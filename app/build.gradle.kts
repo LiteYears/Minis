@@ -70,9 +70,6 @@ android {
         buildConfigField("boolean", "AUTO_UPDATE_CHECK", "true")
         buildConfigField("boolean", "IN_APP_INSTALL", "true")
 
-        ndk {
-            abiFilters += listOf("arm64-v8a")
-        }
     }
 
     signingConfigs {
@@ -89,18 +86,7 @@ android {
             buildConfigField("boolean", "DEV_TOOLS", "true")
             signingConfig = signingConfigs.getByName("debugConfig")
         }
-        create("perf") {
-            initWith(getByName("debug"))
-            isDebuggable = false
-            isProfileable = true
-            matchingFallbacks += listOf("debug")
-            buildConfigField("boolean", "DEV_TOOLS", "true")
-            signingConfig = signingConfigs.getByName("debugConfig")
-        }
         release {
-            ndk {
-                debugSymbolLevel = "FULL"
-            }
             isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -148,70 +134,28 @@ android {
         getByName("androidTest") {
             assets.srcDirs("$projectDir/schemas")
         }
-        // perf shares the debug-only assets (debug-server skill bundle).
-        getByName("perf") {
-            assets.srcDirs("$projectDir/src/debug/assets")
-        }
     }
 
     lint {
-        // AGP 8.x ships a NonNullableMutableLiveData detector that throws
-        // IncompatibleClassChangeError on Kotlin source during
-        // lintVitalAnalyzeRelease, regardless of whether the project uses
-        // LiveData (this project does not). The crash happens in the
-        // detector's dispatch phase — before the configured `disable` list
-        // is consulted — so disabling the rule alone is not enough.
-        // checkReleaseBuilds=false skips lintVitalAnalyzeRelease entirely;
-        // debug-build lint coverage is unaffected. Re-enable once AGP ships
-        // a fixed detector (tracked at issuetracker.google.com/388538014).
         checkReleaseBuilds = false
         disable += "NonNullableMutableLiveData"
     }
 }
 
-// [T-android-downgrade-compat] Room needs an explicit output directory once
-// `exportSchema = true`. The generated JSON is COMMITTED: it is what
-// MigrationTestHelper replays to prove every upgrade — and every no-op
-// downgrade — still produces the schema the entities expect. Without it the
-// migration chain has no automated check and only a real device install can
-// catch a break.
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
 }
 
-// [T-android-about-build-date] Stamp the build time into the APK so About can
-// show "Built yyyy-MM-dd HH:mm:ss", like iOS. versionName/versionCode are
-// static across rebuilds, so without it an install that silently didn't
-// replace the app looks identical to one that did.
-//
-// An asset, not a BuildConfig field: BuildConfig constants are inlined into
-// every class that reads BuildConfig, so a value that changes on every build
-// would defeat incremental Kotlin compilation. A generated asset only re-runs
-// the asset merge. The task never counts as up to date, so the stamp is the
-// time of the build that produced the APK.
 abstract class WriteBuildInfoTask : DefaultTask() {
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
 
-    /** [T-android-jankdiag] Repository root, for the commit stamp. */
-    @get:Internal
-    abstract val repoDir: DirectoryProperty
-
     @TaskAction
     fun write() {
-        val file = outputDir.file("build_info/build_time.txt").get().asFile
-        file.parentFile.mkdirs()
-        file.writeText(System.currentTimeMillis().toString())
-        // [T-android-jankdiag] The commit the APK came from, "-dirty" when the
-        // Android sources had uncommitted changes (Gradle builds the working
-        // tree, not the commit), so a field log names exactly what was built.
-        fun git(vararg args: String): String = runCatching {
-            val p = ProcessBuilder(listOf("git") + args).directory(repoDir.get().asFile).redirectErrorStream(true).start()
-            p.inputStream.bufferedReader().readText().trim().also { p.waitFor() }
-        }.getOrDefault("")
-        val head = git("rev-parse", "--short=9", "HEAD").ifEmpty { "unknown" }
-        val dirty = git("status", "--porcelain", "--untracked-files=no", "--", "src/android").isNotEmpty()
-        outputDir.file("build_info/commit.txt").get().asFile.writeText(if (dirty) "$head-dirty" else head)
+        val dir = outputDir.get().asFile.resolve("build_info")
+        dir.mkdirs()
+        dir.resolve("build_time.txt").writeText(System.currentTimeMillis().toString())
+        dir.resolve("commit.txt").writeText("1.15")
     }
 }
 androidComponents {
@@ -219,7 +163,6 @@ androidComponents {
         val cap = variant.name.replaceFirstChar { it.uppercase() }
         val task = tasks.register<WriteBuildInfoTask>("write${cap}BuildInfo") {
             outputs.upToDateWhen { false }
-            repoDir.set(rootProject.layout.projectDirectory)
         }
         variant.sources.assets?.addGeneratedSourceDirectory(task, WriteBuildInfoTask::outputDir)
     }
