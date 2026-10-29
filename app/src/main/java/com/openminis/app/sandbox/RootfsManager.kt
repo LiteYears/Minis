@@ -3,29 +3,33 @@ package com.openminis.app.sandbox
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.LinkProperties
+import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.FilterInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.nio.charset.Charset
+import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 
 /**
- * Observable state for rootfs installation. Mirrors the conceptual iOS
- * `downloadRootfs(progress:)` contract: discrete phases with a 0..1 fraction
- * during the long-running extract step. Neither platform actually downloads
- * the rootfs from the network today — it ships bundled as an asset — so
- * "progress" tracks asset-stream consumption (compressed bytes) instead of
- * HTTP transfer. The fraction semantics are identical from the UI's viewpoint.
+ * Observable state for rootfs installation.
  */
 sealed class RootfsInstallState {
     object Idle : RootfsInstallState()
     object Preparing : RootfsInstallState()
+    /** progress in 0f..1f during network download. */
+    data class Downloading(val progress: Float) : RootfsInstallState()
     /** progress in 0f..1f, based on compressed asset bytes consumed. */
     data class Extracting(val progress: Float) : RootfsInstallState()
     object Finalizing : RootfsInstallState()
@@ -46,7 +50,7 @@ class RootfsManager private constructor(private val context: Context) {
 
     val isInstalled: Boolean
         get() = rootfsDir.exists() && archFile.exists() &&
-                archFile.readText().trim() == ARCH
+                archFile.readText().trim().isNotEmpty()
 
     /**
      * Observable install progress. UI layers (OnboardingScreen,
@@ -82,66 +86,100 @@ class RootfsManager private constructor(private val context: Context) {
             }
             rootfsDir.mkdirs()
 
-            // Extract rootfs from assets.
-            // AAPT may decompress .tar.gz → .tar automatically, so try both names.
-            val assetName = try {
-                context.assets.open(ROOTFS_ASSET).close()
-                ROOTFS_ASSET
-            } catch (_: java.io.FileNotFoundException) {
-                ROOTFS_ASSET_TAR
+            val currentArch = detectDeviceArch()
+            Log.i(TAG, "Device architecture detected as: $currentArch")
+
+            // 1. Check for bundled assets matching current architecture or generic names
+            val assetCandidates = listOf(
+                "alpine-minirootfs-$currentArch.tar.gz",
+                ROOTFS_ASSET,
+                "alpine-minirootfs-$currentArch.tar",
+                ROOTFS_ASSET_TAR,
+                "alpine-minirootfs-aarch64.tar.gz",
+                "alpine-minirootfs-x86_64.tar.gz"
+            )
+
+            var foundAsset: String? = null
+            for (cand in assetCandidates) {
+                try {
+                    context.assets.open(cand).close()
+                    foundAsset = cand
+                    break
+                } catch (_: Exception) { }
             }
 
-            // Asset size for progress calculation — compressed length (for .gz)
-            // or uncompressed length (for .tar). openFd() fails for 0-length
-            // assets on some devices; fall back to 0 which disables progress.
-            val assetTotal: Long = try {
-                context.assets.openFd(assetName).use { it.length }
-            } catch (_: Exception) { 0L }
+            val cachedFile = File(context.cacheDir, "alpine-minirootfs-$currentArch.tar.gz")
 
-            // Emit an initial 0% so the UI flips from Preparing → progress bar.
-            _installState.value = RootfsInstallState.Extracting(0f)
+            if (foundAsset != null) {
+                Log.i(TAG, "Extracting rootfs from bundled asset: $foundAsset")
+                val assetTotal: Long = try {
+                    context.assets.openFd(foundAsset).use { it.length }
+                } catch (_: Exception) { 0L }
 
-            context.assets.open(assetName).use { rawAsset ->
-                // Wrap the ASSET stream (not the gzip stream) so progress tracks
-                // compressed bytes consumed — monotonic and matches the size we
-                // have a total for. Throttle updates to avoid flooding the StateFlow.
-                val progressStream = ProgressInputStream(rawAsset, assetTotal) { fraction ->
-                    _installState.value = RootfsInstallState.Extracting(fraction)
+                _installState.value = RootfsInstallState.Extracting(0f)
+                context.assets.open(foundAsset).use { rawAsset ->
+                    val progressStream = ProgressInputStream(rawAsset, assetTotal) { fraction ->
+                        _installState.value = RootfsInstallState.Extracting(fraction)
+                    }
+                    if (foundAsset.endsWith(".gz")) {
+                        GZIPInputStream(progressStream).use { gzipStream ->
+                            extractTar(gzipStream, rootfsDir)
+                        }
+                    } else {
+                        extractTar(progressStream, rootfsDir)
+                    }
                 }
-                if (assetName.endsWith(".gz")) {
+            } else {
+                // If not bundled in assets, use cached file or download from mirrors
+                if (!cachedFile.exists() || cachedFile.length() < 500_000) {
+                    Log.i(TAG, "No bundled asset found; downloading rootfs for $currentArch from mirror...")
+                    _installState.value = RootfsInstallState.Downloading(0f)
+                    downloadRootfsFromMirrors(currentArch, cachedFile)
+                }
+
+                Log.i(TAG, "Extracting rootfs from file: ${cachedFile.absolutePath}")
+                _installState.value = RootfsInstallState.Extracting(0f)
+                val fileTotal = cachedFile.length()
+                FileInputStream(cachedFile).use { rawStream ->
+                    val progressStream = ProgressInputStream(rawStream, fileTotal) { fraction ->
+                        _installState.value = RootfsInstallState.Extracting(fraction)
+                    }
                     GZIPInputStream(progressStream).use { gzipStream ->
                         extractTar(gzipStream, rootfsDir)
                     }
-                } else {
-                    extractTar(progressStream, rootfsDir)
                 }
             }
 
             _installState.value = RootfsInstallState.Finalizing
 
             // Write arch marker
-            archFile.writeText(ARCH)
+            archFile.writeText(currentArch)
 
-            // Pre-create /var/minis directories. Mirrors iOS
-            // RootfsManager.swift:76-80 (attachments/offloads/workspace/skills/
-            // shared) plus Android-specific `memory` kept from prior parity work.
-            // T219-6: also pre-create `mounts/` so PRoot's `-b host:/var/minis/mounts/<name>`
-            // has the parent directory to bind into; without this, PRoot silently
-            // skips bind mounts whose target path doesn't exist.
+            // Pre-create /var/minis directories
             val minisSubdirs = listOf("attachments", "offloads", "workspace", "skills", "memory", "shared", "mounts")
             for (subdir in minisSubdirs) {
                 File(rootfsDir, "var/minis/$subdir").mkdirs()
             }
 
-            // Pre-create /opt/bin — appears in PATH so users can drop third-party
-            // binaries here without first `mkdir -p`. Matches iOS PATH layout.
+            // Pre-create /opt/bin
             File(rootfsDir, "opt/bin").mkdirs()
 
             // Write resolv.conf from system DNS (fallback to 8.8.8.8)
             refreshDns()
 
-            // Flag a fresh install so MirrorSpeedTestViewModel.autoDetectOnceIfNeeded()
-            // picks the fastest mirror for each category on first boot.
+            // Configure /etc/apk/repositories with the active Alpine mirror
+            try {
+                val mirrorUrl = getActiveAlpineMirror()
+                val apkDir = File(rootfsDir, "etc/apk")
+                apkDir.mkdirs()
+                val reposFile = File(apkDir, "repositories")
+                reposFile.writeText("${mirrorUrl}v3.21/main\n${mirrorUrl}v3.21/community\n")
+                Log.i(TAG, "Configured apk repositories using mirror: $mirrorUrl")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to write initial apk repositories: ${e.message}")
+            }
+
+            // Flag a fresh install so MirrorSpeedTestViewModel picks fastest mirror
             context.getSharedPreferences("mirror_settings", Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean("rootfs.freshInstall", true)
@@ -154,6 +192,110 @@ class RootfsManager private constructor(private val context: Context) {
             _installState.value = RootfsInstallState.Failed(t.message ?: t.javaClass.simpleName)
             throw t
         }
+    }
+
+    fun detectDeviceArch(): String {
+        val abis = Build.SUPPORTED_ABIS ?: emptyArray()
+        return when {
+            abis.any { it.startsWith("arm64") } -> "aarch64"
+            abis.any { it.contains("x86_64") } -> "x86_64"
+            abis.any { it.startsWith("armeabi") } -> "armv7"
+            else -> "aarch64"
+        }
+    }
+
+    fun getActiveAlpineMirror(): String {
+        val prefs = context.getSharedPreferences("mirror_settings", Context.MODE_PRIVATE)
+        val customMirror = prefs.getString("custom_mirror_alpine", null)?.trim()
+        val useCustom = prefs.getBoolean("use_custom_alpine", false)
+        if (useCustom && !customMirror.isNullOrEmpty()) {
+            return if (customMirror.endsWith("/")) customMirror else "$customMirror/"
+        }
+        val selectedId = prefs.getString("selected_mirror_alpine", null)
+        if (!selectedId.isNullOrEmpty()) {
+            val entry = com.openminis.app.ui.sandbox.MirrorCatalog.alpineMirrors.firstOrNull { it.id == selectedId }
+            if (entry != null) return entry.baseURL
+        }
+        return "https://dl-cdn.alpinelinux.org/alpine/"
+    }
+
+    private fun downloadRootfsFromMirrors(arch: String, destFile: File) {
+        val httpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(180, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .build()
+
+        val activeMirror = getActiveAlpineMirror()
+        val mirrorsToTry = buildList {
+            add(activeMirror)
+            for (m in com.openminis.app.ui.sandbox.MirrorCatalog.alpineMirrors) {
+                if (m.baseURL != activeMirror) add(m.baseURL)
+            }
+        }.distinct()
+
+        var lastError: Exception? = null
+        val tempFile = File(destFile.parentFile, "${destFile.name}.tmp")
+        if (tempFile.exists()) tempFile.delete()
+
+        for (mirror in mirrorsToTry) {
+            val candidateUrls = listOf(
+                "${mirror}v3.21/releases/$arch/alpine-minirootfs-3.21.9-$arch.tar.gz",
+                "${mirror}latest-stable/releases/$arch/alpine-minirootfs-3.21.9-$arch.tar.gz",
+                "${mirror}v3.21/releases/$arch/alpine-minirootfs-3.21.0-$arch.tar.gz"
+            )
+
+            for (url in candidateUrls) {
+                try {
+                    Log.i(TAG, "Attempting rootfs download from: $url")
+                    val request = Request.Builder().url(url).build()
+                    val response = httpClient.newCall(request).execute()
+                    if (!response.isSuccessful) {
+                        response.close()
+                        continue
+                    }
+                    val body = response.body
+                    if (body == null) {
+                        response.close()
+                        continue
+                    }
+                    val totalLength = body.contentLength()
+                    var bytesDownloaded = 0L
+                    var lastReported = 0L
+
+                    body.byteStream().use { input ->
+                        FileOutputStream(tempFile).use { output ->
+                            val buf = ByteArray(16384)
+                            var len: Int
+                            while (input.read(buf).also { len = it } != -1) {
+                                output.write(buf, 0, len)
+                                bytesDownloaded += len
+                                val now = System.currentTimeMillis()
+                                if (now - lastReported > 80 && totalLength > 0) {
+                                    val prog = (bytesDownloaded.toFloat() / totalLength).coerceIn(0f, 1f)
+                                    _installState.value = RootfsInstallState.Downloading(prog)
+                                    lastReported = now
+                                }
+                            }
+                        }
+                    }
+
+                    if (tempFile.length() > 500_000) {
+                        if (destFile.exists()) destFile.delete()
+                        if (tempFile.renameTo(destFile)) {
+                            Log.i(TAG, "Rootfs downloaded successfully (${destFile.length()} bytes) from $url")
+                            return
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Download failed from $url: ${e.message}")
+                    lastError = e
+                    if (tempFile.exists()) tempFile.delete()
+                }
+            }
+        }
+        throw lastError ?: IOException("Failed to download Alpine rootfs from any configured mirror")
     }
 
     /** Directory containing extracted native libraries (read-only, executable). */

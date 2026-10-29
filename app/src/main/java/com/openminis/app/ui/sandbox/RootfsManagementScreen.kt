@@ -170,11 +170,11 @@ fun RootfsManagementScreen(
                         colors = transparentListItemColors(),
                     )
                 }
+            }
 
-                // --- Mirrors section ---
-                SettingsSection(title = stringResource(R.string.rootfs_mirrors_section)) {
-                    MirrorsSectionView(onNavigate = onMirrorCategoryClick)
-                }
+            // --- Mirrors section ---
+            SettingsSection(title = stringResource(R.string.rootfs_mirrors_section)) {
+                MirrorsSectionView(onNavigate = onMirrorCategoryClick)
             }
 
             // --- Container Network section ---
