@@ -132,7 +132,11 @@ internal class JiebaEngine(context: Context) {
         private val DICT_FILES = listOf("jieba.dict.utf8", "hmm_model.utf8")
 
         init {
-            System.loadLibrary("jieba_jni")
+            try {
+                System.loadLibrary("jieba_jni")
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "jieba_jni library not available: ${t.message}")
+            }
         }
     }
 }

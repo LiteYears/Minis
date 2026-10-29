@@ -1,0 +1,6 @@
+{
+  "name": "Minis",
+  "description": "On-device AI assistant and workspace with offline tools, sandboxed execution, and multi-provider models",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

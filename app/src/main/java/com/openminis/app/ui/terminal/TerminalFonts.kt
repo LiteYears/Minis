@@ -27,22 +27,10 @@ import com.openminis.app.R
  *    through Compose. Loaded once via `ResourcesCompat.getFont` and
  *    cached.
  */
-val JetBrainsMonoFontFamily: FontFamily = FontFamily(
-    Font(R.font.jetbrains_mono_regular, FontWeight.Normal),
-    Font(R.font.jetbrains_mono_bold, FontWeight.Bold),
-)
-
-/** Lazily-loaded JetBrains Mono Typeface for Canvas/Paint usage. */
-private var cachedRegular: Typeface? = null
-private var cachedBold: Typeface? = null
+val JetBrainsMonoFontFamily: FontFamily = FontFamily.Monospace
 
 fun jetBrainsMonoTypeface(context: Context, bold: Boolean = false): Typeface {
-    val cached = if (bold) cachedBold else cachedRegular
-    if (cached != null) return cached
-    val resId = if (bold) R.font.jetbrains_mono_bold else R.font.jetbrains_mono_regular
-    val tf = ResourcesCompat.getFont(context, resId) ?: Typeface.MONOSPACE
-    if (bold) cachedBold = tf else cachedRegular = tf
-    return tf
+    return if (bold) Typeface.defaultFromStyle(Typeface.BOLD) else Typeface.MONOSPACE
 }
 
 @Composable

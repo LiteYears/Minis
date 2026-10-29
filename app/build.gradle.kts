@@ -66,58 +66,38 @@ android {
         buildConfigField("String", "RELEASE_REPO", "\"OpenMinis/OpenMinis\"")
         buildConfigField("String", "UPDATE_CHANNEL", "\"stable\"")
 
+        buildConfigField("boolean", "SELF_UPDATE", "true")
+        buildConfigField("boolean", "AUTO_UPDATE_CHECK", "true")
+        buildConfigField("boolean", "IN_APP_INSTALL", "true")
+
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
-
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++17"
-                arguments += "-DANDROID_STL=c++_shared"
-            }
-        }
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+    signingConfigs {
+        create("debugConfig") {
+            storeFile = file("${rootDir}/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 
     buildTypes {
         getByName("debug") {
             buildConfigField("boolean", "DEV_TOOLS", "true")
+            signingConfig = signingConfigs.getByName("debugConfig")
         }
-        // `perf`: the debug variant minus android:debuggable. ART refuses to
-        // AOT-compile a debuggable app (`cmd package compile -m speed`
-        // silently downgrades to `verify`) and runs it interpreter + JIT in
-        // debuggable mode; simpleperf on a streaming turn showed the main
-        // thread ~94% inside the interpreter. Frame-cost measurements taken
-        // on `debug` therefore do not represent what users run. `perf` keeps
-        // the debug server and probes (DEV_TOOLS) so the measurement harness
-        // works, but is profileable/AOT-compilable like a release build.
-        // Same debug signing key as release, so it installs in place.
         create("perf") {
             initWith(getByName("debug"))
             isDebuggable = false
             isProfileable = true
             matchingFallbacks += listOf("debug")
             buildConfigField("boolean", "DEV_TOOLS", "true")
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("debugConfig")
         }
         release {
-            // [OpenMinis#363] Produce native-debug-symbols.zip alongside the
-            // APK so a stripped release .so can still be symbolicated after
-            // the fact (`ndk-stack -sym`, or upload to Play Console). Without
-            // it every native frame in a field report is a bare PC and the
-            // unstripped objects only exist inside the build tree of whoever
-            // happened to compile it.
-            //
-            // NOT `keepDebugSymbols` (the old doNotStrip): that ships the
-            // symbols INSIDE the APK and would add tens of MB to a package
-            // that already carries libgojni.so and libonnxruntime.so. The zip
-            // is a build artifact to archive, not payload for the device.
             ndk {
                 debugSymbolLevel = "FULL"
             }
@@ -126,7 +106,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("debugConfig")
         }
     }
 
@@ -137,28 +117,6 @@ android {
     // - store: the app-store build (AAB). Never checks on its own and never
     //   shows a badge; About's manual "Check for Updates" still works and
     //   downloads + installs from GitHub like the github build.
-    // IN_APP_INSTALL gates the download-and-install step. It is true for both
-    // today; Google Play forbids self-installing APKs, so a Play listing would
-    // flip it to false for `store` (show the release page instead).
-    // `github` is the default flavor: plain assembleDebug / installDebug /
-    // testDebugUnitTest keep meaning the build everyone already uses (see the
-    // aliases after this block).
-    flavorDimensions += "distribution"
-    productFlavors {
-        create("github") {
-            dimension = "distribution"
-            isDefault = true
-            buildConfigField("boolean", "SELF_UPDATE", "true")
-            buildConfigField("boolean", "AUTO_UPDATE_CHECK", "true")
-            buildConfigField("boolean", "IN_APP_INSTALL", "true")
-        }
-        create("store") {
-            dimension = "distribution"
-            buildConfigField("boolean", "SELF_UPDATE", "true")
-            buildConfigField("boolean", "AUTO_UPDATE_CHECK", "false")
-            buildConfigField("boolean", "IN_APP_INSTALL", "true")
-        }
-    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -211,64 +169,6 @@ android {
     }
 }
 
-// [T15-channels] Keep the flavorless task names and APK paths working.
-// Adding the `distribution` dimension renames every variant (debug ->
-// githubDebug), and scripts and docs drive the build with :app:assembleDebug,
-// :app:installDebug, :app:testDebugUnitTest --tests '…' and
-// app/build/outputs/apk/debug/app-debug.apk.
-// - The store flavor only ships as a release AAB, so its debug and perf
-//   variants are off unless -Pminis.storeDev=true (to try the store
-//   behaviour on a device with installStoreDebug). That keeps the
-//   aggregate assembleDebug / assemblePerf building ONE variant, not two.
-// - assembleRelease is narrowed to the github APK (bundleStoreRelease builds
-//   the store AAB explicitly).
-// - installDebug / installPerf / installRelease are aliases for the github
-//   variants; AGP only creates them when there are no flavors.
-// - testDebugUnitTest is a real Test task over the githubDebug unit-test
-//   classpath, so `--tests` filtering works and results still land in
-//   build/test-results/testDebugUnitTest.
-// - The github APKs are also copied to their pre-flavor paths
-//   (outputs/apk/<type>/app-<type>.apk); the flavored originals stay at
-//   outputs/apk/github/<type>/app-github-<type>.apk.
-val storeDevVariants = providers.gradleProperty("minis.storeDev").map { it.toBoolean() }.getOrElse(false)
-androidComponents {
-    beforeVariants(selector().withFlavor("distribution" to "store")) { variant ->
-        if (variant.buildType != "release" && !storeDevVariants) variant.enable = false
-    }
-}
-for (buildType in listOf("debug", "release", "perf")) {
-    val cap = buildType.replaceFirstChar { it.uppercase() }
-    val copyLegacy = tasks.register<Copy>("copyGithub${cap}ApkToLegacyPath") {
-        from(layout.buildDirectory.dir("outputs/apk/github/$buildType")) {
-            include("app-github-$buildType.apk")
-            rename { "app-$buildType.apk" }
-        }
-        into(layout.buildDirectory.dir("outputs/apk/$buildType"))
-    }
-    tasks.matching { it.name == "assembleGithub$cap" || it.name == "packageGithub$cap" }
-        .configureEach { finalizedBy(copyLegacy) }
-    tasks.register("install$cap") {
-        group = "install"
-        description = "Installs the github $buildType build (alias of installGithub$cap)."
-        dependsOn("installGithub$cap")
-    }
-}
-afterEvaluate {
-    // AGP wires the aggregate after the build script's own configuration, so
-    // narrowing it has to wait until then.
-    tasks.named("assembleRelease") { setDependsOn(listOf("assembleGithubRelease")) }
-    val githubUnitTests = tasks.named<Test>("testGithubDebugUnitTest")
-    tasks.register<Test>("testDebugUnitTest") {
-        group = "verification"
-        description = "Runs the githubDebug unit tests (pre-flavor name; supports --tests)."
-        testClassesDirs = githubUnitTests.get().testClassesDirs
-        classpath = githubUnitTests.get().classpath
-        jvmArgs(githubUnitTests.get().jvmArgs ?: emptyList<String>())
-        systemProperties(githubUnitTests.get().systemProperties)
-        maxHeapSize = githubUnitTests.get().maxHeapSize
-    }
-}
-
 // [T-android-downgrade-compat] Room needs an explicit output directory once
 // `exportSchema = true`. The generated JSON is COMMITTED: it is what
 // MigrationTestHelper replays to prove every upgrade — and every no-op
@@ -278,45 +178,6 @@ afterEvaluate {
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
 }
-
-// [T-bash-on-demand] Keep the shared bashism rule table / test vectors as a
-// SINGLE source of truth (src/shared/bashism) — copy into assets at build
-// time instead of committing duplicate JSON. iOS references the same files as
-// bundle resources. Runs before every asset merge so debug/release stay fresh.
-val copyBashismRules by tasks.registering(Copy::class) {
-    from(rootProject.file("../shared/bashism")) {
-        include("bashism_rules.json", "bashism_test_vectors.json")
-    }
-    into(layout.projectDirectory.dir("src/main/assets/bashism"))
-}
-tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }
-    .configureEach { dependsOn(copyBashismRules) }
-tasks.named("preBuild") { dependsOn(copyBashismRules) }
-
-// [T-android-debugserver-skill] Stage the debug-server skill + an Android
-// reference client into the DEBUG-ONLY asset source set, so the debug server
-// can serve them over GET /skill (mirrors the iOS "Generate Debug Skill" build
-// phase). Single source of truth stays .claude/skills/debug-server/.
-//
-// Wired to DEBUG asset merges only: src/debug/assets never reaches a release
-// APK, so the tooling docs can't ship to users. `assets` is also declared as an
-// output so Gradle re-runs this when the skill changes but skips it otherwise.
-val stageDebugSkillAssets by tasks.registering(Exec::class) {
-    val script = rootProject.file("../../scripts/gen_debug_skill_android.sh")
-    val skillDir = rootProject.file("../../.claude/skills/debug-server")
-    onlyIf { script.exists() }
-    // Declare the inputs only when they exist. `.optional()` covers an unset
-    // property, not a path that is absent: Gradle validates inputs before it
-    // consults onlyIf, so a missing skill dir fails the build outright. The
-    // public mirror has neither the script nor .claude/skills, and must still
-    // build.
-    if (skillDir.isDirectory) inputs.dir(skillDir)
-    if (script.isFile) inputs.file(script)
-    outputs.dir(layout.projectDirectory.dir("src/debug/assets/debug-skill"))
-    commandLine("bash", script.absolutePath)
-}
-tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") && (it.name.contains("Debug") || it.name.contains("Perf")) }
-    .configureEach { dependsOn(stageDebugSkillAssets) }
 
 // [T-android-about-build-date] Stamp the build time into the APK so About can
 // show "Built yyyy-MM-dd HH:mm:ss", like iOS. versionName/versionCode are
@@ -358,7 +219,7 @@ androidComponents {
         val cap = variant.name.replaceFirstChar { it.uppercase() }
         val task = tasks.register<WriteBuildInfoTask>("write${cap}BuildInfo") {
             outputs.upToDateWhen { false }
-            repoDir.set(rootProject.layout.projectDirectory.dir("../.."))
+            repoDir.set(rootProject.layout.projectDirectory)
         }
         variant.sources.assets?.addGeneratedSourceDirectory(task, WriteBuildInfoTask::outputDir)
     }
@@ -427,12 +288,6 @@ dependencies {
     // note in `ndk`; we ship arm64-v8a only.
     implementation("com.github.helloooideeeeea:RealTimeCutVADLibraryForAndroid:1.0.5@aar")
 
-    // rclone, via its official gomobile binding, for backup destinations
-    // (SMB / WebDAV / SFTP / S3 / FTP). Build it with
-    // `deps/build_rclone_android.sh` — the .aar is a build artifact under
-    // app/libs/, not a checked-in binary. Backends are decided by
-    // deps/rclone-mobile/backends/backends.go, shared with the iOS build.
-    implementation(group = "", name = "rclone", ext = "aar")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
