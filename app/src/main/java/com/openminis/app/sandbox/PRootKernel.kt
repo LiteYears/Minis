@@ -688,6 +688,10 @@ object PRootKernel {
     fun buildProotCommand(shellCommand: String): List<String> {
         check(isBooted) { "PRootKernel.boot() must be called before building commands" }
 
+        if (!rootfsManager.isProotAvailable) {
+            return listOf("/system/bin/sh", "-c", shellCommand)
+        }
+
         val cmd = mutableListOf<String>()
 
         cmd.add(rootfsManager.prootBinary.absolutePath)

@@ -21,8 +21,19 @@ object Gomobile {
         """{"ok":true,"result":{"changed":false}}"""
 
     @JvmStatic
-    fun rcloneRPC(method: String, input: String): RcloneRPCResult =
-        RcloneRPCResult(200, "{}")
+    fun rcloneRPC(method: String, input: String): RcloneRPCResult {
+        val responseJson = when (method) {
+            "core/version" -> """{"version":"v1.68.0","decomposed":[1,68,0],"isGit":false,"isBeta":false,"os":"android","arch":"arm64","goVersion":"go1.23.0"}"""
+            "config/listremotes" -> """{"remotes":[]}"""
+            "config/dump" -> """{}"""
+            "operations/list" -> """{"list":[]}"""
+            "operations/about" -> """{"total":0,"used":0,"trashed":0,"other":0,"free":0}"""
+            "operations/stat" -> """{"item":null}"""
+            "job/list" -> """{"jobids":[]}"""
+            else -> """{}"""
+        }
+        return RcloneRPCResult(200L, responseJson)
+    }
 
     @JvmStatic
     fun tsSetLogger(sink: LogSink?) {}

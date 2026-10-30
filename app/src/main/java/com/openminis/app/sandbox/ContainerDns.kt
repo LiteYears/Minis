@@ -1516,40 +1516,46 @@ internal class FreshProcessShell(
     private fun spawn(command: String, envVars: Map<String, String>, statusGuestPath: String): Process {
         val rootfsManager = RootfsManager.getInstance(context)
         val cmd = mutableListOf<String>()
-        cmd.add(rootfsManager.prootBinary.absolutePath)
-        cmd.add("-0")
-        cmd.add("--link2symlink")
-        cmd.add("-r"); cmd.add(rootfsManager.rootfsDir.absolutePath)
-        cmd.add("-b"); cmd.add("/dev")
-        cmd.add("-b"); cmd.add("/proc")
-        cmd.add("-b"); cmd.add("/sys")
-        cmd.add("-w"); cmd.add("/root")
-        for ((linuxPath, hostPath) in sessionBindMounts) {
-            cmd.add("-b"); cmd.add("$hostPath:$linuxPath")
+        if (rootfsManager.isProotAvailable) {
+            cmd.add(rootfsManager.prootBinary.absolutePath)
+            cmd.add("-0")
+            cmd.add("--link2symlink")
+            cmd.add("-r"); cmd.add(rootfsManager.rootfsDir.absolutePath)
+            cmd.add("-b"); cmd.add("/dev")
+            cmd.add("-b"); cmd.add("/proc")
+            cmd.add("-b"); cmd.add("/sys")
+            cmd.add("-w"); cmd.add("/root")
+            for ((linuxPath, hostPath) in sessionBindMounts) {
+                cmd.add("-b"); cmd.add("$hostPath:$linuxPath")
+            }
+            val handlers = NativeOffloadServer.registeredHandlers
+            // [T-native-offload-bind] Only when our server is listening: otherwise
+            // the handler stubs run and report the CLI unavailable, instead of
+            // proot connecting to a name another process holds (and hanging).
+            if (handlers.isNotEmpty() && NativeOffloadServer.awaitListening()) {
+                cmd.add("--native-offload=${NativeOffloadServer.socketName}:${handlers.joinToString(",")}")
+            }
+            // [T-android-fake-netlink] Same rtnetlink emulation the pooled shell
+            // gets; the two paths must not disagree about whether the sandbox has
+            // network interfaces.
+            cmd.add("--fake-netlink")
+            // [FEAT-261021-11] Shell transparent forwarding (see PRootKernel).
+            cmd.addAll(com.openminis.app.network.ShellTransparentNet.prootArgs(rootfsManager.prootBinary))
+            // [T-android-shell-fresh-process] Step 4: run the command as its own
+            // process-group leader.
+            cmd.addAll(ForegroundCommandGroup.wrapForFreshProcess(command, statusGuestPath))
+        } else {
+            val hostStatusPath = File(rootfsManager.rootfsDir, statusGuestPath.removePrefix("/")).absolutePath
+            val wrapped = ForegroundCommandGroup.wrapForFreshProcess(command, hostStatusPath)
+            cmd.add("/system/bin/sh")
+            cmd.addAll(wrapped.drop(1))
         }
-        val handlers = NativeOffloadServer.registeredHandlers
-        // [T-native-offload-bind] Only when our server is listening: otherwise
-        // the handler stubs run and report the CLI unavailable, instead of
-        // proot connecting to a name another process holds (and hanging).
-        if (handlers.isNotEmpty() && NativeOffloadServer.awaitListening()) {
-            cmd.add("--native-offload=${NativeOffloadServer.socketName}:${handlers.joinToString(",")}")
-        }
-        // [T-android-fake-netlink] Same rtnetlink emulation the pooled shell
-        // gets; the two paths must not disagree about whether the sandbox has
-        // network interfaces.
-        cmd.add("--fake-netlink")
-        // [FEAT-261021-11] Shell transparent forwarding (see PRootKernel).
-        cmd.addAll(com.openminis.app.network.ShellTransparentNet.prootArgs(rootfsManager.prootBinary))
-        // [T-android-shell-fresh-process] Step 4: run the command as its own
-        // process-group leader. No marker, no pgid reporting — the host does
-        // not need to LEARN the group, because on the fresh path the guest
-        // group leader is the direct child of the proot process we already
-        // hold. It only needs the group to EXIST, so that killing reaches the
-        // descendants that would otherwise keep the pipe open.
-        cmd.addAll(ForegroundCommandGroup.wrapForFreshProcess(command, statusGuestPath))
 
         val debugOffload = com.openminis.app.BuildConfig.DEV_TOOLS
         val pb = ProcessBuilder(cmd)
+        if (!rootfsManager.isProotAvailable) {
+            pb.directory(File(rootfsManager.rootfsDir, "root").apply { mkdirs() })
+        }
         configureStdin(pb)
         // Separate in debug so proot's [native_offload] lines reach logcat
         // instead of the output — which is why execute() starts a StderrDrain

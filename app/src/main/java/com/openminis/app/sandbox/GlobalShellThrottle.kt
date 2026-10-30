@@ -330,6 +330,8 @@ class RootfsManager private constructor(private val context: Context) {
 
     val rootfsDir: File = File(context.filesDir, "alpine-rootfs")
     val prootBinary: File = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
+    val isProotAvailable: Boolean
+        get() = prootBinary.exists() && prootBinary.canExecute()
 
     private val archFile: File get() = File(rootfsDir, ".arch")
 
@@ -590,17 +592,14 @@ class RootfsManager private constructor(private val context: Context) {
      * Verify PRoot binary is available in the native library directory.
      */
     suspend fun installProotIfNeeded() = withContext(Dispatchers.IO) {
-        if (!prootBinary.exists() || !prootBinary.canExecute()) {
-            throw IllegalStateException(
-                "PRoot binary not found at $prootBinary. " +
-                "It should be auto-extracted from jniLibs."
+        if (!isProotAvailable) {
+            Log.w(
+                TAG,
+                "PRoot binary not found at $prootBinary (arch=${detectDeviceArch()}). " +
+                    "Falling back to host /system/bin/sh execution."
             )
+            return@withContext
         }
-
-        // No libtalloc staging: deps/build_proot.sh links talloc statically
-        // (the binary carries no DT_NEEDED for libtalloc.so), so there is no
-        // shared object to version-rename. Older builds shipped libtalloc.so
-        // in jniLibs and copied it here as libtalloc.so.2.
 
         Log.d(TAG, "PRoot binary available at $prootBinary")
     }

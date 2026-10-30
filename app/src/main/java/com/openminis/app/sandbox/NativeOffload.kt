@@ -837,39 +837,46 @@ class PersistentShell(
         lastExitCode = null
 
         val cmd = mutableListOf<String>()
-        cmd.add(rootfsManager.prootBinary.absolutePath)
-        cmd.add("-0")
-        // T141: see PRootKernel.buildProotCommand for rationale — translates
-        // hardlinks to symlinks so apk install of binutils/gcc works.
-        cmd.add("--link2symlink")
-        cmd.add("-r")
-        cmd.add(rootfsManager.rootfsDir.absolutePath)
-        cmd.add("-b"); cmd.add("/dev")
-        cmd.add("-b"); cmd.add("/proc")
-        cmd.add("-b"); cmd.add("/sys")
-        cmd.add("-w"); cmd.add("/root")
+        if (rootfsManager.isProotAvailable) {
+            cmd.add(rootfsManager.prootBinary.absolutePath)
+            cmd.add("-0")
+            // T141: see PRootKernel.buildProotCommand for rationale — translates
+            // hardlinks to symlinks so apk install of binutils/gcc works.
+            cmd.add("--link2symlink")
+            cmd.add("-r")
+            cmd.add(rootfsManager.rootfsDir.absolutePath)
+            cmd.add("-b"); cmd.add("/dev")
+            cmd.add("-b"); cmd.add("/proc")
+            cmd.add("-b"); cmd.add("/sys")
+            cmd.add("-w"); cmd.add("/root")
 
-        // Apply this session's bind mounts (session-specific, not global)
-        for ((linuxPath, hostPath) in sessionBindMounts) {
-            cmd.add("-b")
-            cmd.add("$hostPath:$linuxPath")
+            // Apply this session's bind mounts (session-specific, not global)
+            for ((linuxPath, hostPath) in sessionBindMounts) {
+                cmd.add("-b")
+                cmd.add("$hostPath:$linuxPath")
+            }
+
+            val handlers = NativeOffloadServer.registeredHandlers
+            // [T-native-offload-bind] Only when our server is listening: otherwise
+            // the handler stubs run and report the CLI unavailable, instead of
+            // proot connecting to a name another process holds (and hanging).
+            if (handlers.isNotEmpty() && NativeOffloadServer.awaitListening()) {
+                cmd.add("--native-offload=${NativeOffloadServer.socketName}:${handlers.joinToString(",")}")
+            }
+            // [FEAT-261021-11] Shell transparent forwarding (see PRootKernel).
+            cmd.addAll(com.openminis.app.network.ShellTransparentNet.prootArgs(rootfsManager.prootBinary))
+
+            cmd.add("/bin/sh")
+        } else {
+            cmd.add("/system/bin/sh")
         }
-
-        val handlers = NativeOffloadServer.registeredHandlers
-        // [T-native-offload-bind] Only when our server is listening: otherwise
-        // the handler stubs run and report the CLI unavailable, instead of
-        // proot connecting to a name another process holds (and hanging).
-        if (handlers.isNotEmpty() && NativeOffloadServer.awaitListening()) {
-            cmd.add("--native-offload=${NativeOffloadServer.socketName}:${handlers.joinToString(",")}")
-        }
-        // [FEAT-261021-11] Shell transparent forwarding (see PRootKernel).
-        cmd.addAll(com.openminis.app.network.ShellTransparentNet.prootArgs(rootfsManager.prootBinary))
-
-        cmd.add("/bin/sh")
 
         val debugOffload = com.openminis.app.BuildConfig.DEV_TOOLS
 
         val processBuilder = ProcessBuilder(cmd)
+        if (!rootfsManager.isProotAvailable) {
+            processBuilder.directory(File(rootfsManager.rootfsDir, "root").apply { mkdirs() })
+        }
         // In debug builds we want proot's native_offload stderr logs in
         // logcat, not merged into shell stdout (which would break the
         // __MINIS_DONE__ marker detection). Release keeps the original
@@ -1589,7 +1596,12 @@ class TerminalSession(private val context: Context) {
                 }
 
                 val envp = envMap.map { (k, v) -> "$k=$v" }.toTypedArray()
-                val cwd = File(cmd).parentFile?.absolutePath
+                val rm = RootfsManager.getInstance(context)
+                val cwd = if (rm.isProotAvailable) {
+                    File(cmd).parentFile?.absolutePath
+                } else {
+                    File(rm.rootfsDir, "root").apply { mkdirs() }.absolutePath
+                }
 
                 val outPid = IntArray(1)
                 val fd = PtyBridge.forkExec(cmd, argv, envp, cwd, cols, rows, outPid)
@@ -1844,6 +1856,9 @@ class TerminalSession(private val context: Context) {
     private fun buildInteractiveCommand(sessionId: String?): List<String> {
         check(PRootKernel.isBooted) { "PRootKernel must be booted" }
         val rootfsManager = RootfsManager.getInstance(context)
+        if (!rootfsManager.isProotAvailable) {
+            return listOf("/system/bin/sh", "-i")
+        }
         val cmd = mutableListOf<String>()
         cmd.add(rootfsManager.prootBinary.absolutePath)
         cmd.add("-0")

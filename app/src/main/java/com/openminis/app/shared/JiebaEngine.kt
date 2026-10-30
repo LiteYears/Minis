@@ -39,6 +39,7 @@ internal class JiebaEngine(context: Context) {
     @Synchronized
     fun ensureInitialized(): Boolean {
         if (initialized) return true
+        if (!nativeLoaded) return false
         return try {
             val dictDir = extractDictionaries()
             initialized = nativeInit(dictDir.absolutePath)
@@ -54,13 +55,23 @@ internal class JiebaEngine(context: Context) {
     /** Exact-mode segmentation (HMM on). Empty list if init failed. */
     fun segment(text: String): List<String> {
         if (text.isEmpty() || !ensureInitialized()) return emptyList()
-        return nativeSegment(text).asList()
+        return try {
+            nativeSegment(text).asList()
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "nativeSegment failed: ${t.message}")
+            emptyList()
+        }
     }
 
     /** Search-engine-mode segmentation. Empty list if init failed. */
     fun segmentForSearch(text: String): List<String> {
         if (text.isEmpty() || !ensureInitialized()) return emptyList()
-        return nativeSegmentForSearch(text).asList()
+        return try {
+            nativeSegmentForSearch(text).asList()
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "nativeSegmentForSearch failed: ${t.message}")
+            emptyList()
+        }
     }
 
     /**
@@ -75,14 +86,19 @@ internal class JiebaEngine(context: Context) {
      */
     fun posTag(text: String): List<Pair<String, String>> {
         if (text.isEmpty() || !ensureInitialized()) return emptyList()
-        val flat = nativePosTag(text)
-        val out = ArrayList<Pair<String, String>>(flat.size / 2)
-        var i = 0
-        while (i + 1 < flat.size) {
-            out.add(flat[i] to flat[i + 1])
-            i += 2
+        return try {
+            val flat = nativePosTag(text)
+            val out = ArrayList<Pair<String, String>>(flat.size / 2)
+            var i = 0
+            while (i + 1 < flat.size) {
+                out.add(flat[i] to flat[i + 1])
+                i += 2
+            }
+            out
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "nativePosTag failed: ${t.message}")
+            emptyList()
         }
-        return out
     }
 
     /**
@@ -133,11 +149,16 @@ internal class JiebaEngine(context: Context) {
 
         private val DICT_FILES = listOf("jieba.dict.utf8", "hmm_model.utf8")
 
+        @Volatile
+        private var nativeLoaded = false
+
         init {
             try {
                 System.loadLibrary("jieba_jni")
+                nativeLoaded = true
             } catch (t: Throwable) {
                 android.util.Log.w(TAG, "jieba_jni library not available: ${t.message}")
+                nativeLoaded = false
             }
         }
     }
