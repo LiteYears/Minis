@@ -1133,6 +1133,41 @@ fun SessionListScreen(
             // iOS `didInitialLoad` on ContentView. The transition is usually
             // sub-200ms, so no spinner.
             if (isInitialLoadComplete) Column(modifier = Modifier.fillMaxSize()) {
+                AnimatedVisibility(
+                    visible = !isSelecting && !isSearchActive,
+                    enter = fadeIn(tween(180)) + androidx.compose.animation.expandVertically(
+                        animationSpec = androidx.compose.animation.core.spring(
+                            dampingRatio = androidx.compose.animation.core.Spring.DampingRatioNoBouncy,
+                            stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow
+                        )
+                    ),
+                    exit = fadeOut(tween(120)) + androidx.compose.animation.shrinkVertically(tween(150)),
+                ) {
+                    val isSandboxReady = remember {
+                        runCatching {
+                            com.openminis.app.sandbox.RootfsManager.getInstance(context).isInstalled
+                        }.getOrDefault(false)
+                    }
+                    HarnessQuickDock(
+                        isSandboxReady = isSandboxReady,
+                        onTerminalClick = {
+                            exitSearchIfQueryBlank()
+                            onTerminalClick()
+                        },
+                        onSandboxClick = {
+                            exitSearchIfQueryBlank()
+                            onRootfsClick()
+                        },
+                        onBrowserClick = {
+                            browserTabPool.ensureTabForUI()
+                            showBrowserSheet = true
+                        },
+                        onScheduledTasksClick = {
+                            exitSearchIfQueryBlank()
+                            onScheduledTasksClick()
+                        },
+                    )
+                }
                 // [T-search-folder-expand] A folder whose name matched is a result
                 // even with no member: the list shows it rather than "no results".
                 if (sessions.isEmpty() && !(searchResultsActive && folderBlocks.isNotEmpty())) {
@@ -4016,4 +4051,123 @@ private fun exportSession(
         }
     }
 }
+
+@Composable
+private fun HarnessQuickDock(
+    isSandboxReady: Boolean,
+    onTerminalClick: () -> Unit,
+    onSandboxClick: () -> Unit,
+    onBrowserClick: () -> Unit,
+    onScheduledTasksClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        HarnessQuickTile(
+            icon = Icons.Outlined.Terminal,
+            title = "Shell",
+            subtitle = if (isSandboxReady) "Alpine" else "Host Sh",
+            accentColor = Color(0xFF4CAF50),
+            onClick = onTerminalClick,
+            modifier = Modifier.weight(1f),
+        )
+        HarnessQuickTile(
+            icon = Icons.Outlined.Code,
+            title = "Sandbox",
+            subtitle = if (isSandboxReady) "Ready" else "Setup",
+            accentColor = if (isSandboxReady) MaterialTheme.colorScheme.primary else Color(0xFFFF9800),
+            onClick = onSandboxClick,
+            modifier = Modifier.weight(1f),
+        )
+        HarnessQuickTile(
+            icon = Icons.Outlined.Language,
+            title = "Browser",
+            subtitle = "Web Tool",
+            accentColor = Color(0xFF00ACC1),
+            onClick = onBrowserClick,
+            modifier = Modifier.weight(1f),
+        )
+        HarnessQuickTile(
+            icon = Icons.Outlined.Schedule,
+            title = "Tasks",
+            subtitle = "Cron & Jobs",
+            accentColor = Color(0xFF9C27B0),
+            onClick = onScheduledTasksClick,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun HarnessQuickTile(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    subtitle: String,
+    accentColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        border = androidx.compose.foundation.BorderStroke(
+            width = 0.75.dp,
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
+        ),
+        modifier = modifier,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(accentColor.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = title,
+                        tint = accentColor,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(accentColor.copy(alpha = 0.75f)),
+                )
+            }
+            Text(
+                text = title,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = subtitle,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
 

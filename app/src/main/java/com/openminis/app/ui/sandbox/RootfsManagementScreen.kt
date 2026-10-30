@@ -4,7 +4,22 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.text.format.Formatter
 import android.util.Log
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,9 +43,11 @@ import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Inventory2
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restore
@@ -66,13 +83,17 @@ import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.openminis.app.R
 import com.openminis.app.ui.components.MinisTextButton
@@ -111,9 +132,6 @@ fun RootfsManagementScreen(
         viewModel.refresh(context)
     }
 
-    // T168: iOS-style inset-grouped background. surfaceContainerLowest sits
-    // a hair below `surface`, so the rounded section cards (which use
-    // `surface`) read as raised pads against the page bg.
     val groupedBg = MaterialTheme.colorScheme.surfaceContainerLowest
     Scaffold(
         topBar = {
@@ -122,6 +140,18 @@ fun RootfsManagementScreen(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.common_back))
+                    }
+                },
+                actions = {
+                    IconButton(
+                        onClick = { viewModel.runDiagnostics(context) },
+                        enabled = !state.isRunningDiagnostics,
+                    ) {
+                        Icon(
+                            Icons.Filled.Bolt,
+                            contentDescription = "Run Sandbox Diagnostics",
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = groupedBg),
@@ -138,7 +168,65 @@ fun RootfsManagementScreen(
         ) {
             Spacer(modifier = Modifier.height(8.dp))
 
-            // --- Status section ---
+            // --- Animated Sandbox Hero Card ---
+            SandboxHeroStatusCard(
+                state = state,
+                context = context,
+                onRunDiagnostics = { viewModel.runDiagnostics(context) },
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // --- Live Diagnostics Results (Animated) ---
+            AnimatedVisibility(
+                visible = state.isRunningDiagnostics || state.diagnosticsResults.isNotEmpty(),
+                enter = expandVertically(
+                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
+                ) + fadeIn(tween(220)),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
+                SettingsSection(title = "SANDBOX DIAGNOSTICS") {
+                    if (state.isRunningDiagnostics) {
+                        ListItem(
+                            headlineContent = { Text("Running sandbox health checks…") },
+                            leadingContent = {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            },
+                            colors = transparentListItemColors(),
+                        )
+                    } else {
+                        state.diagnosticsResults.forEachIndexed { idx, check ->
+                            if (idx > 0) SettingsRowDivider()
+                            ListItem(
+                                headlineContent = {
+                                    Text(
+                                        check.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                },
+                                supportingContent = {
+                                    Text(
+                                        check.detail,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                },
+                                leadingContent = {
+                                    Icon(
+                                        imageVector = if (check.passed) Icons.Filled.CheckCircle else Icons.Filled.Cancel,
+                                        contentDescription = null,
+                                        tint = if (check.passed) Color(0xFF34C759) else MaterialTheme.colorScheme.error,
+                                    )
+                                },
+                                colors = transparentListItemColors(),
+                            )
+                        }
+                    }
+                }
+            }
+
+            // --- Status & Storage Breakdown section ---
             SettingsSection(title = stringResource(R.string.rootfs_status_section)) {
                 ListItem(
                     headlineContent = { Text(stringResource(R.string.rootfs_installed_label)) },
@@ -147,7 +235,7 @@ fun RootfsManagementScreen(
                             if (state.isInstalled) Icons.Filled.CheckCircle else Icons.Filled.Cancel,
                             contentDescription = null,
                             tint = if (state.isInstalled)
-                                MaterialTheme.colorScheme.primary
+                                Color(0xFF34C759)
                             else
                                 MaterialTheme.colorScheme.error,
                         )
@@ -163,6 +251,7 @@ fun RootfsManagementScreen(
                                 Text(
                                     Formatter.formatFileSize(context, state.rootfsSize),
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontWeight = FontWeight.SemiBold,
                                 )
                             } else {
                                 CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -177,12 +266,69 @@ fun RootfsManagementScreen(
                             Text(
                                 state.rootfsPath,
                                 style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                             )
                         },
                         colors = transparentListItemColors(),
                     )
+                    if (state.dirBreakdown.isNotEmpty() && state.rootfsSize > 0) {
+                        SettingsRowDivider()
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = "Directory Breakdown",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            state.dirBreakdown.forEach { (dirName, bytes) ->
+                                val ratio = (bytes.toFloat() / state.rootfsSize.coerceAtLeast(1L)).coerceIn(0.02f, 1f)
+                                val animRatio by animateFloatAsState(
+                                    targetValue = ratio,
+                                    animationSpec = spring(stiffness = Spring.StiffnessLow),
+                                    label = "dir_ratio",
+                                )
+                                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        Text(
+                                            text = dirName,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                        )
+                                        Text(
+                                            text = Formatter.formatFileSize(context, bytes),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(4.dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                            .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth(animRatio)
+                                                .height(4.dp)
+                                                .clip(RoundedCornerShape(2.dp))
+                                                .background(MaterialTheme.colorScheme.primary),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -215,14 +361,31 @@ fun RootfsManagementScreen(
             }
 
             // --- Container Network section ---
-            // [T-container-network-dns] (OpenMinis#396) Shown before install too:
-            // the install itself writes resolv.conf through the same setting.
             SettingsSection(title = stringResource(R.string.rootfs_network_section)) {
                 ContainerNetworkSection()
             }
 
             // --- Actions section ---
             SettingsSection(title = stringResource(R.string.rootfs_actions_section)) {
+                ListItem(
+                    headlineContent = { Text("Run Sandbox Health Check") },
+                    supportingContent = { Text("Verify PRoot engine, Alpine filesystem, DNS, and shell latency") },
+                    leadingContent = {
+                        Icon(
+                            Icons.Filled.Bolt,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickableListItem(
+                            enabled = !state.isRunningDiagnostics,
+                            onClick = { viewModel.runDiagnostics(context) },
+                        ),
+                    colors = transparentListItemColors(),
+                )
+                SettingsRowDivider()
                 if (!state.isInstalled) {
                     ListItem(
                         headlineContent = { Text(stringResource(R.string.rootfs_install_label)) },
@@ -238,6 +401,21 @@ fun RootfsManagementScreen(
                         colors = transparentListItemColors(),
                     )
                 } else {
+                    ListItem(
+                        headlineContent = { Text("Clean Sandbox Temp & Cache") },
+                        supportingContent = { Text("Reclaim disk space in /tmp and /var/cache/apk without deleting user files") },
+                        leadingContent = {
+                            Icon(Icons.Filled.CleaningServices, contentDescription = null)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickableListItem(
+                                enabled = !state.isProcessing,
+                                onClick = { viewModel.cleanSandboxCache(context) },
+                            ),
+                        colors = transparentListItemColors(),
+                    )
+                    SettingsRowDivider()
                     ListItem(
                         headlineContent = { Text(stringResource(R.string.rootfs_reset_label)) },
                         supportingContent = { Text(stringResource(R.string.rootfs_reset_description)) },
@@ -289,7 +467,11 @@ fun RootfsManagementScreen(
             }
 
             // --- Progress / Result ---
-            if (state.isProcessing) {
+            AnimatedVisibility(
+                visible = state.isProcessing,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
                 SettingsSection(title = stringResource(R.string.rootfs_progress_section)) {
                     ListItem(
                         headlineContent = { Text(state.statusMessage) },
@@ -395,6 +577,178 @@ fun RootfsManagementScreen(
                     Text(stringResource(R.string.common_cancel))
                 }
             },
+        )
+    }
+}
+
+@Composable
+private fun SandboxHeroStatusCard(
+    state: RootfsManagementUiState,
+    context: Context,
+    onRunDiagnostics: () -> Unit,
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "sandbox_hero_pulse")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 0.9f,
+        targetValue = 1.18f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "sandbox_pulse",
+    )
+
+    val accentColor = if (state.isInstalled) Color(0xFF34C759) else MaterialTheme.colorScheme.primary
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 2.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    Brush.linearGradient(
+                        colors = listOf(
+                            accentColor.copy(alpha = 0.10f),
+                            Color.Transparent,
+                        )
+                    )
+                )
+                .border(
+                    0.5.dp,
+                    accentColor.copy(alpha = 0.28f),
+                    RoundedCornerShape(16.dp),
+                )
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(accentColor.copy(alpha = 0.16f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Memory,
+                            contentDescription = null,
+                            tint = accentColor,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    }
+                    Column {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .scale(if (state.isInstalled) pulseScale else 1f)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (state.isInstalled) Color(0xFF34C759)
+                                        else MaterialTheme.colorScheme.error
+                                    ),
+                            )
+                            Text(
+                                text = if (state.isInstalled) "Alpine Linux Sandbox Ready" else "Sandbox Not Installed",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                        Text(
+                            text = if (state.isProotAvailable) "Native PRoot Engine · Alpine v3.21"
+                            else "Host Shell Fallback · Alpine v3.21",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                        .clickable(onClick = onRunDiagnostics)
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.Bolt,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Text(
+                            text = "Diagnose",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SandboxMetaBadge(label = "ARCH", value = state.deviceArch.uppercase())
+                SandboxMetaBadge(
+                    label = "ENGINE",
+                    value = if (state.isProotAvailable) "PROOT" else "HOST SH",
+                )
+                if (state.isInstalled && state.rootfsSize > 0) {
+                    SandboxMetaBadge(
+                        label = "DISK",
+                        value = Formatter.formatFileSize(context, state.rootfsSize),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SandboxMetaBadge(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 10.sp,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
         )
     }
 }

@@ -3,7 +3,21 @@ package com.openminis.app.ui.terminal
 import com.openminis.app.R
 import androidx.compose.ui.res.stringResource
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -21,6 +35,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -28,19 +43,20 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.KeyboardTab
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Eject
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.KeyboardHide
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.Cancel
 import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.PauseCircle
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
-import androidx.compose.ui.platform.LocalConfiguration
-import android.content.res.Configuration
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -51,6 +67,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -58,30 +75,82 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.openminis.app.sandbox.RootfsManager
 import com.openminis.app.sandbox.TerminalSession
 import com.openminis.app.terminal.MinisOpenUrlBroker
 import com.openminis.app.ui.terminal.canvas.TerminalNativeViewCompose
 import com.openminis.app.ui.terminal.canvas.TerminalInputView
 import com.openminis.app.ui.terminal.canvas.rememberTerminalInputController
 import com.openminis.app.ui.terminal.emulator.TerminalEmulator
-import kotlinx.coroutines.launch
 
-// iOS-matched palette
-private val TerminalBg = Color(0xFF000000)
-private val TerminalFg = Color(0xFFD4D4D4)
+// iOS-matched palette with rich dark accents
+private val TerminalBg = Color(0xFF0A0C10)
+private val TerminalHeaderBg = Color(0xFF12161F)
+private val TerminalFg = Color(0xFFE2E8F0)
 private val TerminalGreen = Color(0xFF34C759)
-private val AccessoryBg = Color(0xFF1F1F1F)
-private val AccButtonBg = Color(0xFF404040)
+private val TerminalAmber = Color(0xFFF59E0B)
+private val TerminalRed = Color(0xFFEF4444)
+private val TerminalCyan = Color(0xFF38BDF8)
+private val AccessoryBg = Color(0xFF181C26)
+private val AccButtonBg = Color(0xFF283040)
 private val AccButtonActive = Color(0xFF007AFF)
-private val TopButtonBg = Color(0xFF2C2C2E)
+private val TopButtonBg = Color(0xFF222836)
+
+private data class TerminalSnippetCategory(
+    val title: String,
+    val snippets: List<Pair<String, String>>,
+)
+
+private val TERMINAL_SNIPPET_CATEGORIES = listOf(
+    TerminalSnippetCategory(
+        title = "Workspace",
+        snippets = listOf(
+            "ls /var/minis" to "ls -la /var/minis",
+            "cd workspace" to "cd /var/minis/workspace && ls -la",
+            "Disk usage" to "du -sh /var/minis/* 2>/dev/null || df -h",
+            "Find files" to "find /var/minis -maxdepth 3",
+            "Skills list" to "ls -la /var/minis/skills",
+        ),
+    ),
+    TerminalSnippetCategory(
+        title = "System",
+        snippets = listOf(
+            "Sys info" to "uname -a && cat /etc/os-release 2>/dev/null",
+            "Processes" to "ps aux 2>/dev/null || ps",
+            "Storage" to "df -h",
+            "Memory" to "free -m 2>/dev/null || cat /proc/meminfo | head -n 6",
+            "Env vars" to "env | sort",
+        ),
+    ),
+    TerminalSnippetCategory(
+        title = "Alpine APK",
+        snippets = listOf(
+            "apk update" to "apk update",
+            "Installed pkgs" to "apk info | sort",
+            "Add curl & git" to "apk add --no-cache curl git",
+            "Add python3" to "apk add --no-cache python3 py3-pip",
+            "Mirrors" to "cat /etc/apk/repositories 2>/dev/null",
+        ),
+    ),
+    TerminalSnippetCategory(
+        title = "Dev & Net",
+        snippets = listOf(
+            "DNS config" to "cat /etc/resolv.conf",
+            "Ping 1.1.1.1" to "ping -c 3 1.1.1.1",
+            "Python ver" to "python3 --version",
+            "Node ver" to "node --version",
+            "Git status" to "git status",
+        ),
+    ),
+)
 
 @Composable
 fun TerminalScreen(
@@ -98,8 +167,14 @@ fun TerminalScreen(
     val emulator = remember { TerminalEmulator() }
     val context = LocalContext.current
     val inputController = rememberTerminalInputController()
-    val scope = rememberCoroutineScope()
     var ctrlActive by remember { mutableStateOf(false) }
+    var showSnippetsDrawer by remember { mutableStateOf(false) }
+    var selectedCategoryIndex by remember { mutableIntStateOf(0) }
+
+    val sessionState by terminalSession.state.collectAsStateEffect()
+    val isProotAvailable = remember(context) {
+        RootfsManager.getInstance(context).isProotAvailable
+    }
 
     // Pipe PTY output → emulator.
     LaunchedEffect(terminalSession) {
@@ -132,32 +207,6 @@ fun TerminalScreen(
         }
     }
 
-    // T-android-terminal-keyboard-3a8f5e0b: Do NOT auto-focus the hidden input
-    // EditText on open. Previously a 20-tick retry loop here force-popped the
-    // IME on entry (matching iOS becomeFirstResponder), but on Android that
-    // caused two issues: (1) keyboard pops up unsolicited when the user just
-    // wants to read terminal output, (2) the back gesture's first press hides
-    // the IME, then the still-living retry loop (or a focus-restore on next
-    // composition) re-pops it, requiring a second back press to actually
-    // leave the screen. Android convention for read-eval shells is to let the
-    // user tap the canvas (handled below via `onTap = { requestFocus() }`) or
-    // the keyboard-toggle button in the accessory bar to deliberately invoke
-    // the IME — that single user action handles both opening the keyboard
-    // and (via the toggle) closing it, and a single back press now exits.
-
-    // [T-android-terminal-enter-keeps-focus] ...but DO auto-focus when a
-    // hardware keyboard is attached.
-    //
-    // Every objection in the note above is about the soft IME: it pops up
-    // unsolicited over the output, and it fights the back gesture. With a
-    // physical keyboard there is no IME to pop — focus is invisible — so the
-    // only thing auto-focus changes is that the keys the user presses arrive
-    // somewhere. Without it, opening the terminal and typing does nothing at
-    // all, with no on-screen hint as to why.
-    // [T-android-hwkeyboard-virtual-false-positive] Same rule as the chat
-    // composer — see HardwareKeyboard. Configuration.keyboard alone also
-    // counts virtual HID keyboards (scrcpy --uhid), which would auto-focus the
-    // terminal input on a touch-only phone.
     val hasHardwareKeyboard = com.openminis.app.ui.components.rememberHasHardwareKeyboard()
     LaunchedEffect(hasHardwareKeyboard) {
         if (hasHardwareKeyboard) inputController.requestFocus()
@@ -167,20 +216,11 @@ fun TerminalScreen(
         onDispose { terminalSession.stop() }
     }
 
-    // Claim the broker while the fullscreen terminal is up so ChatScreen
-    // (still composed underneath this destination's stack) doesn't try to
-    // present its own preview sheet on top — mirrors iOS ISHTerminalView.
     DisposableEffect(Unit) {
         MinisOpenUrlBroker.setTerminalVisible(true)
         onDispose { MinisOpenUrlBroker.setTerminalVisible(false) }
     }
 
-    // OSC 1337 MinisOpenURL emitted by `/usr/local/bin/minis-open` is parsed
-    // by TerminalEmulator and forwarded to MinisOpenUrlBroker. From the
-    // standalone terminal we only route web schemes (http(s)/about) into an
-    // in-app WebView preview; minis://-style chat resources need ChatScreen's
-    // resolver and aren't reachable here, so we still consume them to avoid
-    // leaking a stale pendingUrl back to chat on next attach.
     var previewUrl by remember { mutableStateOf<String?>(null) }
     val pendingUrl by MinisOpenUrlBroker.pendingUrl.collectAsStateEffect()
     LaunchedEffect(pendingUrl) {
@@ -191,20 +231,10 @@ fun TerminalScreen(
         MinisOpenUrlBroker.consume()
     }
 
-    // T290: Layered layout — top bar fixed, canvas fills middle, accessory
-    // bar pinned to bottom and lifted above the IME via Modifier.imePadding().
-    //
-    // Pre-T290 this was an off-window Popup + manually-tracked IME height
-    // built around a Pixel/Gboard PAN-mode quirk. That misfired on pixel6
-    // (bar still under the keyboard). With windowSoftInputMode=adjustResize
-    // already set in the manifest, edge-to-edge enabled, and modern Pixel
-    // builds reporting WindowInsets.ime correctly, a plain in-window Box +
-    // imePadding does the right thing without any custom tracking.
-    val accessoryBarHeightDp = 40.dp
+    val accessoryBarHeightDp = 44.dp
 
     Box(modifier = Modifier.fillMaxSize().background(TerminalBg)) {
-        // Main content: top bar + canvas. imePadding() lifts the canvas
-        // above the keyboard so it's never covered.
+        // Main content: top bar + optional snippet drawer + canvas.
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -212,12 +242,53 @@ fun TerminalScreen(
                 .imePadding()
                 .padding(bottom = accessoryBarHeightDp),
         ) {
-            Spacer(modifier = Modifier.height(52.dp))
+            TerminalTopBar(
+                sessionState = sessionState,
+                isProotAvailable = isProotAvailable,
+                sessionId = sessionId,
+                snippetsExpanded = showSnippetsDrawer,
+                onToggleSnippets = { showSnippetsDrawer = !showSnippetsDrawer },
+                onRestart = {
+                    emulator.feed("\u001Bc".toByteArray())
+                    terminalSession.start(sessionId = sessionId)
+                },
+                onClose = {
+                    terminalSession.stop()
+                    onBack()
+                },
+                onClear = {
+                    terminalSession.sendRawBytes(byteArrayOf(0x15))
+                    terminalSession.clearOutput()
+                    emulator.feed("\u001Bc".toByteArray())
+                },
+            )
+
+            AnimatedVisibility(
+                visible = showSnippetsDrawer,
+                enter = expandVertically(
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioLowBouncy,
+                        stiffness = Spring.StiffnessMediumLow,
+                    )
+                ) + fadeIn(tween(180)),
+                exit = shrinkVertically(
+                    animationSpec = spring(stiffness = Spring.StiffnessMedium)
+                ) + fadeOut(tween(140)),
+            ) {
+                TerminalSnippetsDrawer(
+                    selectedCategoryIndex = selectedCategoryIndex,
+                    onSelectCategory = { selectedCategoryIndex = it },
+                    onRunSnippet = { cmd ->
+                        emulator.scrollOffset = 0
+                        if (!terminalSession.isRunning) {
+                            terminalSession.start(sessionId = sessionId)
+                        }
+                        terminalSession.sendText("$cmd\n")
+                    },
+                )
+            }
+
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                // T194 part-2: native Android View backing gives us long-press
-                // selection + ActionMode + ClipboardManager copy. The old
-                // TerminalCanvasView is left in the package as a Compose-only
-                // fallback if anything regresses with the View interop path.
                 TerminalNativeViewCompose(
                     emulator = emulator,
                     onResize = { cols, rows ->
@@ -228,7 +299,6 @@ fun TerminalScreen(
                 )
                 TerminalInputView(
                     onInput = { bytes ->
-                        // Any user input snaps back to live tail so typing is visible.
                         emulator.scrollOffset = 0
                         if (ctrlActive && bytes.size == 1) {
                             val ch = bytes[0].toInt().toChar().uppercaseChar()
@@ -247,36 +317,7 @@ fun TerminalScreen(
             }
         }
 
-        // Top bar pinned at top — never moves with IME.
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .align(Alignment.TopStart)
-                .windowInsetsPadding(WindowInsets.systemBars)
-                .height(52.dp)
-                .background(TerminalBg),
-        ) {
-            TerminalTopBar(
-                onClose = {
-                    terminalSession.stop()
-                    onBack()
-                },
-                onClear = {
-                    // T310: send Ctrl+U (NAK, 0x15) so readline kills any
-                    // half-typed line in the shell. Otherwise those chars
-                    // stay in the line buffer and get prepended to the
-                    // user's next command after the visual clear.
-                    terminalSession.sendRawBytes(byteArrayOf(0x15))
-                    terminalSession.clearOutput()
-                    emulator.feed("\u001Bc".toByteArray())
-                },
-            )
-        }
-
-        // T290: accessory bar — anchored to bottom of the parent Box and
-        // lifted above the IME via imePadding(). When the keyboard is
-        // closed, windowInsetsPadding(navigationBars) keeps it above the
-        // gesture / nav bar. No Popup, no manual IME tracking.
+        // Accessory bar anchored to bottom and lifted above the IME via imePadding()
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -287,15 +328,27 @@ fun TerminalScreen(
             KeyboardAccessoryBar(
                 ctrlActive = ctrlActive,
                 keyboardVisible = inputController.isFocused,
+                snippetsActive = showSnippetsDrawer,
                 onCtrlToggle = { ctrlActive = !ctrlActive },
                 onToggleKeyboard = {
                     if (inputController.isFocused) inputController.clearFocus()
                     else inputController.requestFocus()
                 },
+                onToggleSnippets = { showSnippetsDrawer = !showSnippetsDrawer },
                 onCopyAll = { copyAllToClipboard(context, emulator) },
+                onPaste = {
+                    pasteFromClipboard(context) { text ->
+                        emulator.scrollOffset = 0
+                        terminalSession.sendText(text)
+                    }
+                },
                 onSendRaw = { bytes ->
                     emulator.scrollOffset = 0
                     terminalSession.sendRawBytes(bytes)
+                },
+                onSendText = { text ->
+                    emulator.scrollOffset = 0
+                    terminalSession.sendText(text)
                 },
                 onArrow = { dir ->
                     emulator.scrollOffset = 0
@@ -316,7 +369,7 @@ fun TerminalScreen(
     }
 }
 
-// ── Tiny helper: collectAsState for StateFlow<Int> without pulling all of androidx.lifecycle ──
+// ── Tiny helper: collectAsState for StateFlow<T> ──
 @Composable
 private fun <T> kotlinx.coroutines.flow.StateFlow<T>.collectAsStateEffect(): androidx.compose.runtime.State<T> {
     val state = remember { androidx.compose.runtime.mutableStateOf(value) }
@@ -328,13 +381,40 @@ private fun <T> kotlinx.coroutines.flow.StateFlow<T>.collectAsStateEffect(): and
 
 @Composable
 private fun TerminalTopBar(
+    sessionState: TerminalSession.State,
+    isProotAvailable: Boolean,
+    sessionId: String?,
+    snippetsExpanded: Boolean,
+    onToggleSnippets: () -> Unit,
+    onRestart: () -> Unit,
     onClose: () -> Unit,
     onClear: () -> Unit,
 ) {
+    val infiniteTransition = rememberInfiniteTransition(label = "terminal_status_pulse")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 0.85f,
+        targetValue = 1.2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(900, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "pulse_scale",
+    )
+
+    val statusColor = when (sessionState) {
+        TerminalSession.State.RUNNING -> TerminalGreen
+        TerminalSession.State.BOOTING, TerminalSession.State.IDLE -> TerminalAmber
+        TerminalSession.State.STOPPED -> TerminalRed
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(TerminalBg)
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(TerminalHeaderBg, TerminalBg)
+                )
+            )
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -345,21 +425,189 @@ private fun TerminalTopBar(
             onClick = onClose,
         )
         Spacer(modifier = Modifier.weight(1f))
-        Text(
-            stringResource(R.string.terminal_title),
-            color = TerminalFg,
-            style = TextStyle(
-                fontFamily = JetBrainsMonoFontFamily,
-                fontSize = 16.sp,
-            ),
-        )
+
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .scale(if (sessionState == TerminalSession.State.RUNNING) pulseScale else 1f)
+                        .clip(CircleShape)
+                        .background(statusColor),
+                )
+                Text(
+                    stringResource(R.string.terminal_title),
+                    color = TerminalFg,
+                    style = TextStyle(
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 15.sp,
+                    ),
+                )
+                // Engine badge
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(
+                            if (isProotAvailable) TerminalGreen.copy(alpha = 0.16f)
+                            else TerminalCyan.copy(alpha = 0.16f)
+                        )
+                        .border(
+                            0.5.dp,
+                            if (isProotAvailable) TerminalGreen.copy(alpha = 0.45f)
+                            else TerminalCyan.copy(alpha = 0.45f),
+                            RoundedCornerShape(6.dp),
+                        )
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = if (isProotAvailable) "ALPINE" else "HOST SH",
+                        color = if (isProotAvailable) TerminalGreen else TerminalCyan,
+                        style = TextStyle(
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                        ),
+                    )
+                }
+            }
+            if (sessionId != null) {
+                Text(
+                    text = "chat:${sessionId.take(8)} · /var/minis",
+                    color = TerminalFg.copy(alpha = 0.55f),
+                    style = TextStyle(
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontSize = 10.sp,
+                    ),
+                )
+            }
+        }
+
         Spacer(modifier = Modifier.weight(1f))
-        CircularIconButton(
-            icon = Icons.Default.Brush,
-            contentDescription = stringResource(R.string.terminal_clear),
-            tint = TerminalGreen,
-            onClick = onClear,
-        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (sessionState == TerminalSession.State.STOPPED) {
+                CircularIconButton(
+                    icon = Icons.Default.Refresh,
+                    contentDescription = "Restart Shell",
+                    tint = TerminalAmber,
+                    onClick = onRestart,
+                )
+            }
+            CircularIconButton(
+                icon = Icons.Default.Bolt,
+                contentDescription = "Quick Snippets",
+                tint = if (snippetsExpanded) Color.White else TerminalCyan,
+                backgroundColor = if (snippetsExpanded) AccButtonActive else TopButtonBg,
+                onClick = onToggleSnippets,
+            )
+            CircularIconButton(
+                icon = Icons.Default.Brush,
+                contentDescription = stringResource(R.string.terminal_clear),
+                tint = TerminalGreen,
+                onClick = onClear,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TerminalSnippetsDrawer(
+    selectedCategoryIndex: Int,
+    onSelectCategory: (Int) -> Unit,
+    onRunSnippet: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF131822))
+            .padding(vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        // Category selector row
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TERMINAL_SNIPPET_CATEGORIES.forEachIndexed { idx, cat ->
+                val selected = idx == selectedCategoryIndex
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (selected) AccButtonActive else Color(0xFF1F2735))
+                        .clickable { onSelectCategory(idx) }
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                ) {
+                    Text(
+                        text = cat.title,
+                        color = if (selected) Color.White else TerminalFg.copy(alpha = 0.75f),
+                        style = TextStyle(
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontSize = 11.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                        ),
+                    )
+                }
+            }
+        }
+
+        // Snippets chips row
+        val activeCategory = TERMINAL_SNIPPET_CATEGORIES.getOrElse(selectedCategoryIndex) {
+            TERMINAL_SNIPPET_CATEGORIES.first()
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            activeCategory.snippets.forEach { (label, command) ->
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFF1E2636))
+                        .border(0.5.dp, TerminalCyan.copy(alpha = 0.35f), RoundedCornerShape(8.dp))
+                        .clickable { onRunSnippet(command) }
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = "❯",
+                        color = TerminalGreen,
+                        style = TextStyle(fontFamily = JetBrainsMonoFontFamily, fontSize = 11.sp),
+                    )
+                    Column {
+                        Text(
+                            text = label,
+                            color = TerminalFg,
+                            style = TextStyle(
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                            ),
+                        )
+                        Text(
+                            text = command,
+                            color = TerminalFg.copy(alpha = 0.5f),
+                            style = TextStyle(
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontSize = 9.sp,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -368,13 +616,14 @@ private fun CircularIconButton(
     icon: ImageVector,
     contentDescription: String,
     tint: Color,
+    backgroundColor: Color = TopButtonBg,
     onClick: () -> Unit,
 ) {
     Box(
         modifier = Modifier
             .size(36.dp)
             .clip(CircleShape)
-            .background(TopButtonBg)
+            .background(backgroundColor)
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
@@ -387,15 +636,8 @@ private fun CircularIconButton(
     }
 }
 
-// ─── Copy All (#451) ──────────────────────────────────────────────────────────
+// ─── Copy All & Paste (#451) ──────────────────────────────────────────────────
 
-/**
- * [#451] The terminal's whole output to the clipboard, with a Toast. Runs on
- * the main thread, which is also where the PTY output is fed, so the buffer
- * is not changing underneath. A clip goes through Binder (about 1 MB a
- * transaction), so a very wide, CJK-heavy history can be refused: that is
- * reported instead of crashing.
- */
 private fun copyAllToClipboard(context: Context, emulator: TerminalEmulator) {
     val text = emulator.copyableText()
     if (text.isEmpty()) return
@@ -414,61 +656,87 @@ private fun copyAllToClipboard(context: Context, emulator: TerminalEmulator) {
     }
 }
 
+private fun pasteFromClipboard(context: Context, onText: (String) -> Unit) {
+    runCatching {
+        val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val item = cb.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+        val text = item?.coerceToText(context)?.toString()
+        if (!text.isNullOrEmpty()) {
+            onText(text)
+        } else {
+            Toast.makeText(context, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
 // ─── Keyboard accessory bar ───────────────────────────────────────────────────
 
 @Composable
 private fun KeyboardAccessoryBar(
     ctrlActive: Boolean,
     keyboardVisible: Boolean,
+    snippetsActive: Boolean,
     onCtrlToggle: () -> Unit,
     onToggleKeyboard: () -> Unit,
+    onToggleSnippets: () -> Unit,
     onCopyAll: () -> Unit,
+    onPaste: () -> Unit,
     onSendRaw: (ByteArray) -> Unit,
+    onSendText: (String) -> Unit,
     onArrow: (Char) -> Unit,
 ) {
     val scrollState = rememberScrollState()
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 4.dp)
+            .padding(horizontal = 6.dp, vertical = 4.dp)
             .clip(RoundedCornerShape(12.dp))
-            .background(AccessoryBg),
+            .background(AccessoryBg)
+            .border(0.5.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp)),
     ) {
         Row(
             modifier = Modifier
                 .horizontalScroll(scrollState)
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-        QuickCommandButton(
-            label = stringResource(if (keyboardVisible) R.string.terminal_hide_keyboard else R.string.terminal_show_keyboard),
-            icon = if (keyboardVisible) Icons.Default.KeyboardHide else Icons.Outlined.Keyboard,
-            onClick = onToggleKeyboard,
-        )
-        // [#451] Copy the whole output (scrollback + screen). Here rather
-        // than in the top bar, where it would sit next to Clear.
-        QuickCommandButton(
-            label = stringResource(R.string.terminal_copy_all),
-            icon = Icons.Outlined.ContentCopy,
-            onClick = onCopyAll,
-        )
-        QuickCommandButton("Esc", iconText = "⎋") { onSendRaw(byteArrayOf(0x1B)) }
-        QuickCommandButton("Tab", icon = Icons.AutoMirrored.Filled.KeyboardTab) { onSendRaw(byteArrayOf(0x09)) }
-        // [T-android-shell-toolbar-enter-key] The soft keyboard's Return
-        // inserts a newline inside the terminal, so it can't send a real
-        // carriage return to run a command line / trigger an in-CLI prompt.
-        // This writes CR (0x0D) on the same raw-PTY path as Esc/Tab/C-c.
-        // Placed right after Tab, mirroring iOS fa3d2f8c.
-        QuickCommandButton("⏎", iconText = "⏎") { onSendRaw(byteArrayOf(0x0D)) }
-        QuickCommandButton("Ctrl", iconText = "^", isActive = ctrlActive, onClick = onCtrlToggle)
-        QuickCommandButton("\u2191", icon = Icons.Default.KeyboardArrowUp) { onArrow('A') }
-        QuickCommandButton("\u2193", icon = Icons.Default.KeyboardArrowDown) { onArrow('B') }
-        QuickCommandButton("\u2190", icon = Icons.AutoMirrored.Filled.KeyboardArrowLeft) { onArrow('D') }
-        QuickCommandButton("\u2192", icon = Icons.AutoMirrored.Filled.KeyboardArrowRight) { onArrow('C') }
-        QuickCommandButton("C-c", icon = Icons.Outlined.Cancel) { onSendRaw(byteArrayOf(0x03)) }
-        QuickCommandButton("C-d", icon = Icons.Default.Eject) { onSendRaw(byteArrayOf(0x04)) }
-        QuickCommandButton("C-z", icon = Icons.Outlined.PauseCircle) { onSendRaw(byteArrayOf(0x1A)) }
+            QuickCommandButton(
+                label = stringResource(if (keyboardVisible) R.string.terminal_hide_keyboard else R.string.terminal_show_keyboard),
+                icon = if (keyboardVisible) Icons.Default.KeyboardHide else Icons.Outlined.Keyboard,
+                onClick = onToggleKeyboard,
+            )
+            QuickCommandButton(
+                label = "Snippets",
+                icon = Icons.Default.Bolt,
+                isActive = snippetsActive,
+                onClick = onToggleSnippets,
+            )
+            QuickCommandButton(
+                label = "Paste",
+                icon = Icons.Default.ContentPaste,
+                onClick = onPaste,
+            )
+            QuickCommandButton(
+                label = stringResource(R.string.terminal_copy_all),
+                icon = Icons.Outlined.ContentCopy,
+                onClick = onCopyAll,
+            )
+            QuickCommandButton("Esc", iconText = "⎋") { onSendRaw(byteArrayOf(0x1B)) }
+            QuickCommandButton("Tab", icon = Icons.AutoMirrored.Filled.KeyboardTab) { onSendRaw(byteArrayOf(0x09)) }
+            QuickCommandButton("⏎", iconText = "⏎") { onSendRaw(byteArrayOf(0x0D)) }
+            QuickCommandButton("Ctrl", iconText = "^", isActive = ctrlActive, onClick = onCtrlToggle)
+            QuickCommandButton("\u2191", icon = Icons.Default.KeyboardArrowUp) { onArrow('A') }
+            QuickCommandButton("\u2193", icon = Icons.Default.KeyboardArrowDown) { onArrow('B') }
+            QuickCommandButton("\u2190", icon = Icons.AutoMirrored.Filled.KeyboardArrowLeft) { onArrow('D') }
+            QuickCommandButton("\u2192", icon = Icons.AutoMirrored.Filled.KeyboardArrowRight) { onArrow('C') }
+            QuickCommandButton("C-c", icon = Icons.Outlined.Cancel) { onSendRaw(byteArrayOf(0x03)) }
+            QuickCommandButton("C-d", icon = Icons.Default.Eject) { onSendRaw(byteArrayOf(0x04)) }
+            QuickCommandButton("C-z", icon = Icons.Outlined.PauseCircle) { onSendRaw(byteArrayOf(0x1A)) }
+            QuickCommandButton("|") { onSendText("|") }
+            QuickCommandButton("/") { onSendText("/") }
+            QuickCommandButton("-") { onSendText("-") }
+            QuickCommandButton("~") { onSendText("~") }
         }
     }
 }
@@ -486,7 +754,7 @@ private fun QuickCommandButton(
     Row(
         modifier = Modifier
             .height(28.dp)
-            .clip(RoundedCornerShape(6.dp))
+            .clip(RoundedCornerShape(7.dp))
             .background(bg)
             .clickable(onClick = onClick)
             .padding(horizontal = 10.dp),
