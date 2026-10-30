@@ -1,8 +1,36 @@
 package com.openminis.app.ui.chat
 
+import android.content.Context
 import android.util.Log
+import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.layout
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
+import com.openminis.app.data.model.ModelEntry
+import com.openminis.app.data.model.ModelGroup
+import com.openminis.app.data.model.RoutingStrategy
+import com.openminis.app.data.repository.ProviderRepository
+import com.openminis.app.logging.AppLogger
+import com.openminis.app.provider.LLMProvider
+import com.openminis.app.provider.ProviderFactory
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * Process-level cache of ChatViewModels keyed by sessionId. Mirrors iOS
@@ -821,5 +849,672 @@ object ChatViewModelStore {
                 "text=${t.inputText.length}ch attachments=${t.attachments.size}",
         )
         return t
+    }
+}
+
+// ─── Merged from TableColumnPlanner.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-android-table-width-by-content] Decides markdown table column widths from
+ * how much text each column holds. Port of iOS `TableColumnPlanner` as of
+ * b3ec29cee (T-table-width-by-content); widths are in dp, the iOS constants
+ * are points, so the numbers match one to one.
+ *
+ * History: every column at its single-line width (up to 5× the viewport) made
+ * prose tables several screens wide; the next plan guaranteed three columns,
+ * then two plus a peek — both capped every visible column at the SAME width,
+ * so a column with three times the text came out as narrow as its neighbour.
+ * Now widths follow the content ratio and a wordier column is never narrower.
+ *
+ * Per column (all widths include the cell's horizontal padding):
+ *   n = natural width: widest cell on one line, never below FLOOR_WIDTH
+ *   h = hard minimum: min(n, max(floor, min(longest Latin word, scrollCap), hardMin))
+ *   c = comfortable width: min(n, max(h, COMFORT_FRACTION · W))
+ * Modes:
+ *   1. Σn ≤ W  → NATURAL: every column grows in proportion to n to fill W.
+ *   2. Σc ≤ W  → WRAPPED: max(h, min(n, C + (n − C) · t)) with C = COMFORT · W
+ *                and one t ∈ [0, 1] chosen so the table exactly fills W.
+ *   3. else    → SCROLLS: clamp(n, c, max(c, scrollCap)); the column crossing
+ *                the right edge shows at least PEEK_MIN.
+ * Invariant (tested): n_i ≥ n_j ⇒ width_i ≥ width_j, except where a long word
+ * or an inline formula forces a minimum.
+ *
+ * Android-only: [Column.hardMin]. iOS fits an over-wide cell formula to the
+ * cell (wrap at relations / scale); Android's inline formula is a fixed-size
+ * Placeholder sized before layout, so the column must hold it instead.
+ *
+ * Pure (no Android types) so `TableColumnPlannerTest` runs it on the JVM.
+ */
+internal object TableColumnPlanner {
+
+    /**
+     * @param natural widest cell of the column on a single line, padding included
+     * @param minUnbreakable widest run that should not be split (longest Latin word), padding included
+     * @param hardMin width the column can never go below, padding included: the
+     *   widest inline-formula slot, which cannot wrap. 0 when the column has none.
+     */
+    data class Column(val natural: Float, val minUnbreakable: Float, val hardMin: Float = 0f)
+
+    enum class Mode { NATURAL, WRAPPED, SCROLLS }
+
+    data class Plan(val widths: FloatArray, val tableWidth: Float, val mode: Mode) {
+        override fun equals(other: Any?): Boolean = other is Plan && widths.contentEquals(other.widths) &&
+            tableWidth == other.tableWidth && mode == other.mode
+
+        override fun hashCode(): Int = widths.contentHashCode()
+    }
+
+    /** Narrowest column (the long-standing minimum). */
+    const val FLOOR_WIDTH = 80f
+    /** A prose column gets at least this share of the viewport before the table scrolls instead. */
+    const val COMFORT_FRACTION = 0.35f
+    /** No column (and no unbreakable word) is wider than this share when the table scrolls. */
+    const val SCROLL_CAP_FRACTION = 0.7f
+    /** Least visible width of the column crossing the right edge, the cue that the table scrolls. */
+    const val PEEK_MIN = 24f
+
+    fun plan(columns: List<Column>, availableWidth: Float): Plan {
+        val n = columns.size
+        val w = max(availableWidth, 0f)
+        if (n == 0 || w <= 0f) return Plan(FloatArray(0), w, Mode.NATURAL)
+        val floorW = min(FLOOR_WIDTH, w)
+        val scrollCap = floor(w * SCROLL_CAP_FRACTION)
+        val comfortW = floor(w * COMFORT_FRACTION)
+        val natural = FloatArray(n) { max(floorW, ceil(columns[it].natural)) }
+        val hard = FloatArray(n) { i ->
+            min(natural[i], maxOf(floorW, min(ceil(columns[i].minUnbreakable), scrollCap), ceil(columns[i].hardMin)))
+        }
+        val comfort = FloatArray(n) { i -> min(natural[i], max(hard[i], comfortW)) }
+        val sumNatural = natural.sum()
+        val sumComfort = comfort.sum()
+
+        if (sumNatural <= w) {
+            // Everything fits on one line: spread the spare width in proportion
+            // to content, so no column ends up wider than a wordier one.
+            return Plan(FloatArray(n) { natural[it] * w / sumNatural }, w, Mode.NATURAL)
+        }
+        if (sumComfort <= w) {
+            // One growth factor for every column, so width stays a function of
+            // content alone; a long word only ever raises its own column to
+            // that word, never gives it a bigger share of the spare width.
+            fun widths(t: Float) = FloatArray(n) {
+                max(hard[it], min(natural[it], comfortW + (natural[it] - comfortW) * t))
+            }
+            var lo = 0f
+            var hi = 1f
+            repeat(40) {
+                val mid = (lo + hi) / 2
+                if (widths(mid).sum() < w) lo = mid else hi = mid
+            }
+            val result = widths(hi)
+            // Bisection lands within a hair of w; the widest column takes the rest.
+            val widest = natural.indices.maxByOrNull { natural[it] }!!
+            result[widest] += w - result.sum()
+            return Plan(result, w, Mode.WRAPPED)
+        }
+        val widths = FloatArray(n) { max(comfort[it], min(natural[it], scrollCap)) }
+        applyPeek(widths, natural, comfort, w)
+        return Plan(widths, max(widths.sum(), w), Mode.SCROLLS)
+    }
+
+    /**
+     * If a column boundary lands just inside the right edge, the next column
+     * shows as a sliver (or not at all) and the table reads as finished.
+     * Narrow the column before it — never below its comfortable width and never
+     * below a column with no more text — so at least PEEK_MIN shows.
+     */
+    fun applyPeek(widths: FloatArray, natural: FloatArray, comfort: FloatArray, viewport: Float) {
+        var x = 0f
+        for (k in widths.indices) {
+            if (x + widths[k] > viewport) {
+                val visible = viewport - x
+                if (k < 1 || visible >= PEEK_MIN) return
+                val j = k - 1
+                val lessText = widths.indices.filter { it != j && natural[it] <= natural[j] }
+                    .maxOfOrNull { widths[it] } ?: 0f
+                val give = min(PEEK_MIN - visible, widths[j] - max(comfort[j], lessText))
+                if (give > 0f) widths[j] -= give
+                return
+            }
+            x += widths[k]
+        }
+    }
+
+    /**
+     * Streaming stability: column widths only grow while a table streams in (a
+     * later row can't make an earlier column jump narrower). A table the plan
+     * fits in the viewport stays within it: any overshoot from the lift is
+     * taken back from the most-lifted columns, never below the plan. A
+     * scrolling table keeps its lifted widths.
+     */
+    fun applyingStreamingFloor(plan: Plan, previous: FloatArray?, availableWidth: Float): Plan {
+        if (previous == null || previous.size != plan.widths.size || plan.widths.isEmpty()) return plan
+        val widths = FloatArray(plan.widths.size) { max(plan.widths[it], previous[it]) }
+        if (plan.mode != Mode.SCROLLS) {
+            var over = widths.sum() - max(availableWidth, plan.widths.sum())
+            while (over >= 0.5f) {
+                val i = widths.indices.maxByOrNull { widths[it] - plan.widths[it] } ?: break
+                val lifted = widths[i] - plan.widths[i]
+                if (lifted <= 0f) break
+                val take = min(over, lifted)
+                widths[i] -= take
+                over -= take
+            }
+        }
+        return Plan(widths, max(widths.sum(), availableWidth), plan.mode)
+    }
+
+    /**
+     * Longest run of the text that should not be split across lines: a
+     * whitespace-delimited run with CJK counted as a break (CJK wraps per
+     * character). Null when there is no run longer than one character.
+     */
+    fun longestUnbreakableRun(text: String): String? {
+        var best: String? = null
+        var start = -1
+        var i = 0
+        fun close(end: Int) {
+            if (start < 0) return
+            val run = text.substring(start, end)
+            if (run.codePointCount(0, run.length) > (best?.let { it.codePointCount(0, it.length) } ?: 0)) best = run
+            start = -1
+        }
+        while (i < text.length) {
+            val cp = text.codePointAt(i)
+            val breaks = Character.isWhitespace(cp) || isCjk(cp)
+            if (breaks) close(i) else if (start < 0) start = i
+            i += Character.charCount(cp)
+        }
+        close(text.length)
+        val b = best ?: return null
+        return if (b.codePointCount(0, b.length) > 1) b else null
+    }
+
+    private fun isCjk(cp: Int): Boolean = cp in 0x1100..0x11FF || cp in 0x2E80..0x2FDF ||
+        cp in 0x3000..0x303F || cp in 0x3040..0x30FF || cp in 0x3100..0x31FF ||
+        cp in 0x3400..0x4DBF || cp in 0x4E00..0x9FFF || cp in 0xAC00..0xD7AF ||
+        cp in 0xF900..0xFAFF || cp in 0xFE30..0xFE4F || cp in 0xFF00..0xFFEF ||
+        cp in 0x20000..0x2FA1F
+}
+
+// ─── Merged from TitleCandidates.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-titlegen-group-order] Which models title generation tries, and in what
+ * order. iOS parity: `regenerateTitleCandidates` + `expandSourceForSubTasks`
+ * (987f1f70d, 26ccf9cb4).
+ *
+ * A title call used to reach ONE model. The auto path resolved the title
+ * group's first member (or fell back to the chat's model) and called it once
+ * per turn; manual Regenerate took the title group's first member, the
+ * session's model id, then every other entry. So a rate-limited title model
+ * left the chat on "New Chat" until the first-message fallback, and the other
+ * members of the group the user had ordered precisely for this — the point of
+ * a fallback group — were never asked.
+ *
+ * Order, deduped by entry id, every candidate available (provider enabled +
+ * credentialed + entry visible) and title-eligible:
+ *   1  title sub group (`defaultSubGroupId`) — the WHOLE group, router order
+ *   2  the session's primary source — its whole group, or its pinned entry
+ *   2b only if nothing so far: the session row's model id
+ *   2c the default primary group — whole group, router order
+ *   3  every other available eligible entry
+ *
+ * "Router order" is the order the agent loop walks a group on provider
+ * failure: the member it would pick first (the preferred/last-used member
+ * when still available, else the strategy's pick — first available for
+ * `fallback`, session-id hash for `loadBalance`), then the members after it,
+ * wrapping around. See ChatViewModel.resolveProviderFromGroup +
+ * buildFallbackProviders.
+ */
+internal object TitleCandidates {
+
+    /**
+     * Cap on models tried per title request: enough to exhaust a typical
+     * 6-member title group before the first-message fallback, without letting
+     * a systemic outage spray every configured model. iOS auto path: 6.
+     */
+    const val MAX_TRIES = 6
+
+    /** Pause between auto-title tries: rate limits recover in seconds. */
+    const val AUTO_PAUSE_MS = 1_500L
+
+    /** Where the session's primary model comes from (ChatSessionEntity.modelBinding). */
+    sealed class PrimarySource {
+        data class Group(val groupId: String, val preferredEntryId: String?) : PrimarySource()
+        data class Entry(val entryId: String) : PrimarySource()
+
+        companion object {
+            /** Parse the persisted binding JSON; null for none / unreadable. */
+            fun parse(bindingJson: String?): PrimarySource? {
+                if (bindingJson.isNullOrBlank()) return null
+                return try {
+                    val obj = org.json.JSONObject(bindingJson)
+                    when (obj.optString("type")) {
+                        "group" -> obj.optString("groupId").takeIf { it.isNotEmpty() }
+                            ?.let { Group(it, obj.optString("lastEntryId").takeIf { e -> e.isNotEmpty() }) }
+                        "entry" -> obj.optString("entryId").takeIf { it.isNotEmpty() }?.let { Entry(it) }
+                        else -> null
+                    }
+                } catch (_: Exception) {
+                    null
+                }
+            }
+        }
+    }
+
+    /**
+     * T334 title-eligibility, shared by both paths: the model must output
+     * text (no declared modalities counts as text) and its id must not name a
+     * non-chat capability — those endpoints reject the chat schema or stream
+     * nothing useful.
+     */
+    fun isTitleEligible(entry: ModelEntry): Boolean {
+        val outs = entry.model.outputModalities
+        val outputsText = outs == null || outs.isEmpty() || outs.contains("text")
+        val idLower = entry.model.id.lowercase()
+        val nonChatId = listOf("tts", "voiceclone", "voicedesign", "embedding", "embed-", "whisper", "image", "video")
+            .any { idLower.contains(it) }
+        return outputsText && !nonChatId
+    }
+
+    /**
+     * [group]'s [available] members (already filtered, in member order) in
+     * router order: the first pick, then the rest wrapping around.
+     */
+    fun expandGroup(
+        group: ModelGroup,
+        available: List<ModelEntry>,
+        sessionId: String,
+        preferredEntryId: String? = null,
+    ): List<ModelEntry> {
+        if (available.isEmpty()) return emptyList()
+        val start = available.indexOfFirst { it.id == preferredEntryId }.takeIf { it >= 0 }
+            ?: when (group.strategy) {
+                RoutingStrategy.loadBalance -> Math.floorMod(sessionId.hashCode(), available.size)
+                RoutingStrategy.fallback -> 0
+            }
+        return List(available.size) { available[(start + it) % available.size] }
+    }
+
+    /**
+     * Assemble the ordered list from the tiers (see the class doc). Pure: the
+     * caller supplies lookups, so the ordering is unit-tested without a
+     * repository.
+     */
+    fun order(
+        sessionId: String,
+        subGroup: ModelGroup?,
+        primary: PrimarySource?,
+        sessionModelId: String?,
+        defaultPrimaryGroup: ModelGroup?,
+        pool: List<ModelEntry>,
+        group: (String) -> ModelGroup?,
+        entry: (String) -> ModelEntry?,
+        availableMembers: (ModelGroup) -> List<ModelEntry>,
+        isAvailable: (ModelEntry) -> Boolean,
+    ): List<ModelEntry> {
+        val ordered = mutableListOf<ModelEntry>()
+        val seen = HashSet<String>()
+        fun push(e: ModelEntry?) {
+            if (e == null || !seen.add(e.id)) return
+            if (!isAvailable(e) || !isTitleEligible(e)) return
+            ordered += e
+        }
+        fun pushGroup(g: ModelGroup?, preferred: String? = null) {
+            if (g == null) return
+            expandGroup(g, availableMembers(g), sessionId, preferred).forEach(::push)
+        }
+
+        pushGroup(subGroup)
+        when (primary) {
+            is PrimarySource.Group -> pushGroup(group(primary.groupId), primary.preferredEntryId)
+            is PrimarySource.Entry -> push(entry(primary.entryId))
+            null -> Unit
+        }
+        if (ordered.isEmpty() && !sessionModelId.isNullOrEmpty()) {
+            push(pool.firstOrNull { it.model.id == sessionModelId && isAvailable(it) })
+        }
+        pushGroup(defaultPrimaryGroup)
+        pool.forEach(::push)
+        return ordered
+    }
+
+    /** [order] against the live provider configuration. */
+    fun forSession(
+        repo: ProviderRepository,
+        sessionId: String,
+        primary: PrimarySource?,
+        sessionModelId: String?,
+    ): List<ModelEntry> {
+        val config = repo.config.value
+        // One credential check per INSTANCE, not per entry: hasAnyCredential
+        // reads the (encrypted) key store, and a large catalog has hundreds of
+        // entries on a handful of instances — measured 12.5 s for 901 entries
+        // on a Pixel 4a before this, on the thread finishing the agent turn.
+        val instanceUsable = HashMap<String, Boolean>()
+        fun isAvailable(e: ModelEntry): Boolean {
+            if (e.isHidden) return false
+            return instanceUsable.getOrPut(e.providerInstanceId) {
+                val inst = config.instances.find { it.id == e.providerInstanceId }
+                inst != null && inst.isEnabled && repo.hasAnyCredential(inst)
+            }
+        }
+        val entriesById = config.modelEntries.associateBy { it.id }
+        return order(
+            sessionId = sessionId,
+            subGroup = repo.defaultSubGroupId?.let { repo.group(it) },
+            primary = primary,
+            sessionModelId = sessionModelId,
+            defaultPrimaryGroup = repo.defaultPrimaryGroupId?.let { repo.group(it) },
+            pool = repo.allVisibleEntries(),
+            group = { repo.group(it) },
+            entry = { id -> entriesById[id] },
+            // Same filter as ProviderRepository.availableMemberEntries (hidden /
+            // disabled / uncredentialed dropped, member order kept), through
+            // the memoized check.
+            availableMembers = { g -> g.memberEntryIds.mapNotNull { entriesById[it] }.filter(::isAvailable) },
+            isAvailable = ::isAvailable,
+        )
+    }
+
+    /**
+     * Build a provider for one candidate: usable key (keyless self-hosted
+     * endpoints and OAuth instances included), OAuth token refreshed first so
+     * an expired cached token does not 401 the title call, tagged with the
+     * chat id (OpenCode Go needs `x-opencode-session`). Null when the entry
+     * cannot be driven at all — the walk then moves on.
+     */
+    suspend fun providerFor(
+        repo: ProviderRepository,
+        context: Context,
+        entry: ModelEntry,
+        sessionId: String,
+    ): LLMProvider? {
+        val instance = repo.instance(entry.providerInstanceId) ?: return null
+        val apiKey = repo.requestCredential(instance) ?: return null
+        return try {
+            ProviderFactory.create(instance, apiKey, entry.model, context, sessionId = sessionId, overrides = entry.overrides)
+        } catch (e: Exception) {
+            Log.w("TitleGen", "provider creation failed for ${entry.model.id}: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * [T-android-titlegen-stream-error-walk] Whether [e] is the caller being
+     * cancelled, rather than one model failing.
+     *
+     * Providers report a mid-stream failure (an inline SSE `error` frame such
+     * as OpenRouter's 429, `response.failed`, a stream that closed empty) by
+     * cancelling their producer with the real LLMError as the cause, so the
+     * collector sees a CancellationException that is NOT a cancellation of
+     * this coroutine. Rethrowing every CancellationException ended the whole
+     * walk on the first such error and never tried the next title model — the
+     * exact report 0047dc76c set out to fix. Same rule as the agent loop
+     * (`e is CancellationException && e.cause == null`), plus the coroutine's
+     * own state, so a real cancellation that happens to carry a cause still
+     * propagates.
+     */
+    suspend fun isRealCancellation(e: kotlinx.coroutines.CancellationException): Boolean =
+        e.cause == null || !kotlinx.coroutines.currentCoroutineContext().isActive
+
+    /**
+     * Walk [candidates] (at most [maxTries]) until [tryOne] returns non-null.
+     * A throw or a null result is a failure and moves on to the next model —
+     * an empty or unparseable title counts too. [shouldStop] is checked before
+     * each try (e.g. the user renamed the chat meanwhile). [pauseMs] separates
+     * tries. Returns the first success, or null when every try failed.
+     */
+    suspend fun <T : Any> walk(
+        candidates: List<ModelEntry>,
+        origin: String,
+        maxTries: Int = MAX_TRIES,
+        pauseMs: Long = 0L,
+        shouldStop: suspend () -> Boolean = { false },
+        tryOne: suspend (ModelEntry) -> T?,
+    ): T? {
+        val tries = candidates.take(maxTries)
+        for ((idx, entry) in tries.withIndex()) {
+            if (shouldStop()) {
+                AppLogger.info("TitleGen", "walk origin=$origin stopped before candidate ${idx + 1}/${tries.size}")
+                return null
+            }
+            AppLogger.info("TitleGen", "walk origin=$origin candidate ${idx + 1}/${tries.size} model=${entry.model.id}")
+            val result = try {
+                tryOne(entry)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException && isRealCancellation(e)) throw e
+                AppLogger.warning(
+                    "TitleGen",
+                    "walk origin=$origin FAILED ${idx + 1}/${tries.size} model=${entry.model.id} " +
+                        "${e.javaClass.simpleName}: ${e.message?.take(200)}",
+                )
+                null
+            }
+            if (result != null) {
+                if (idx > 0) AppLogger.info("TitleGen", "walk origin=$origin succeeded on fallback candidate ${idx + 1} (${entry.model.id})")
+                return result
+            }
+            if (pauseMs > 0 && idx + 1 < tries.size) delay(pauseMs)
+        }
+        AppLogger.warning("TitleGen", "walk origin=$origin all ${tries.size} candidate(s) failed (of ${candidates.size})")
+        return null
+    }
+}
+
+// ─── Merged from ToggleAnchor.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-user-ask-resolved-expand] Pure geometry for "a card the user opens or
+ * shuts keeps its top in place" (iOS e563158e2 ToggleAnchorMath).
+ *
+ * The chat list is reverseLayout: an item's BOTTOM is pinned (to the item
+ * below it, or to the viewport bottom), so a card that grows pushes its top
+ * up and one that shrinks pulls it down. Scrolling by the height change
+ * undoes exactly that. In LazyListState units under reverseLayout, a positive
+ * scroll moves content down and a negative one moves it up, toward the newest
+ * message (see ChatScreen's jump-to-bottom glide: "Negative = toward
+ * newest/bottom").
+ */
+internal object ToggleAnchorMath {
+    /** The scroll that keeps the card's top fixed when its height goes [oldHeight] -> [newHeight]. */
+    fun keepTopScroll(oldHeight: Int, newHeight: Int): Float = (newHeight - oldHeight).toFloat()
+
+    /**
+     * After an EXPAND only: how far (px, >= 0) to move the content up so the
+     * opened card's bottom is visible, never pushing its top above the
+     * visible top. A collapse never scrolls back (iOS revealShift).
+     */
+    fun revealShift(cardTop: Float, cardBottom: Float, visibleTop: Float, visibleBottom: Float): Float {
+        val overflow = cardBottom - visibleBottom
+        if (overflow <= 0f) return 0f
+        return minOf(overflow, cardTop - visibleTop).coerceAtLeast(0f)
+    }
+
+    /** Ease-in-out over [0, 1], the curve animateContentSize's default spring roughly follows. */
+    fun ease(t: Float): Float {
+        val x = t.coerceIn(0f, 1f)
+        return if (x < 0.5f) 4 * x * x * x else 1 - (-2 * x + 2).let { it * it * it } / 2
+    }
+
+    /** Height shown at progress [t] of a resize from [from] to [to]. */
+    fun heightAt(from: Int, to: Int, t: Float): Int = from + Math.round((to - from) * ease(t))
+
+    /**
+     * The LazyColumn index of flat row [flatPos]: the list renders
+     * `flatItems.asReversed()` after [leading] conditional items (the same
+     * relationship as ChatScreen's previous-turn jump).
+     */
+    fun lazyIndex(flatPos: Int, flatSize: Int, leading: Int): Int = (flatSize - 1 - flatPos) + leading
+
+    /** [leading] measured from one visible row: its lazy index and flat position. */
+    fun leadingCount(lazyIndex: Int, flatPos: Int, flatSize: Int): Int = lazyIndex - (flatSize - 1 - flatPos)
+
+    /**
+     * The scroll offset that puts a row back where it was. LazyListItemInfo
+     * offsets and scroll offsets share one axis (an item at scroll position
+     * (i, s) has offset -s), so a row that sat at [offset] is requested at
+     * -offset. Negative is fine: the next measure fills in the newer rows
+     * below it.
+     */
+    fun restoreScrollOffset(offset: Int): Int = -offset
+}
+
+/**
+ * The chat list's side of a top-anchored toggle. Provided to list items by
+ * [LocalChatToggleAnchor]; null outside the chat list (a card then just
+ * animates, as before).
+ */
+internal class ChatToggleAnchor(private val listState: LazyListState) {
+    /** The LazyColumn's coordinates and the px hidden under its bottom reserve (composer / toolbar). */
+    var listCoords: () -> LayoutCoordinates? = { null }
+    var bottomInsetPx: Float = 0f
+    var scope: CoroutineScope? = null
+
+    /**
+     * [T-toggle-anchor-snap-yield] True while a user toggle is moving the list
+     * (and briefly after): ChatScreen's bottom drift snap stands down, or it
+     * would undo each compensation step a frame later when pinned to the bottom.
+     */
+    @Volatile private var busyUntilMs = 0L
+    val isBusy: Boolean get() = android.os.SystemClock.uptimeMillis() < busyUntilMs
+    fun markBusy(forMs: Long = BUSY_TAIL_MS) {
+        busyUntilMs = maxOf(busyUntilMs, android.os.SystemClock.uptimeMillis() + forMs)
+    }
+
+    /** A tapped fold row waiting for the list that opens / shuts it. */
+    private class PendingRow(val key: String, val offset: Int, val leading: Int, val size: Int)
+    private var pendingRow: PendingRow? = null
+
+    /**
+     * A folded tool row was tapped: remember where it is. Expanding inserts its
+     * calls as separate rows BELOW it, and the reverseLayout list keeps the
+     * row under them in place, so without this the tapped row is pushed up.
+     */
+    fun captureRow(key: String, rows: List<com.openminis.app.ui.chat.FlatChatItem>) {
+        val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == key } ?: return
+        val pos = rows.indexOfFirst { it.key == key }
+        if (pos < 0) return
+        pendingRow = PendingRow(key, info.offset, ToggleAnchorMath.leadingCount(info.index, pos, rows.size), rows.size)
+    }
+
+    /** The folded rows were rebuilt: request the tapped row's old place for the same remeasure. */
+    fun restoreRow(rows: List<com.openminis.app.ui.chat.FlatChatItem>) {
+        val p = pendingRow ?: return
+        pendingRow = null
+        val pos = rows.indexOfFirst { it.key == p.key }
+        if (pos < 0) return
+        val index = ToggleAnchorMath.lazyIndex(pos, rows.size, p.leading)
+        if (index < 0) return
+        markBusy()
+        listState.requestScrollToItem(index, ToggleAnchorMath.restoreScrollOffset(p.offset))
+        val added = rows.size - p.size
+        if (added > 0) scope?.launch { revealRows(p.key, index, added) }
+    }
+
+    /** After a fold row opened: bring its last call into view, keeping the row itself visible. */
+    private suspend fun revealRows(key: String, index: Int, added: Int) {
+        withFrameNanos { }
+        withFrameNanos { }
+        val info = listState.layoutInfo
+        val head = info.visibleItemsInfo.firstOrNull { it.key == key } ?: return
+        val last = info.visibleItemsInfo.firstOrNull { it.index == index - added }
+        // Axis: offsets grow from the list's bottom edge upward (reverseLayout),
+        // so "below the visible bottom" is a negative offset.
+        val blockBottom = last?.offset ?: Int.MIN_VALUE / 2
+        val shift = ToggleAnchorMath.revealShift(
+            cardTop = -(head.offset + head.size).toFloat(),
+            cardBottom = -blockBottom.toFloat(),
+            visibleTop = -(info.viewportEndOffset - info.afterContentPadding).toFloat(),
+            visibleBottom = 0f,
+        )
+        if (shift > 0f) { markBusy(); listState.animateScrollBy(-shift) }
+    }
+
+    /** Undo the bottom pin for one height change. Called in a frame callback, before that frame's measure. */
+    fun keepTop(oldHeight: Int, newHeight: Int) {
+        markBusy()
+        val d = ToggleAnchorMath.keepTopScroll(oldHeight, newHeight)
+        if (d != 0f) listState.dispatchRawDelta(d)
+    }
+
+    /** One short scroll bringing an opened card's bottom into view (top stays visible). */
+    suspend fun reveal(card: LayoutCoordinates?) {
+        val list = listCoords() ?: return
+        if (card == null || !card.isAttached || !list.isAttached) return
+        val box = list.localBoundingBoxOf(card, clipBounds = false)
+        val shift = ToggleAnchorMath.revealShift(box.top, box.bottom, 0f, list.size.height - bottomInsetPx)
+        if (shift > 0f) { markBusy(); listState.animateScrollBy(-shift) }
+    }
+}
+
+internal val LocalChatToggleAnchor = staticCompositionLocalOf<ChatToggleAnchor?> { null }
+
+/** How long after its last step a toggle keeps the drift snap away. */
+private const val BUSY_TAIL_MS = 450L
+
+/**
+ * A card's own open / shut animation with its top held in place.
+ *
+ * animateContentSize cannot do this: it resizes during measure, and the list's
+ * compensating scroll would land a frame later, so the top would wobble. Here
+ * one frame callback sets both the shown height and the compensating scroll,
+ * and the frame's measure applies them together.
+ *
+ * Apply [modifier] to the card's outermost layout. Its content is measured at
+ * its natural height; while [shown] is pinned, the card reports that height
+ * instead and clips.
+ */
+internal class TopAnchoredResize(private val durationMs: Long = 260) {
+    private var natural = -1
+    private var shown: Int? by mutableStateOf(null)
+    private var job: Job? = null
+    /** The card's coordinates, for the reveal. */
+    var coords: LayoutCoordinates? = null
+
+    val modifier: Modifier = Modifier
+        .clipToBounds()
+        .layout { measurable, constraints ->
+            val p = measurable.measure(constraints)
+            natural = p.height
+            val h = shown ?: p.height
+            layout(p.width, h) { p.place(0, 0) }
+        }
+
+    /** Flip the card's state with [flip] and animate the height change, top fixed. */
+    fun toggle(scope: CoroutineScope, anchor: ChatToggleAnchor?, flip: () -> Unit) {
+        val from = shown ?: natural
+        job?.cancel()
+        if (from < 0) { flip(); return }
+        shown = from
+        anchor?.markBusy(durationMs + 450)
+        flip()
+        // A newer toggle cancels this one and pins its own starting height, so
+        // a cancelled run leaves [shown] alone.
+        job = scope.launch {
+            withFrameNanos { }   // this frame measures the new content (height still pinned)
+            withFrameNanos { }   // its natural height is known from here on
+            val to = natural
+            var current = from
+            val start = withFrameNanos { it }
+            while (true) {
+                val done = withFrameNanos { now ->
+                    val t = ((now - start) / 1_000_000f) / durationMs
+                    val h = if (t >= 1f) to else ToggleAnchorMath.heightAt(from, to, t)
+                    // Same frame callback: the scroll and the height reach this frame's measure together.
+                    anchor?.keepTop(current, h)
+                    current = h
+                    shown = h
+                    t >= 1f
+                }
+                if (done) break
+            }
+            shown = null
+            if (to > from) {
+                withFrameNanos { }
+                anchor?.reveal(coords)
+            }
+        }
     }
 }

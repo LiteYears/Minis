@@ -1,25 +1,33 @@
 package com.openminis.app.config
 
+import android.content.Context
+import android.content.SharedPreferences
 import com.openminis.app.config.audit.ConfigAuditActor
 import com.openminis.app.config.audit.ConfigAuditEntry
 import com.openminis.app.config.audit.ConfigAuditLog
-import com.openminis.app.config.readable.ConfigReadableRenderer
-import com.openminis.app.config.readable.ReadableSummary
-import com.openminis.app.config.readable.RedactedConfigValue
 import com.openminis.app.config.audit.ConfigAuditStatus
 import com.openminis.app.config.confirm.ConfigConfirmationGate
 import com.openminis.app.config.confirm.ConfirmOutcome
 import com.openminis.app.config.confirm.PendingConfigChange
 import com.openminis.app.config.confirm.PendingConfigChangeItem
+import com.openminis.app.config.readable.ConfigReadable
+import com.openminis.app.config.readable.ConfigReadableRenderer
+import com.openminis.app.config.readable.ReadableLine
+import com.openminis.app.config.readable.ReadableSummary
+import com.openminis.app.config.readable.RedactedConfigValue
 import com.openminis.app.logging.AppLogger
-import kotlinx.coroutines.runBlocking
-import org.json.JSONArray
-import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
+import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
  * Bridge between the offload handler (Kotlin / shell args / JSON
@@ -1023,5 +1031,546 @@ object ConfigBridge {
             ConfigAuditLog.get().markReverted(entry.id)
         }
         return res
+    }
+}
+
+// ─── Merged from ConfigCollection.kt ──────────────────────────────────────────────────
+
+/**
+ * A dynamically-keyed group of fields, e.g. one ProviderInstance per id,
+ * one ModelEntry per uuid, one ModelGroup per id. Mirrors iOS
+ * `ConfigCollection` (Shared/Config/Fields/ConfigCollection.swift).
+ *
+ * Static fields go through the registry's flat field map. A collection
+ * adds two more capabilities:
+ *   1. Enumerate runtime children ([childIds]) — used for dynamic path
+ *      resolution like `models.<uuid>.maxOutputTokens`.
+ *   2. Define `add` / `remove` semantics — these create or dispose the
+ *      whole child rather than mutate a single field.
+ */
+interface ConfigCollection {
+    /** First segment of every member's path, e.g. `models` or `groups`. */
+    val basePath: String
+    val displayName: String
+    val description: String
+
+    val addable: Boolean get() = true
+    val removable: Boolean get() = true
+
+    /**
+     * Risk applied to add/remove operations (children declare per-field
+     * risk). Defaults to [ConfigRisk.SENSITIVE] because creating /
+     * destroying structured records is more impactful than tweaking a
+     * scalar.
+     */
+    val risk: ConfigRisk get() = ConfigRisk.SENSITIVE
+
+    /** Currently-existing child ids. Order is meaningful where user-visible. */
+    fun childIds(): List<String>
+
+    /** Field set exposed for one child id. Empty if id missing. */
+    fun fields(forId: String): List<ConfigField>
+
+    /** JSON schema accepted by [add]. `Json` allows free-form parsing. */
+    val addPayloadSchema: ConfigSchema get() = ConfigSchema.Json
+
+    /** Create a new child. Returns the new id. */
+    fun add(payload: ConfigValue): String
+
+    /** Remove a child. Throws on missing id or non-removable. */
+    fun remove(id: String)
+
+    // [T-config-readable] Human-readable descriptions — no defaults, so a new
+    // collection does not compile until it says how it reads. Mirrors iOS.
+
+    /**
+     * Localization key naming a child's field in a sentence, with the
+     * child's name as %1$@ and the field label as %2$@, e.g.
+     * "Group “%1$@” – %2$@".
+     */
+    val readableSubjectFormat: String
+
+    /**
+     * The child's user-facing name (group name, provider label, …), or null
+     * when [id] is not a child. Called before the write, so a removed child
+     * is still named.
+     */
+    fun entityLabel(id: String): String?
+
+    /** Sentences describing an `add`. The payload is already secret-masked. */
+    fun readableForAdd(payload: RedactedConfigValue): List<ReadableLine>
+
+    /** Sentences describing a `remove`, rendered BEFORE the removal. */
+    fun readableForRemove(id: String): List<ReadableLine>
+}
+
+// ─── Merged from ConfigError.kt ──────────────────────────────────────────────────
+
+/**
+ * Failure modes a [ConfigField] operation may surface. Matches iOS
+ * `ConfigError`. Bridge-level error codes:
+ *   TypeMismatch / InvalidValue / OutOfRange / RegexMismatch  → 1
+ *   PermissionDenied                                          → 126
+ *   UnknownPath                                               → 1
+ *   IoError                                                   → 1
+ */
+sealed class ConfigError(message: String) : Exception(message) {
+    class TypeMismatch(expected: String) :
+        ConfigError("type_mismatch: expected $expected")
+
+    class InvalidValue(msg: String) :
+        ConfigError("invalid_value: $msg")
+
+    class OutOfRange(min: Double?, max: Double?) :
+        ConfigError(
+            "out_of_range: " + listOfNotNull(
+                min?.let { "min=$it" },
+                max?.let { "max=$it" }
+            ).joinToString(", ")
+        )
+
+    class RegexMismatch(pattern: String) :
+        ConfigError("regex_mismatch: must match /$pattern/")
+
+    class PermissionDenied(reason: String = "Hidden from minis-config") :
+        ConfigError("permission_denied: $reason")
+
+    class UnknownPath(path: String) :
+        ConfigError("unknown_path: $path")
+
+    /** Raised by collection.add when a child with the same natural key already exists. */
+    class AlreadyExists(reason: String) :
+        ConfigError("already_exists: $reason")
+
+    class IoError(msg: String) :
+        ConfigError("io_error: $msg")
+}
+
+// ─── Merged from ConfigField.kt ──────────────────────────────────────────────────
+
+/**
+ * One configurable setting. Concrete kinds: [com.openminis.app.config.fields.PrefsBoolField]
+ * etc. for SharedPreferences-backed scalars; [com.openminis.app.config.fields.ClosureField]
+ * when the storage backend is something more bespoke (a repository, a DB row, an
+ * in-process singleton). Mirrors iOS `ConfigField` (Shared/Config/ConfigField.swift).
+ */
+interface ConfigField {
+    /** Dot-path id, e.g. `appearance.theme` or `models.<uuid>.maxOutputTokens`. */
+    val path: String
+
+    /** Human-readable label rendered in the confirm dialog and topic-help. */
+    val displayName: String
+
+    /** One-line description rendered in topic-help. */
+    val description: String
+
+    val valueSchema: ConfigSchema
+    val access: ConfigAccess
+    val risk: ConfigRisk
+
+    /** Whether `audit-revert` may roll a write back. */
+    val revertable: Boolean
+
+    /**
+     * [T-config-readable] How a change to this field reads to the person
+     * approving it (confirmation dialog) and reviewing it (Logs → Config
+     * Changes). Deliberately has NO default: a new field does not compile
+     * until it says how its values read. [ConfigReadable.generic] is the
+     * explicit opt-out. Mirrors iOS `ConfigField.readable`.
+     */
+    val readable: ConfigReadable
+
+    /**
+     * [T-android-config-feature-unavailable] Non-null when the field's
+     * underlying feature does not exist on this device / OS version (e.g. the
+     * Android 16 "Live Updates" surface on a device without it). The bridge
+     * short-circuits BOTH reads and writes with a `feature_unavailable` error
+     * BEFORE validation and before the confirmation dialog — the Settings UI
+     * already blocks these entries, and minis-config must not be a side door
+     * around that gate.
+     *
+     * Default null = available everywhere; only [UnavailableField] overrides.
+     * Mirrors iOS `ConfigField.unavailableReason` (dba46d42).
+     */
+    val unavailableReason: String?
+        get() = null
+
+    /**
+     * [FEAT-261021-03] Rewrites a `set` value before validation and the
+     * confirmation dialog (e.g. a proxy's name -> `proxy:<id>`), so the user
+     * approves - and the audit log records - what will be stored. Default:
+     * unchanged. Mirrors iOS `ConfigField.normalize`.
+     */
+    fun normalize(value: ConfigValue): ConfigValue = value
+
+    /**
+     * [FEAT-261021-03] Checks beyond the schema, run on the normalized value
+     * BEFORE the confirmation dialog, so a value that cannot be stored is
+     * refused without asking the user first. Throws [ConfigError]. Mirrors
+     * iOS `ConfigField.validate`.
+     */
+    fun validate(value: ConfigValue) {}
+
+    /** Read the current value. May throw [ConfigError] on backend failure. */
+    fun read(): ConfigValue
+
+    /** Apply [value]. Schema validation runs in the bridge before this. */
+    fun write(value: ConfigValue)
+
+    /** Top-level scope = first dot segment. Used for audit `--scope` filtering. */
+    val scope: String
+        get() = path.substringBefore('.', missingDelimiterValue = "unknown")
+}
+
+/**
+ * [T-android-config-feature-unavailable] Wraps a real field so its path stays
+ * REGISTERED (help/list keep showing it with correct metadata) while every read
+ * and write is refused with `feature_unavailable` plus [reason].
+ *
+ * Keeping the path registered is the point: the agent gets a precise "this
+ * device can't do that, and retrying won't help" instead of a confusing
+ * `unknown_path` that looks like a typo. Mirrors iOS `UnavailableField`.
+ */
+class UnavailableField(
+    private val delegate: ConfigField,
+    private val reason: String,
+) : ConfigField by delegate {
+    override val unavailableReason: String = reason
+}
+
+// ─── Merged from ConfigSchema.kt ──────────────────────────────────────────────────
+
+/**
+ * Type tag + per-type constraints for a [ConfigField]. Drives the
+ * pre-write validation in the bridge and `--help` rendering. Mirrors
+ * iOS `ConfigValueSchema` (Shared/Config/ConfigField.swift).
+ */
+sealed class ConfigSchema {
+    object Bool : ConfigSchema()
+    data class Int(val min: kotlin.Int? = null, val max: kotlin.Int? = null) : ConfigSchema()
+    data class Double(val min: kotlin.Double? = null, val max: kotlin.Double? = null) : ConfigSchema()
+    data class Str(val maxLength: kotlin.Int? = null, val regex: String? = null) : ConfigSchema()
+    data class StrEnum(val cases: List<String>) : ConfigSchema()
+    object Path : ConfigSchema()
+    data class Optional(val inner: ConfigSchema) : ConfigSchema()
+    data class Array(val inner: ConfigSchema) : ConfigSchema()
+    /** Free-form: validation is the writer's responsibility. */
+    object Json : ConfigSchema()
+
+    /** Human-readable schema description for `topic-help` output. */
+    val helpDescription: String
+        get() = when (this) {
+            Bool -> "bool"
+            is Int -> "int (${min?.toString() ?: "-∞"}..${max?.toString() ?: "+∞"})"
+            is Double -> "double (${min?.toString() ?: "-∞"}..${max?.toString() ?: "+∞"})"
+            is Str -> buildString {
+                append("string")
+                if (maxLength != null) append(" max $maxLength chars")
+                if (regex != null) append(" /$regex/")
+            }
+            is StrEnum -> "one of: " + cases.joinToString(", ")
+            Path -> "path"
+            is Optional -> "${inner.helpDescription}?"
+            is Array -> "[${inner.helpDescription}]"
+            Json -> "json"
+        }
+
+    /** Pure validation. Throws [ConfigError] on failure; never mutates. */
+    fun validate(value: ConfigValue) {
+        when (this) {
+            Bool -> {
+                if (value !is ConfigValue.Bool) throw ConfigError.TypeMismatch("bool")
+            }
+            is Int -> {
+                val i = (value as? ConfigValue.Int)?.value
+                    ?: throw ConfigError.TypeMismatch("int")
+                if (min != null && i < min) throw ConfigError.OutOfRange(min.toDouble(), max?.toDouble())
+                if (max != null && i > max) throw ConfigError.OutOfRange(min?.toDouble(), max.toDouble())
+            }
+            is Double -> {
+                val d: kotlin.Double = when (value) {
+                    is ConfigValue.Double -> value.value
+                    is ConfigValue.Int -> value.value.toDouble()
+                    else -> throw ConfigError.TypeMismatch("double")
+                }
+                if (min != null && d < min) throw ConfigError.OutOfRange(min, max)
+                if (max != null && d > max) throw ConfigError.OutOfRange(min, max)
+            }
+            is Str -> {
+                val s = (value as? ConfigValue.Str)?.value
+                    ?: throw ConfigError.TypeMismatch("string")
+                if (maxLength != null && s.length > maxLength) {
+                    throw ConfigError.InvalidValue("string longer than $maxLength chars")
+                }
+                if (regex != null) {
+                    val re = try { Regex(regex) } catch (_: Throwable) { null }
+                    if (re != null && !re.matches(s)) throw ConfigError.RegexMismatch(regex)
+                }
+            }
+            is StrEnum -> {
+                val s = (value as? ConfigValue.Str)?.value
+                    ?: throw ConfigError.TypeMismatch("string")
+                if (s !in cases) {
+                    throw ConfigError.InvalidValue("must be one of: ${cases.joinToString(", ")}")
+                }
+            }
+            Path -> {
+                if (value !is ConfigValue.Str) throw ConfigError.TypeMismatch("path")
+            }
+            is Optional -> {
+                if (value === ConfigValue.Null) return
+                inner.validate(value)
+            }
+            is Array -> {
+                val arr = (value as? ConfigValue.Arr)?.value
+                    ?: throw ConfigError.TypeMismatch("array")
+                for (v in arr) inner.validate(v)
+            }
+            Json -> Unit
+        }
+    }
+}
+
+enum class ConfigAccess { HIDDEN, READONLY, READWRITE }
+
+/** Risk classification surfaced in the confirm dialog. */
+enum class ConfigRisk { NORMAL, SENSITIVE, DESTRUCTIVE }
+
+// ─── Merged from ConfigValue.kt ──────────────────────────────────────────────────
+
+/**
+ * JSON-serializable union covering every value type a [ConfigField] can
+ * hold. Mirrors iOS `ConfigValue` (Shared/Config/ConfigField.swift).
+ *
+ * The CLI bridge encodes/decodes these as JSON; the confirm dialog
+ * renders them via [displayString]; the audit log persists them as JSON
+ * text in the `old_value` / `new_value` columns.
+ */
+sealed class ConfigValue {
+    data class Bool(val value: Boolean) : ConfigValue()
+    data class Int(val value: kotlin.Int) : ConfigValue()
+    data class Double(val value: kotlin.Double) : ConfigValue()
+    data class Str(val value: String) : ConfigValue()
+    data class Arr(val value: List<ConfigValue>) : ConfigValue()
+    data class Obj(val value: Map<String, ConfigValue>) : ConfigValue()
+    object Null : ConfigValue()
+
+    /**
+     * Compact human-readable rendering used by the confirm dialog and
+     * `--help` examples. Long strings are truncated; arrays/objects show
+     * their JSON form. Mirrors iOS `displayString`.
+     */
+    val displayString: String
+        get() = when (this) {
+            is Bool -> if (value) "true" else "false"
+            is Int -> value.toString()
+            is Double -> value.toString()
+            is Str -> {
+                if (value.length > 80) {
+                    "\"${value.take(60)}…${value.takeLast(15)}\""
+                } else {
+                    "\"$value\""
+                }
+            }
+            is Arr, is Obj -> jsonString()
+            Null -> "null"
+        }
+
+    /**
+     * Returns a copy with every value under a [SECRET_KEYS] key masked.
+     * `$$VAR` references pass through (they're a pointer, not the secret);
+     * any other non-empty literal string becomes `"••• (hidden)"`. Recurses
+     * into nested objects/arrays so a secret nested in an add-payload is
+     * caught too. Mirrors iOS `ConfigValue.redactingSecrets()` —
+     * [T-minis-config-provider-add].
+     *
+     * Apply this to add-payload / audit-row JSON when the path resolves to a
+     * collection that may contain credentials. The real (un-redacted) value
+     * still reaches the collection's `add()` so it can persist the secret to
+     * the encrypted store; only the displayed / audit-logged copy is masked.
+     */
+    fun redactingSecrets(): ConfigValue = when (this) {
+        is Obj -> {
+            val out = LinkedHashMap<String, ConfigValue>(value.size)
+            for ((k, v) in value) {
+                if (k in SECRET_KEYS && v is Str &&
+                    !v.value.startsWith("\$\$") && v.value.isNotEmpty()) {
+                    out[k] = Str("••• (hidden)")
+                } else {
+                    out[k] = v.redactingSecrets()
+                }
+            }
+            Obj(out)
+        }
+        is Arr -> Arr(value.map { it.redactingSecrets() })
+        else -> this
+    }
+
+    /** JSON-text representation suitable for storing in audit rows. */
+    fun jsonString(): String = toJsonAny().let { any ->
+        when (any) {
+            JSONObject.NULL -> "null"
+            is JSONObject -> any.toString()
+            is JSONArray -> any.toString()
+            is String -> JSONObject.quote(any)
+            else -> any.toString()
+        }
+    }
+
+    /** Recursively convert to a JSON-compatible Any (JSONObject/JSONArray/primitive/null). */
+    private fun toJsonAny(): Any = when (this) {
+        is Bool -> value
+        is Int -> value
+        is Double -> value
+        is Str -> value
+        is Arr -> JSONArray().also { arr ->
+            for (v in value) {
+                val a = v.toJsonAny()
+                if (a === JSONObject.NULL) arr.put(JSONObject.NULL) else arr.put(a)
+            }
+        }
+        is Obj -> JSONObject().also { obj ->
+            for ((k, v) in value) {
+                val a = v.toJsonAny()
+                obj.put(k, if (a === JSONObject.NULL) JSONObject.NULL else a)
+            }
+        }
+        Null -> JSONObject.NULL
+    }
+
+    companion object {
+        /**
+         * Object keys whose values are credential-sensitive and must be
+         * masked in any audit / display / confirm-sheet surface. Mirrors
+         * iOS `ConfigValue.secretObjectKeys`. Used by [redactingSecrets].
+         */
+        val SECRET_KEYS: Set<String> = setOf(
+            "apiKey", "oauthToken", "manualOAuthToken",
+            // [FEAT-261021-03] Proxy passwords and the Tailscale auth key.
+            "password", "authKey",
+        )
+
+        /**
+         * Parse a JSON string into a ConfigValue. Returns null on malformed JSON.
+         *
+         * [T-container-network-dns] Null also when text is left over after the
+         * first value. org.json reads an UNQUOTED value only up to the first
+         * `, : ; = # [ ] { } /`, so `set network.dnsCustomServers
+         * 223.5.5.5,8.8.8.8` used to store "223.5.5.5" and drop the rest, an
+         * unquoted IPv6 address kept only what came before its first `:`, and
+         * an unquoted URL kept "https". A silent partial write is worse than
+         * an error, so the whole input must be one value; a quoted string or
+         * an unquoted single word still works as before.
+         */
+        fun decode(json: String): ConfigValue? = try {
+            val tokener = JSONTokener(json)
+            val value = tokener.nextValue()
+            if (tokener.nextClean() != 0.toChar()) null else fromJsonAny(value)
+        } catch (_: Throwable) {
+            null
+        }
+
+        private fun fromJsonAny(any: Any?): ConfigValue = when (any) {
+            null, JSONObject.NULL -> Null
+            is Boolean -> Bool(any)
+            is kotlin.Int -> Int(any)
+            is Long -> {
+                if (any in kotlin.Int.MIN_VALUE.toLong()..kotlin.Int.MAX_VALUE.toLong()) Int(any.toInt())
+                else Double(any.toDouble())
+            }
+            is kotlin.Double, is Float -> Double((any as Number).toDouble())
+            is String -> Str(any)
+            is JSONArray -> {
+                val out = ArrayList<ConfigValue>(any.length())
+                for (i in 0 until any.length()) out.add(fromJsonAny(any.opt(i)))
+                Arr(out)
+            }
+            is JSONObject -> {
+                val out = LinkedHashMap<String, ConfigValue>(any.length())
+                val keys = any.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    out[k] = fromJsonAny(any.opt(k))
+                }
+                Obj(out)
+            }
+            else -> Null
+        }
+    }
+}
+
+// ─── Merged from ConfigWriteWarnings.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-envvar-disable] Non-fatal notes a field or collection raises while it is
+ * being written - the write still happens. ConfigBridge opens a scope around
+ * its apply loop and returns whatever was collected as `warnings` in the
+ * response, so the agent learns about it (e.g. "$$GH_TOKEN is disabled and
+ * resolved to an empty string") without the batch failing.
+ *
+ * Thread-local: writes run synchronously inside the bridge's loop, on the
+ * thread that opened the scope. Outside a scope (tests, other callers) a
+ * warning is simply dropped after being logged by its caller.
+ */
+object ConfigWriteWarnings {
+    private val current = ThreadLocal<MutableList<String>?>()
+
+    fun add(message: String) {
+        current.get()?.add(message)
+    }
+
+    /** Runs [block] collecting warnings; returns its result and the warnings. */
+    fun <T> collect(block: () -> T): Pair<T, List<String>> {
+        val previous = current.get()
+        val list = ArrayList<String>()
+        current.set(list)
+        try {
+            return block() to list.distinct()
+        } finally {
+            current.set(previous)
+        }
+    }
+}
+
+// ─── Merged from MinisConfigPermissionStore.kt ──────────────────────────────────────────────────
+
+/**
+ * Master switch controlling whether the agent can use the
+ * `minis-config` CLI at all. Disabling short-circuits every CLI call
+ * before any field lookup, ConfirmationGate enqueue, or audit write.
+ *
+ * The flag itself is intentionally not settable through minis-config:
+ * the registry registers a hidden placeholder on the same path so any
+ * agent attempt to flip the switch returns `permission_denied`.
+ *
+ * Mirrors iOS `MinisConfigPermissionStore`.
+ */
+object MinisConfigPermissionStore {
+    private const val PREFS = "minis_config_permission"
+    private const val KEY = "minis_config_enabled"
+
+    /** Default: true (preserves existing behaviour for upgrade users). */
+    private const val DEFAULT_ENABLED = true
+
+    private var prefs: SharedPreferences? = null
+
+    private val _enabled = MutableStateFlow(DEFAULT_ENABLED)
+    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+
+    /** Hot-path read used by the offload bridge before any work. */
+    val isEnabled: Boolean get() = _enabled.value
+
+    /** Call once early — typically from MinisApp.onCreate. Idempotent. */
+    fun init(context: Context) {
+        if (prefs != null) return
+        val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        prefs = p
+        _enabled.value = if (p.contains(KEY)) p.getBoolean(KEY, DEFAULT_ENABLED) else DEFAULT_ENABLED
+    }
+
+    /** UI toggle. Persists eagerly. */
+    fun setEnabled(value: Boolean) {
+        prefs?.edit()?.putBoolean(KEY, value)?.apply()
+        _enabled.value = value
     }
 }

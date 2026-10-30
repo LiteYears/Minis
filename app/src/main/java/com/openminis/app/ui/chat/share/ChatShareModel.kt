@@ -1,11 +1,35 @@
 package com.openminis.app.ui.chat.share
 
+import android.util.Base64
+import android.view.ViewGroup
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCompositionContext
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.platform.LocalView
+import com.openminis.app.BuildConfig
+import com.openminis.app.ui.chat.ChatViewModel
+import com.openminis.app.ui.chat.rememberMarkdownPrewarmer
+import java.io.BufferedOutputStream
+import java.io.DataOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.util.Collections
+import java.util.zip.CRC32
+import java.util.zip.Deflater
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.MutableSharedFlow
+import org.json.JSONArray
+import org.json.JSONObject
 
 // [T-multi-select-share] Pure model for sharing selected messages as one long image
 // or a PDF: which rows form one selectable unit and cell, how a reply's markdown
@@ -540,4 +564,289 @@ object ChatShareGeometry {
 
     fun canvasWidth(base: Float, tableRowWidths: List<Float>): Float =
         min(max(base, tableRowWidths.maxOrNull() ?: 0f), maxCanvasWidth(base))
+}
+
+// ─── Merged from ChatSharePngWriter.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-multi-select-share] Writes an opaque RGB PNG row by row, so a long image of tens
+ * of thousands of rows is encoded strip by strip without ever holding the whole
+ * picture in memory (iOS composes one bitmap of up to 60 MP; an Android heap cannot
+ * be relied on for that, and HWUI cannot draw a bitmap that tall anyway).
+ *
+ * The image data (one zlib stream across every row, cut into IDAT chunks) goes to
+ * [idatFile] as it arrives; [finish] then writes the real file — signature, IHDR with
+ * the final height, the IDAT chunks, IEND — once the height is known. Each row picks
+ * the None / Sub / Up filter with the smallest sum of absolute values, the usual
+ * libpng heuristic. Pure JVM: ChatSharePngWriterTest decodes the output with ImageIO.
+ */
+internal class ChatSharePngWriter(private val width: Int, private val idatFile: File) : AutoCloseable {
+    private val deflater = Deflater(6)
+    private val idat = DataOutputStream(BufferedOutputStream(FileOutputStream(idatFile), 1 shl 16))
+    private val rowBytes = width * 3
+    private var prev = ByteArray(rowBytes)
+    private var cur = ByteArray(rowBytes)
+    private val filtered = Array(3) { ByteArray(rowBytes + 1) }
+    private val deflateOut = ByteArray(1 shl 16)
+    private val pending = java.io.ByteArrayOutputStream(1 shl 16)
+    var rows = 0
+        private set
+
+    /** Appends [count] rows of ARGB pixels (alpha ignored) starting at [offset], [width] per row. */
+    fun writeRows(argb: IntArray, offset: Int, count: Int) {
+        for (r in 0 until count) {
+            val base = offset + r * width
+            var j = 0
+            for (x in 0 until width) {
+                val p = argb[base + x]
+                cur[j] = (p shr 16).toByte()
+                cur[j + 1] = (p shr 8).toByte()
+                cur[j + 2] = p.toByte()
+                j += 3
+            }
+            deflateRow(pickFilter())
+            val t = prev; prev = cur; cur = t
+            rows++
+        }
+    }
+
+    private fun pickFilter(): ByteArray {
+        val none = filtered[0]; val sub = filtered[1]; val up = filtered[2]
+        none[0] = 0; sub[0] = 1; up[0] = 2
+        var sNone = 0L; var sSub = 0L; var sUp = 0L
+        for (i in 0 until rowBytes) {
+            val c = cur[i].toInt() and 0xFF
+            val a = if (i >= 3) cur[i - 3].toInt() and 0xFF else 0
+            val b = prev[i].toInt() and 0xFF
+            val vNone = c.toByte(); val vSub = (c - a).toByte(); val vUp = (c - b).toByte()
+            none[i + 1] = vNone; sub[i + 1] = vSub; up[i + 1] = vUp
+            sNone += abs(vNone.toInt()); sSub += abs(vSub.toInt()); sUp += abs(vUp.toInt())
+        }
+        return when {
+            sUp <= sSub && sUp <= sNone -> up
+            sSub <= sNone -> sub
+            else -> none
+        }
+    }
+
+    private fun deflateRow(row: ByteArray) {
+        deflater.setInput(row, 0, row.size)
+        while (!deflater.needsInput()) drain(Deflater.NO_FLUSH)
+    }
+
+    private fun drain(flush: Int) {
+        val n = deflater.deflate(deflateOut, 0, deflateOut.size, flush)
+        if (n > 0) {
+            pending.write(deflateOut, 0, n)
+            if (pending.size() >= CHUNK) flushChunk()
+        }
+    }
+
+    private fun flushChunk() {
+        if (pending.size() == 0) return
+        writeChunk(idat, "IDAT", pending.toByteArray())
+        pending.reset()
+    }
+
+    /** Ends the image data and writes the complete PNG to [out]; [idatFile] is removed. */
+    fun finish(out: File) {
+        deflater.finish()
+        while (!deflater.finished()) drain(Deflater.NO_FLUSH)
+        flushChunk()
+        idat.close()
+        deflater.end()
+        DataOutputStream(BufferedOutputStream(FileOutputStream(out), 1 shl 16)).use { png ->
+            png.write(byteArrayOf(0x89.toByte(), 'P'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte(), 13, 10, 26, 10))
+            val ihdr = java.io.ByteArrayOutputStream().also { b ->
+                DataOutputStream(b).apply {
+                    writeInt(width); writeInt(rows)
+                    writeByte(8) // bit depth
+                    writeByte(2) // color type: RGB
+                    writeByte(0); writeByte(0); writeByte(0) // compression, filter, interlace
+                }
+            }.toByteArray()
+            writeChunk(png, "IHDR", ihdr)
+            idatFile.inputStream().use { it.copyTo(png, 1 shl 16) }
+            writeChunk(png, "IEND", ByteArray(0))
+        }
+        idatFile.delete()
+    }
+
+    override fun close() {
+        runCatching { idat.close() }
+        deflater.end()
+        idatFile.delete()
+    }
+
+    private companion object {
+        const val CHUNK = 1 shl 16
+
+        fun writeChunk(out: DataOutputStream, type: String, data: ByteArray) {
+            val typeBytes = type.toByteArray(Charsets.US_ASCII)
+            out.writeInt(data.size)
+            out.write(typeBytes)
+            out.write(data)
+            val crc = CRC32()
+            crc.update(typeBytes)
+            crc.update(data)
+            out.writeInt(crc.value.toInt())
+        }
+    }
+}
+
+// ─── Merged from ChatShareDebug.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-multi-select-share] Debug-server bridge for the share feature (iOS
+ * debug.chatShare.openPicker / debug.chatExport.render). The RPCs run outside any
+ * screen, but the picker and the renderer need the chat on screen (its view model,
+ * its window, its composition), so a request is posted here and served by the
+ * ChatScreen showing that session ([ChatShareDebugHost]).
+ */
+internal object ChatShareDebugBridge {
+    sealed class Event(val sessionId: String)
+    class OpenPicker(sessionId: String, val messageId: String?, val reply: CompletableDeferred<String?>) : Event(sessionId)
+    class Render(sessionId: String, val params: JSONObject, val reply: CompletableDeferred<JSONObject>) : Event(sessionId)
+
+    val events = MutableSharedFlow<Event>(extraBufferCapacity = 8)
+
+    /** Sessions currently shown by a ChatScreen that serves these requests. */
+    val onScreen: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
+}
+
+/**
+ * Serves [ChatShareDebugBridge] requests for the session this ChatScreen shows.
+ * Debug builds only.
+ */
+@Composable
+internal fun ChatShareDebugHost(sessionId: String, viewModel: ChatViewModel, openPicker: (String?) -> Unit) {
+    if (!BuildConfig.DEV_TOOLS) return
+    val view = LocalView.current
+    val parent = rememberCompositionContext()
+    val prewarm = rememberMarkdownPrewarmer()
+    val open by rememberUpdatedState(openPicker)
+    DisposableEffect(sessionId) {
+        ChatShareDebugBridge.onScreen += sessionId
+        onDispose { ChatShareDebugBridge.onScreen -= sessionId }
+    }
+    LaunchedEffect(sessionId, viewModel) {
+        ChatShareDebugBridge.events.collect { event ->
+            if (event.sessionId != sessionId) return@collect
+            when (event) {
+                is ChatShareDebugBridge.OpenPicker -> {
+                    val target = event.messageId
+                        ?: viewModel.uiMessages.value.lastOrNull { it.role == "user" && !it.isQueued }?.id
+                    open(target)
+                    event.reply.complete(target)
+                }
+                is ChatShareDebugBridge.Render -> {
+                    val stage = ChatExportStage(view.rootView as ViewGroup, view, parent)
+                    try {
+                        event.reply.complete(debugRender(viewModel, event.params, ChatExportRenderer(stage, prewarm), view.context.applicationContext))
+                    } catch (t: Throwable) {
+                        event.reply.completeExceptionally(t)
+                    } finally {
+                        stage.dispose()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Runs the export headlessly for the session on screen: units picked by
+ * `unitIndexes` or `lastUnits` (default all), tool calls / thinking only with
+ * `includeToolCalls` / `includeThinking`, options `format` (image|pdf),
+ * `wideLayout`, `dark`, `adaptiveTables`, `title`. The file stays in the app cache;
+ * `inline: true` also returns its bytes (base64, up to 8 MB).
+ */
+private suspend fun debugRender(
+    viewModel: ChatViewModel,
+    params: JSONObject,
+    renderer: ChatExportRenderer,
+    context: android.content.Context,
+): JSONObject {
+    val messages = com.openminis.app.ui.chat.mergeStreamingOverlay(viewModel.uiMessages.value, viewModel.streamingById.value)
+    val cells = ChatShareContent.cells(messages, viewModel.thinkingLevel.value.isEnabled)
+    val unitIds = cells.fold(mutableListOf<String>()) { acc, c -> if (acc.lastOrNull() != c.unitId) acc += c.unitId; acc }
+    var units: List<String> = unitIds
+    params.optJSONArray("unitIndexes")?.let { arr ->
+        units = (0 until arr.length()).mapNotNull { unitIds.getOrNull(arr.optInt(it, -1)) }
+    } ?: params.optInt("lastUnits", 0).takeIf { it > 0 }?.let { units = unitIds.takeLast(it) }
+    val includeTools = params.optBoolean("includeToolCalls", false)
+    val includeThinking = params.optBoolean("includeThinking", false)
+    val wanted = units.toSet()
+    val selected = cells.filter { cell ->
+        cell.unitId in wanted && when (cell.kind) {
+            ChatShareCell.Kind.TOOL -> includeTools
+            ChatShareCell.Kind.THINKING -> includeThinking
+            else -> true
+        }
+    }.map { it.id }.toSet()
+    val groups = ChatShareCells.renderGroups(cells, selected)
+    val options = ChatExportOptions(
+        format = if (params.optString("format") == "pdf") ChatExportOptions.Format.PDF else ChatExportOptions.Format.IMAGE,
+        wideLayout = params.optBoolean("wideLayout", false),
+        dark = params.optBoolean("dark", false),
+        adaptiveTables = params.optBoolean("adaptiveTables", false),
+    )
+    val title = params.optString("title").ifEmpty { "Debug Export" }
+    val started = System.currentTimeMillis()
+    val covered = groups.flatten().mapNotNull { c -> messages.firstOrNull { it.id == c.messageId } }
+    val subtitle = chatExportSubtitle(
+        viewModel.modelName.value.trim().ifEmpty { null },
+        chatShareFirstMessageDate(context, covered),
+    )
+    val result = renderer.render(groups, messages, title, subtitle, options) { _, _ -> }
+    return JSONObject().apply {
+        put("path", result.file.absolutePath)
+        put("bytes", result.file.length())
+        put("width", result.width)
+        put("height", result.height)
+        put("scale", result.scale.toDouble())
+        put("pages", result.pageCount)
+        put("units", result.units)
+        put("totalUnits", unitIds.size)
+        put("cells", JSONArray(groups.flatten().map { it.kind.name.lowercase() }))
+        put("ms", System.currentTimeMillis() - started)
+        if (params.optBoolean("inline", false) && result.file.length() <= 8L * 1024 * 1024) {
+            put("base64", Base64.encodeToString(result.file.readBytes(), Base64.NO_WRAP))
+        }
+    }
+}
+
+/** The RPC side of [ChatShareDebugBridge] (dispatched by DebugRPCHandler, debug builds only). */
+internal object ChatShareDebugRpc {
+    private fun sessionOnScreen(params: JSONObject): String {
+        val sid = params.optString("sessionId")
+        if (sid.isEmpty()) throw com.openminis.app.debug.RPCException(-32602, "Missing required param: sessionId")
+        if (sid !in ChatShareDebugBridge.onScreen) {
+            throw com.openminis.app.debug.RPCException(-32602, "session $sid is not on screen - open it in the app first")
+        }
+        return sid
+    }
+
+    /** debug.chatShare.openPicker: opens the picker as a long-press "Share Chat…" on a message would. */
+    suspend fun openPicker(params: JSONObject): JSONObject {
+        val sid = sessionOnScreen(params)
+        val reply = CompletableDeferred<String?>()
+        ChatShareDebugBridge.events.emit(
+            ChatShareDebugBridge.OpenPicker(sid, params.optString("messageId").ifEmpty { null }, reply),
+        )
+        val target = kotlinx.coroutines.withTimeout(10_000) { reply.await() }
+        return JSONObject().put("ok", true).put("messageId", target ?: JSONObject.NULL)
+    }
+
+    /** debug.chatExport.render: renders the export headlessly for the session on screen. */
+    suspend fun render(params: JSONObject): JSONObject {
+        val sid = sessionOnScreen(params)
+        val reply = CompletableDeferred<JSONObject>()
+        ChatShareDebugBridge.events.emit(ChatShareDebugBridge.Render(sid, params, reply))
+        return try {
+            kotlinx.coroutines.withTimeout(180_000) { reply.await() }
+        } catch (e: ChatExportError) {
+            throw com.openminis.app.debug.RPCException(-32000, "export failed: ${e::class.simpleName}")
+        }
+    }
 }

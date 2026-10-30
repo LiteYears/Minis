@@ -1,54 +1,83 @@
 package com.openminis.app.ui.chat
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AlarmOff
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.openminis.app.R
 import com.openminis.app.scheduled.ScheduledTaskDetailModel
 import com.openminis.app.scheduled.ScheduledTaskManager
 import com.openminis.app.scheduled.ScheduledTaskMarker
 import com.openminis.app.scheduled.ScheduledTaskStore
+import com.openminis.app.ui.components.MinisTextButton
 import com.openminis.app.ui.theme.ChatColors
+import java.text.NumberFormat
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 
 /** [T-android-scheduled-task-card] Amber — a timer, not an agent. */
 internal val ScheduledAccent = Color(0xFFF59E0B)
@@ -245,4 +274,332 @@ internal fun relativeFireTime(context: android.content.Context, atMs: Long, nowM
         ScheduledTaskDetailModel.RelativeUnit.YEAR -> android.icu.text.RelativeDateTimeFormatter.RelativeUnit.YEARS
     }
     return f.format(value.toDouble(), android.icu.text.RelativeDateTimeFormatter.Direction.NEXT, icuUnit)
+}
+
+// ─── Merged from ThinkingFullDialog.kt ──────────────────────────────────────────────────
+
+/**
+ * [#467] "Show full thinking": the whole thinking text of a finished block
+ * in a full-screen dialog (the style of the earlier over-100K viewer it
+ * replaces), never expanded inside the chat list.
+ *
+ * The text is split by [ThinkingChunking] off the main thread and shown as
+ * lazy items, a few chunks at first and a batch more each time the end of
+ * what is shown scrolls into view. Each batch's first frame is timed; a slow
+ * one switches to one chunk per tap of "Load more" ([ThinkingChunking.paceAfter]),
+ * so a device that cannot keep up is never frozen by automatic loading.
+ * "Copy All" copies the full text, whatever is on screen; the shown text is
+ * selectable.
+ *
+ * [content] is the text when the dialog opened: the entry is only offered
+ * once the block has finished streaming.
+ */
+@Composable
+fun ThinkingFullDialog(content: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val thinkingBlue = Color(0xFF007AFF)
+    val chunks by produceState<List<ThinkingChunking.Chunk>?>(null, content) {
+        value = withContext(Dispatchers.Default) { ThinkingChunking.chunks(content) }
+    }
+    var revealed by remember(content) { mutableIntStateOf(0) }
+    var pacing by remember(content) { mutableStateOf(ThinkingChunking.Pacing()) }
+    // Bumped per batch; the watchdog below times that batch's first frame.
+    var batchStartedAt by remember(content) { mutableStateOf(0L) }
+    LaunchedEffect(chunks) {
+        chunks?.let { revealed = ThinkingChunking.initialCount(it) }
+    }
+    LaunchedEffect(batchStartedAt) {
+        if (batchStartedAt == 0L) return@LaunchedEffect
+        withFrameNanos { }
+        pacing = ThinkingChunking.paceAfter(pacing, System.currentTimeMillis() - batchStartedAt)
+    }
+    val reveal = {
+        chunks?.let { c ->
+            if (ThinkingChunking.hasMore(revealed, c.size)) {
+                batchStartedAt = System.currentTimeMillis()
+                revealed = ThinkingChunking.nextCount(revealed, c.size, pacing)
+            }
+        }
+    }
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = stringResource(R.string.thinking_full_title),
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = thinkingBlue,
+                        )
+                        Text(
+                            text = stringResource(
+                                R.string.thinking_full_char_count,
+                                NumberFormat.getIntegerInstance().format(content.length),
+                            ),
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                        )
+                    }
+                    MinisTextButton(onClick = {
+                        try {
+                            clipboard.setText(AnnotatedString(ThinkingChunking.copyText(content)))
+                            Toast.makeText(context, R.string.terminal_copied_all, Toast.LENGTH_SHORT).show()
+                        } catch (e: RuntimeException) {
+                            // A text past the Binder transaction limit cannot go to the clipboard.
+                            Toast.makeText(context, R.string.thinking_full_copy_failed, Toast.LENGTH_SHORT).show()
+                        }
+                    }) {
+                        Text(text = stringResource(R.string.terminal_copy_all))
+                    }
+                    MinisTextButton(onClick = onDismiss) {
+                        Text(text = stringResource(android.R.string.ok))
+                    }
+                }
+                HorizontalDivider()
+                val list = chunks
+                if (list == null) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    }
+                } else {
+                    val state = rememberLazyListState()
+                    SelectionContainer(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                        LazyColumn(
+                            state = state,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(
+                                start = 16.dp,
+                                end = 16.dp,
+                                top = 12.dp,
+                                bottom = 32.dp,
+                            ),
+                        ) {
+                            items(count = minOf(revealed, list.size), key = { it }) { i ->
+                                Text(
+                                    text = ThinkingChunking.chunkText(content, list, i).removeSuffix("\n"),
+                                    fontSize = 13.sp,
+                                    lineHeight = 19.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+                                )
+                            }
+                            if (ThinkingChunking.hasMore(revealed, list.size)) {
+                                item(key = "more") {
+                                    // The end of what is shown came into view: the next batch
+                                    // (iOS LazyRevealChunks footer onAppear).
+                                    if (pacing.auto) LaunchedEffect(revealed) { reveal() }
+                                    Row(
+                                        horizontalArrangement = Arrangement.Center,
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                                    ) {
+                                        MinisTextButton(onClick = { reveal() }) {
+                                            Text(text = stringResource(R.string.thinking_full_load_more))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── Merged from StopChoiceDialog.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-stop-choice] "What should stop?" - shown instead of an immediate Stop
+ * when the conversation has background work a Stop would also end (sub
+ * agents, scheduled tasks; [StopSummary.hasBackground]).
+ *
+ * Lists what is running and how many of each, then offers:
+ *  - Stop Current Tool Only ([onToolOnly], the safe primary choice, nearest the
+ *    thumb) - only when this chat's own turn is running ([canStopToolOnly]);
+ *    with only background work there is no "current tool" to stop;
+ *  - Stop All ([onStopAll], destructive);
+ *  - Cancel.
+ *
+ * Also used by New Chat's "a task is running" guard, with its own title and
+ * button labels and the [body] override.
+ *
+ * Drawn as the iOS action sheet the same choice uses (ChatSendButton
+ * `.confirmationDialog`): a card at the bottom with the centred title and
+ * message over full-width, centred buttons divided by hairlines - the safe
+ * choice in the accent colour, Stop All in red - and Cancel, bold, on a card
+ * of its own below. The Material alert it replaces stacked three text
+ * buttons at the right edge under a left-aligned body.
+ */
+@Composable
+internal fun StopChoiceDialog(
+    summary: StopSummary,
+    canStopToolOnly: Boolean,
+    onDismiss: () -> Unit,
+    onToolOnly: () -> Unit,
+    onStopAll: () -> Unit,
+    title: String = stringResource(R.string.chat_stop_choice_title),
+    toolOnlyText: String = stringResource(R.string.chat_stop_choice_tool_only),
+    stopAllText: String = stringResource(R.string.chat_stop_choice_all),
+    body: String? = null,
+) {
+    val lines = buildList {
+        if (canStopToolOnly) {
+            add(
+                if (summary.runningTools.isEmpty()) {
+                    stringResource(R.string.chat_stop_choice_current_reply)
+                } else {
+                    stringResource(R.string.chat_stop_choice_current_tools, summary.runningTools.distinct().joinToString(", "))
+                },
+            )
+        }
+        if (summary.subAgentsRunning > 0) {
+            add(pluralStringResource(R.plurals.chat_stop_choice_subagents, summary.subAgentsRunning, summary.subAgentsRunning))
+        }
+        if (summary.subAgentsQueued > 0) {
+            add(pluralStringResource(R.plurals.chat_stop_choice_subagents_queued, summary.subAgentsQueued, summary.subAgentsQueued))
+        }
+        if (summary.scheduledTasks > 0) {
+            add(pluralStringResource(R.plurals.chat_stop_choice_scheduled, summary.scheduledTasks, summary.scheduledTasks))
+        }
+    }
+    val footer = buildList {
+        if (canStopToolOnly) add(stringResource(R.string.chat_stop_choice_tool_only_footer))
+        add(stringResource(R.string.chat_stop_choice_all_footer))
+    }.joinToString(" ")
+    val message = buildString {
+        body?.let { append(it).append("\n\n") }
+        append(lines.joinToString("\n"))
+        if (lines.isNotEmpty()) append("\n\n")
+        append(footer)
+    }
+    StopActionSheet(
+        title = title,
+        message = message,
+        onDismiss = onDismiss,
+        actions = buildList {
+            if (canStopToolOnly) add(SheetAction(toolOnlyText, destructive = false, onToolOnly))
+            add(SheetAction(stopAllText, destructive = true, onStopAll))
+        },
+    )
+}
+
+private class SheetAction(val label: String, val destructive: Boolean, val onClick: () -> Unit)
+
+@Composable
+private fun StopActionSheet(
+    title: String,
+    message: String,
+    onDismiss: () -> Unit,
+    actions: List<SheetAction>,
+) {
+    val dark = ChatColors.isDark
+    // iOS system colours for an action sheet: the grouped card, the tint and
+    // the destructive red, in each appearance.
+    val card = if (dark) Color(0xFF2C2C2E) else Color(0xFFF9F9F9)
+    val accent = if (dark) Color(0xFF0A84FF) else Color(0xFF007AFF)
+    val red = if (dark) Color(0xFFFF453A) else Color(0xFFFF3B30)
+    val hairline = ChatColors.separator
+    val shape = RoundedCornerShape(14.dp)
+    val noRipple = remember { MutableInteractionSource() }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        // Full-window so the sheet can sit at the bottom; a tap above it
+        // dismisses, as outside an iOS action sheet.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .clickable(interactionSource = noRipple, indication = null, onClick = onDismiss),
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(max = 480.dp)
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 8.dp, vertical = 8.dp)
+                    // Taps on the sheet itself do not dismiss it.
+                    .clickable(interactionSource = noRipple, indication = null, onClick = {}),
+            ) {
+                // [T-stop-sheet-fits] In landscape or at a large font scale the
+                // sheet can be taller than the window. Cancel is measured first
+                // (this card is weighted, not filling), and inside the card the
+                // buttons come before the title and message, which scroll in
+                // what is left - as the platform alert dialog does. Before,
+                // the bottom buttons laid out past the window edge.
+                Column(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .fillMaxWidth()
+                        .clip(shape)
+                        .background(card),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .fillMaxWidth()
+                            .verticalScroll(androidx.compose.foundation.rememberScrollState())
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = title,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = ChatColors.secondaryText,
+                            textAlign = TextAlign.Center,
+                        )
+                        if (message.isNotEmpty()) {
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = message,
+                                fontSize = 13.sp,
+                                lineHeight = 17.sp,
+                                color = ChatColors.secondaryText,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                    }
+                    for (action in actions) {
+                        Box(Modifier.fillMaxWidth().height(0.5.dp).background(hairline))
+                        SheetButton(action.label, if (action.destructive) red else accent, FontWeight.Normal) {
+                            action.onClick()
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Box(modifier = Modifier.fillMaxWidth().clip(shape).background(card)) {
+                    SheetButton(stringResource(R.string.cancel), accent, FontWeight.SemiBold, onDismiss)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SheetButton(label: String, color: Color, weight: FontWeight, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 56.dp)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            fontSize = 19.sp,
+            fontWeight = weight,
+            color = color,
+            textAlign = TextAlign.Center,
+        )
+    }
 }

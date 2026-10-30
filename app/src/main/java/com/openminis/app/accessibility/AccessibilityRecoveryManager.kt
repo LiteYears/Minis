@@ -1,17 +1,38 @@
 package com.openminis.app.accessibility
 
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.Context
+import android.content.pm.PackageInstaller
+import android.graphics.Bitmap
+import android.graphics.ColorSpace
+import android.graphics.Path
+import android.hardware.HardwareBuffer
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.view.Display
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import androidx.annotation.RequiresApi
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.offload.ShizukuManager
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.resume
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlin.coroutines.Continuation
-import kotlin.coroutines.resume
 
 /**
  * [T-android-a11y-force-stop-recovery] Detects a revoked accessibility grant
@@ -352,5 +373,519 @@ object AccessibilityRecoveryManager {
             Decision.OPEN_SETTINGS -> false
             Decision.CANCEL -> false
         }
+    }
+}
+
+// ─── Merged from MinisAccessibilityService.kt ──────────────────────────────────────────────────
+
+/**
+ * MinisAccessibilityService — host-side AccessibilityService backing the
+ * `android-a11y-cli` offload command. The user must enable it manually
+ * under Settings → Accessibility; we never start it programmatically.
+ */
+class MinisAccessibilityService : AccessibilityService() {
+
+    companion object {
+        private const val TAG = "MinisA11y"
+        const val SERVICE_ID = "com.openminis.app/.accessibility.MinisAccessibilityService"
+        private const val EVENT_RING_CAP = 1024
+
+        @Volatile
+        private var _instance: MinisAccessibilityService? = null
+
+        fun getInstance(): MinisAccessibilityService? = _instance
+    }
+
+    data class RecordedEvent(
+        val type: String,
+        val packageName: String?,
+        val className: String?,
+        val text: String?,
+        val timestamp: Long,
+    )
+
+    private val eventRing = ConcurrentLinkedQueue<RecordedEvent>()
+    private val eventListeners = CopyOnWriteArrayList<(RecordedEvent) -> Unit>()
+
+    val nodeRegistry: NodeRegistry = NodeRegistry()
+
+    override fun onCreate() {
+        super.onCreate()
+        _instance = this
+        AppLogger.info(TAG, "service created")
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        _instance = this
+        // [T-android-a11y-miui-service-failure] Breadcrumb on (re)bind. On OEM
+        // ROMs (MIUI etc.) the system kills + rebinds this service repeatedly,
+        // surfacing "此服务出现故障"; a connect log lets us correlate a degraded
+        // window in stall/diag logs with a kill/rebind. No self-restart logic —
+        // remediation is the user whitelisting autostart + battery (see
+        // SystemPermissionsScreen OEM guidance).
+        AppLogger.info(TAG, "service connected (manufacturer=${android.os.Build.MANUFACTURER})")
+        // [T-android-a11y-force-stop-recovery] Latch that the grant existed, so
+        // a later absence can be recognized as a revocation rather than a
+        // never-configured service. This is the one callback that only fires
+        // when the user has genuinely granted it.
+        try {
+            AccessibilityRecoveryManager.markGranted(this)
+            AccessibilityRecoveryManager.refreshRevokedState(this)
+        } catch (t: Throwable) {
+            AppLogger.warning(TAG, "markGranted failed: ${t.message}")
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val rec = RecordedEvent(
+            type = AccessibilityEvent.eventTypeToString(event.eventType),
+            packageName = event.packageName?.toString(),
+            className = event.className?.toString(),
+            text = event.text?.joinToString(" ") { it?.toString() ?: "" }?.takeIf { it.isNotBlank() },
+            timestamp = System.currentTimeMillis(),
+        )
+        eventRing.offer(rec)
+        while (eventRing.size > EVENT_RING_CAP) eventRing.poll()
+        for (listener in eventListeners) {
+            try { listener(rec) } catch (_: Throwable) {}
+        }
+    }
+
+    override fun onInterrupt() {
+        AppLogger.info(TAG, "service interrupted")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (_instance === this) _instance = null
+        eventRing.clear()
+        nodeRegistry.clear()
+        eventListeners.clear()
+        AppLogger.info(TAG, "service destroyed")
+    }
+
+    fun snapshotEvents(): List<RecordedEvent> = eventRing.toList()
+
+    fun addEventListener(listener: (RecordedEvent) -> Unit) {
+        eventListeners.add(listener)
+    }
+
+    fun removeEventListener(listener: (RecordedEvent) -> Unit) {
+        eventListeners.remove(listener)
+    }
+
+    fun rootNodes(): List<AccessibilityNodeInfo> {
+        val out = ArrayList<AccessibilityNodeInfo>()
+        try {
+            for (w in windows ?: emptyList()) {
+                w.root?.let { out.add(it) }
+            }
+        } catch (_: Throwable) {}
+        if (out.isEmpty()) {
+            try { rootInActiveWindow?.let { out.add(it) } } catch (_: Throwable) {}
+        }
+        return out
+    }
+
+    fun windowInfos(): List<Map<String, Any?>> {
+        val out = ArrayList<Map<String, Any?>>()
+        try {
+            for (w in windows ?: emptyList()) {
+                out.add(mapOf(
+                    "windowId" to w.id,
+                    "type" to when (w.type) {
+                        android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION -> "application"
+                        android.view.accessibility.AccessibilityWindowInfo.TYPE_SYSTEM -> "system"
+                        android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD -> "input_method"
+                        android.view.accessibility.AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY -> "overlay"
+                        else -> "other"
+                    },
+                    "title" to (w.title?.toString() ?: ""),
+                    "focused" to w.isFocused,
+                    "active" to w.isActive,
+                ))
+            }
+        } catch (_: Throwable) {}
+        return out
+    }
+
+    fun foregroundPackage(): Pair<String?, String?> {
+        return try {
+            val r = rootInActiveWindow
+            (r?.packageName?.toString()) to (r?.className?.toString())
+        } catch (_: Throwable) { null to null }
+    }
+
+    fun dispatchSimpleGesture(path: Path, startTime: Long, durationMs: Long, timeoutMs: Long = 5000): Boolean {
+        val stroke = GestureDescription.StrokeDescription(path, startTime, durationMs)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        val done = java.util.concurrent.CountDownLatch(1)
+        val ok = booleanArrayOf(false)
+        val callback = object : GestureResultCallback() {
+            override fun onCompleted(g: GestureDescription?) { ok[0] = true; done.countDown() }
+            override fun onCancelled(g: GestureDescription?) { ok[0] = false; done.countDown() }
+        }
+        Handler(Looper.getMainLooper()).post { dispatchGesture(gesture, callback, null) }
+        return done.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) && ok[0]
+    }
+
+    fun dispatchPinch(cx: Float, cy: Float, scale: Float, durationMs: Long): Boolean {
+        val initialOffset = 200f
+        val finalOffset = (initialOffset * scale).coerceAtLeast(20f)
+        val (s0, e0) = if (scale > 1f) {
+            (cx - finalOffset to cy) to (cx - initialOffset to cy)
+        } else {
+            (cx - initialOffset to cy) to (cx - finalOffset to cy)
+        }
+        val (s1, e1) = if (scale > 1f) {
+            (cx + finalOffset to cy) to (cx + initialOffset to cy)
+        } else {
+            (cx + initialOffset to cy) to (cx + finalOffset to cy)
+        }
+        val p0 = Path().apply { moveTo(s0.first, s0.second); lineTo(e0.first, e0.second) }
+        val p1 = Path().apply { moveTo(s1.first, s1.second); lineTo(e1.first, e1.second) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p0, 0, durationMs))
+            .addStroke(GestureDescription.StrokeDescription(p1, 0, durationMs))
+            .build()
+        val done = java.util.concurrent.CountDownLatch(1)
+        val ok = booleanArrayOf(false)
+        Handler(Looper.getMainLooper()).post {
+            dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) { ok[0] = true; done.countDown() }
+                override fun onCancelled(g: GestureDescription?) { ok[0] = false; done.countDown() }
+            }, null)
+        }
+        return done.await(durationMs + 2000, java.util.concurrent.TimeUnit.MILLISECONDS) && ok[0]
+    }
+
+    /**
+     * Result of [captureScreenshot]. On success [bitmap] is non-null and
+     * caller is responsible for `bitmap.recycle()`.
+     */
+    data class ShotResult(
+        val bitmap: Bitmap?,
+        val errorCode: String? = null,
+        val errorMessage: String? = null,
+    )
+
+    /**
+     * Synchronously captures a system-wide screenshot via
+     * `AccessibilityService.takeScreenshot` (API 30+). Blocks the calling
+     * thread up to [timeoutMs]. Caller must check `Build.VERSION.SDK_INT`
+     * before invoking — annotated `@RequiresApi(R)`.
+     */
+    @RequiresApi(Build.VERSION_CODES.R)
+    fun captureScreenshot(displayId: Int = Display.DEFAULT_DISPLAY, timeoutMs: Long = 5_000): ShotResult {
+        val done = CountDownLatch(1)
+        val resultRef = java.util.concurrent.atomic.AtomicReference(
+            ShotResult(null, "TIMEOUT", "takeScreenshot timed out")
+        )
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            takeScreenshot(displayId, executor, object : TakeScreenshotCallback {
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    try {
+                        val hwBuffer: HardwareBuffer = screenshot.hardwareBuffer
+                        val cs: ColorSpace? = screenshot.colorSpace
+                        val bmp = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
+                        try { hwBuffer.close() } catch (_: Throwable) {}
+                        if (bmp == null) {
+                            resultRef.set(ShotResult(null, "DECODE_FAILED", "wrapHardwareBuffer returned null"))
+                        } else {
+                            // Copy to a software bitmap so we can encode + scale freely.
+                            val sw = bmp.copy(Bitmap.Config.ARGB_8888, false)
+                            bmp.recycle()
+                            resultRef.set(ShotResult(sw))
+                        }
+                    } catch (t: Throwable) {
+                        resultRef.set(ShotResult(null, "DECODE_FAILED", "${t.javaClass.simpleName}: ${t.message ?: ""}"))
+                    } finally {
+                        done.countDown()
+                    }
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    resultRef.set(ShotResult(null, "TAKE_SCREENSHOT_FAILED", "takeScreenshot error code=$errorCode"))
+                    done.countDown()
+                }
+            })
+            if (!done.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                AppLogger.warning(TAG, "takeScreenshot timed out after ${timeoutMs}ms")
+            }
+        } catch (t: Throwable) {
+            resultRef.set(ShotResult(null, "INTERNAL", "${t.javaClass.simpleName}: ${t.message ?: ""}"))
+        } finally {
+            executor.shutdown()
+        }
+        return resultRef.get()
+    }
+
+    fun setNodeText(node: AccessibilityNodeInfo, text: String): Boolean {
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        }
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+}
+
+// ─── Merged from NodeRegistry.kt ──────────────────────────────────────────────────
+
+/**
+ * Short-lived cache mapping opaque string IDs (e.g. "a3f2") to live
+ * AccessibilityNodeInfo references. AccessibilityNodeInfo has no durable
+ * identity across calls — `ui dump` allocates fresh objects every time
+ * the framework re-enumerates the tree, but the AI agent expects to
+ * reference a node by id seconds later in `tap node a3f2`.
+ *
+ * Entries expire after [TTL_MS] or when [clear] is called (e.g. on
+ * service destroy).
+ */
+class NodeRegistry {
+    private data class Entry(val node: AccessibilityNodeInfo, val createdAt: Long)
+
+    private val map = ConcurrentHashMap<String, Entry>()
+    private val seq = AtomicLong(0)
+
+    fun put(node: AccessibilityNodeInfo): String {
+        evictExpired()
+        val id = nextId()
+        map[id] = Entry(node, System.currentTimeMillis())
+        return id
+    }
+
+    fun get(id: String): AccessibilityNodeInfo? {
+        val e = map[id] ?: return null
+        if (System.currentTimeMillis() - e.createdAt > TTL_MS) {
+            map.remove(id)
+            return null
+        }
+        return e.node
+    }
+
+    fun clear() { map.clear() }
+
+    private fun evictExpired() {
+        val now = System.currentTimeMillis()
+        val it = map.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (now - e.value.createdAt > TTL_MS) it.remove()
+        }
+    }
+
+    private fun nextId(): String {
+        return java.lang.Long.toString(seq.incrementAndGet() and 0xFFFFFL, 36).padStart(4, '0')
+    }
+
+    companion object {
+        const val TTL_MS = 60_000L
+    }
+}
+
+// ─── Merged from RestrictedSettingsManager.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-android-restricted-settings] Detects Android 13+ "restricted settings"
+ * and offers to clear it.
+ *
+ * ## Why this exists
+ *
+ * A user on Redmi Note 12 Pro+ 5G (HyperOS 2.0.10 / Android 14) updated Minis
+ * from the website and could no longer enable the accessibility service
+ * backing `android-a11y-cli`: tapping Minis under Settings → Accessibility
+ * pops "Restricted setting — for your security, this setting is currently
+ * unavailable" and the toggle never moves. Older builds enabled fine.
+ *
+ * ## Root cause (an OS policy, not a Minis regression)
+ *
+ * AOSP `InstallPackageHelper.installPackagesLI` ends with:
+ *
+ * ```java
+ * // Apply restricted settings on potentially dangerous packages.
+ * if (installRequest.getPackageSource() == PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE
+ *         || installRequest.getPackageSource() == PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE) {
+ *     enableRestrictedSettings(pkgName, pkg.getUid());
+ * }
+ * ```
+ *
+ * and `enableRestrictedSettings` sets `OP_ACCESS_RESTRICTED_SETTINGS` to
+ * `MODE_ERRORED` for every user. While that op is errored the Settings app
+ * refuses to arm the accessibility toggle (same gate covers notification
+ * listeners and device admin).
+ *
+ * The trigger is purely the `packageSource` the INSTALLING app declared via
+ * `SessionParams.setPackageSource`. The framework does not infer or police it
+ * — see `PackageInstallerService.createSession`, which passes
+ * `params.packageSource` into `InstallSource.create` unchecked. So:
+ *
+ * - `adb install` / `pm install` leaves it `PACKAGE_SOURCE_UNSPECIFIED` (0) →
+ *   never restricted. This is why the problem is invisible to us in
+ *   development and why every internal test build enables fine.
+ * - A file manager or browser installing a downloaded APK declares 3/4 →
+ *   restricted.
+ * - A store declares `PACKAGE_SOURCE_STORE` (2) → not restricted.
+ *
+ * Confirmed on a Pixel 4a (Android 13) across 25 installed third-party
+ * packages: every `packageSource=3`/`4` package reads `deny` (= MODE_ERRORED)
+ * for this op, and every `packageSource=0` package reads `allow`/default. The
+ * correlation is exact.
+ *
+ * ### Why the user's "old version worked" and why SAI did not help
+ *
+ * Nothing changed in Minis. What changed is how that particular copy was
+ * installed: an APK opened from a browser/file manager download declares
+ * `DOWNLOADED_FILE`, so the flag is applied at install time and then persists
+ * across in-place updates. SAI is session-based, but session-based is NOT the
+ * exemption — SAI still declares a local-file source, so reinstalling through
+ * it re-applies the very same flag. That is exactly what the user observed.
+ *
+ * ### Why we cannot fix this from inside the app
+ *
+ * `ACCESS_RESTRICTED_SETTINGS` is set on OUR uid by the installer, and
+ * clearing it needs `android.permission.MANAGE_APP_OPS_MODES` (signature).
+ * An app cannot exempt itself — by design, since the whole point is to stop a
+ * sideloaded app from talking the user into granting it screen-reading power.
+ * The op is additionally `restrictRead`, so we cannot even *observe* it (see
+ * [isRestricted]). So the honest remedy is detection via the install source
+ * plus accurate guidance, with an optional one-tap fix when the user already
+ * has Shizuku (which runs as shell and does hold the permission).
+ *
+ * ## What this does NOT do
+ *
+ * It does not change how Minis is packaged or installed, and deliberately so.
+ * We could make the in-app updater install through a `PackageInstaller`
+ * session declaring `PACKAGE_SOURCE_STORE` — the framework does not verify
+ * that claim — and self-updates would stop being flagged. That is a
+ * misrepresentation of provenance made solely to dodge a user-protection
+ * prompt, it would not help the reported user (whose copy came from a browser
+ * download, not from our updater), and it cannot fix an already-flagged
+ * install anyway. Guidance is the correct fix; the user stays the one who
+ * decides.
+ */
+object RestrictedSettingsManager {
+
+    private const val TAG = "RestrictedSettings"
+
+    /**
+     * Set once [clearWithShizuku] has verifiably lifted the flag. Deliberately
+     * in-memory only: it is a display latch, not persisted state, and a fresh
+     * process re-derives the truth from the install source (plus, if the user
+     * has by then enabled the service, the guidance is gated off anyway).
+     */
+    @Volatile
+    private var cleared = false
+
+    /**
+     * True when the OS has flagged this install and will therefore block the
+     * accessibility toggle.
+     *
+     * ### Why we do NOT read the appop directly
+     *
+     * The obvious probe — `unsafeCheckOpNoThrow("android:access_restricted_settings", …)`
+     * on our own uid — does not work, and fails in a way that is easy to miss:
+     * it throws SecurityException rather than returning a mode. The op is
+     * declared `.setRestrictRead(true)` in AppOpsManager's op table, and
+     * `AppOpsService.verifyIncomingOp` turns that into
+     * `enforcePermission(MANAGE_APPOPS)` for EVERY caller — reading your own
+     * op is not exempt. Verified on a Pixel 4a (Android 13): with the op set
+     * to `deny` via `cmd appops`, the in-app probe logged
+     * "SecurityException" once per poll and the guidance never appeared.
+     *
+     * ### What we read instead
+     *
+     * The same input the framework itself keys the decision on: the
+     * `packageSource` our installer declared. `InstallPackageHelper` applies
+     * the flag for exactly `PACKAGE_SOURCE_LOCAL_FILE` (3) and
+     * `PACKAGE_SOURCE_DOWNLOADED_FILE` (4), and
+     * `InstallSourceInfo.getPackageSource()` is public API readable for our
+     * own package with no permission. So this is not a heuristic — it is the
+     * same condition, read from the other side.
+     *
+     * `getPackageSource()` was added in Android 14 (U). On Android 13 the flag
+     * exists but the value is unreadable, so we return false there and leave
+     * today's behaviour: the reported device is Android 14, and guessing on 13
+     * risks showing the banner to users whose install is fine.
+     *
+     * Returns false on anything unexpected. A false negative just leaves the
+     * pre-existing behaviour; a false positive would send every user chasing a
+     * setting that isn't there.
+     */
+    fun isRestricted(context: Context): Boolean {
+        // Once we have actually cleared the op this session, stop reporting
+        // restricted. The install source (what isRestricted reads) does not
+        // change when the flag is lifted, and the op itself is unreadable to
+        // us, so without this latch the guidance would never go away.
+        if (cleared) return false
+        // getPackageSource() is UPSIDE_DOWN_CAKE+ (Android 14).
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return false
+        return try {
+            val source = context.packageManager
+                .getInstallSourceInfo(context.packageName)
+                .packageSource
+            val restricted = isRestrictedSource(source)
+            if (restricted) {
+                AppLogger.info(TAG, "install flagged restricted (packageSource=$source)")
+            }
+            restricted
+        } catch (t: Throwable) {
+            AppLogger.info(TAG, "install-source probe unavailable: ${t.javaClass.simpleName}")
+            false
+        }
+    }
+
+    /**
+     * Classify a `PackageInstaller.PACKAGE_SOURCE_*` value. Split out so the
+     * decision is testable on the JVM (no Robolectric in this module).
+     *
+     * Mirrors `InstallPackageHelper`'s condition exactly — only LOCAL_FILE and
+     * DOWNLOADED_FILE trigger the flag. UNSPECIFIED (adb/pm), STORE and OTHER
+     * must NOT, or we would put a "your install is blocked" banner in front of
+     * users whose install is perfectly fine.
+     */
+    internal fun isRestrictedSource(packageSource: Int): Boolean =
+        packageSource == PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE ||
+            packageSource == PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE
+
+    /**
+     * Clear the flag via Shizuku, which runs as `shell` and so holds
+     * `MANAGE_APP_OPS_MODES`. This is the same privileged channel
+     * [AccessibilityRecoveryManager.repairWithShizuku] uses.
+     *
+     * Equivalent to the command the reporting user ran by hand:
+     * `appops set com.openminis.app ACCESS_RESTRICTED_SETTINGS allow`.
+     *
+     * @return true once the op reads back as allowed.
+     */
+    suspend fun clearWithShizuku(context: Context): Boolean {
+        if (!ShizukuManager.isReady()) {
+            AppLogger.info(TAG, "clear skipped: Shizuku not ready")
+            return false
+        }
+        val set = ShizukuManager.runProcess(
+            arrayOf(
+                "appops", "set", context.packageName,
+                "ACCESS_RESTRICTED_SETTINGS", "allow",
+            ),
+        )
+        if (set.exitCode != 0) {
+            AppLogger.warning(TAG, "appops set failed: exit=${set.exitCode} ${set.combined}")
+            return false
+        }
+        // Verify rather than trust the exit code. Note we must re-read through
+        // Shizuku too: [isRestricted] reads the INSTALL SOURCE, which never
+        // changes, and the appop itself is read-restricted to MANAGE_APPOPS
+        // holders — so the in-process probe cannot observe this write at all.
+        val get = ShizukuManager.runProcess(
+            arrayOf("appops", "get", context.packageName, "ACCESS_RESTRICTED_SETTINGS"),
+        )
+        // `cmd appops get` prints e.g. "ACCESS_RESTRICTED_SETTINGS: allow".
+        // "deny" is how the shell renders MODE_ERRORED.
+        val ok = get.exitCode == 0 && get.combined.contains("allow")
+        if (ok) cleared = true
+        AppLogger.info(TAG, "cleared restricted settings via Shizuku; ok=$ok (${get.combined.trim()})")
+        return ok
     }
 }

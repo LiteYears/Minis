@@ -14,17 +14,23 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import androidx.annotation.DrawableRes
 import androidx.core.app.NotificationCompat
 import com.openminis.app.MinisApp
+import com.openminis.app.R
 import com.openminis.app.agent.SoulMetadata
 import com.openminis.app.agent.SoulStore
-import com.openminis.app.R
+import com.openminis.app.ui.chat.friendlyToolTitleFor
+import com.openminis.app.ui.chat.toolIconResFor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -1627,3 +1633,560 @@ class AgentForegroundService : Service() {
         return notification
     }
 }
+
+// ─── Merged from BackgroundInterruptionTracker.kt ──────────────────────────────────────────────────
+
+/**
+ * Tracks whether an agent session was interrupted by the app going to background.
+ * Records a timestamp when the app backgrounds; on resume, if an active session was
+ * running, flags the interruption so the UI can alert the user.
+ */
+object BackgroundInterruptionTracker {
+
+    private var backgroundTimestampMs: Long? = null
+    private var wasSessionActive = false
+
+    private val _interrupted = MutableStateFlow(false)
+    val interrupted: StateFlow<Boolean> = _interrupted.asStateFlow()
+
+    private val _interruptionDurationMs = MutableStateFlow(0L)
+    val interruptionDurationMs: StateFlow<Long> = _interruptionDurationMs.asStateFlow()
+
+    /**
+     * Called when the app enters background. Records timestamp and active state.
+     */
+    fun onBackground(sessionActive: Boolean) {
+        backgroundTimestampMs = System.currentTimeMillis()
+        wasSessionActive = sessionActive
+    }
+
+    /**
+     * Called when the app returns to foreground. Checks for interruption.
+     */
+    fun onForeground() {
+        val bgTs = backgroundTimestampMs ?: return
+        if (wasSessionActive) {
+            val duration = System.currentTimeMillis() - bgTs
+            // Only flag as interrupted if backgrounded for more than 5 seconds
+            if (duration > 5_000) {
+                _interruptionDurationMs.value = duration
+                _interrupted.value = true
+            }
+        }
+        backgroundTimestampMs = null
+        wasSessionActive = false
+    }
+
+    /**
+     * Dismiss the interruption alert.
+     */
+    fun acknowledge() {
+        _interrupted.value = false
+        _interruptionDurationMs.value = 0
+    }
+}
+
+// ─── Merged from OverlayPosition.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-overlay-position-restore] Where the floating capsule's window goes: the
+ * position remembered from the user's last drag, kept reachable, or the
+ * default when nothing was ever remembered.
+ *
+ * Coordinates are the window's top-left corner in pixels (gravity TOP|START).
+ * The window is FLAG_LAYOUT_NO_LIMITS and a drag is not clamped, so a
+ * remembered position may be partly off-screen on any side - x is NEGATIVE
+ * when the capsule hangs off the left edge. A negative coordinate is a real
+ * position, never a "nothing saved" marker: the old reader tested
+ * `savedX >= 0 && savedY >= 0`, so a capsule parked off the left (or top)
+ * edge was thrown back to the default corner the next time it was attached,
+ * while one parked off the right edge, whose x is a large positive number,
+ * was restored.
+ *
+ * [T-overlay-no-top-hide] What is SHOWN is never half past the top edge any
+ * more (see [clamp]); the saved drag itself is still kept as dragged.
+ */
+internal object OverlayPosition {
+
+    data class Point(val x: Int, val y: Int)
+
+    /**
+     * [T-overlay-orientation-position] Each orientation keeps its own
+     * position. With one shared position a rotation clamped it to the other
+     * orientation's screen and saved that, so a capsule left low in portrait
+     * came back 850 px higher after a trip through landscape (Alice Q2).
+     */
+    enum class Orientation {
+        PORTRAIT, LANDSCAPE;
+
+        companion object {
+            /** A square screen counts as portrait. */
+            fun of(screenW: Int, screenH: Int): Orientation = if (screenW > screenH) LANDSCAPE else PORTRAIT
+        }
+    }
+
+    /**
+     * Screen edges the capsule must not cover at all, in pixels: the
+     * navigation bar or gesture inset on that side. Zero on the left, right or
+     * bottom keeps the half-on-screen rule there.
+     *
+     * [T-overlay-no-top-hide] The top is different: the capsule is always
+     * fully below it, [top] or 0 when [top] is 0. The half-hidden top that
+     * [T-overlay-position-restore] allowed put the capsule in the system's
+     * pull-down gesture strip, a suspected cause of "it won't drag" (Alice,
+     * inferred, not reproduced). [top] is the status bar / cutout height.
+     */
+    data class Avoid(val left: Int = 0, val right: Int = 0, val bottom: Int = 0, val top: Int = 0) {
+        companion object {
+            val NONE = Avoid()
+        }
+    }
+
+    /** The saved positions, one per orientation. */
+    interface Store {
+        fun get(orientation: Orientation): Point?
+        fun set(orientation: Orientation, point: Point)
+    }
+
+    /**
+     * System bar avoidance for [orientation]. Left, right and bottom are
+     * landscape only: there the capsule was clamped onto the home gesture bar,
+     * where touching it starts a system gesture; portrait keeps the edge
+     * behaviour it already had on those sides. [top] (status bar / cutout,
+     * [T-overlay-no-top-hide]) applies in both orientations.
+     */
+    fun avoidFor(orientation: Orientation, left: Int, right: Int, bottom: Int, top: Int = 0): Avoid =
+        if (orientation == Orientation.LANDSCAPE) {
+            Avoid(left.coerceAtLeast(0), right.coerceAtLeast(0), bottom.coerceAtLeast(0), top.coerceAtLeast(0))
+        } else {
+            Avoid(top = top.coerceAtLeast(0))
+        }
+
+    /**
+     * Where the capsule is shown on a screen of this size: the position saved
+     * for its orientation, clamped, or [default] when that orientation has
+     * none. Reads only; the clamp is for display and is never saved, so the
+     * next rotation back finds the user's position intact.
+     */
+    fun displayed(store: Store, default: Point, screenW: Int, screenH: Int, capsuleW: Int, capsuleH: Int, avoid: Avoid): Point =
+        restore(store.get(Orientation.of(screenW, screenH)), default, screenW, screenH, capsuleW, capsuleH, avoid)
+
+    /** A drag ended at [point]: the only write, and only to the current orientation. */
+    fun dragEnded(store: Store, screenW: Int, screenH: Int, point: Point) =
+        store.set(Orientation.of(screenW, screenH), point)
+
+    /**
+     * Position to attach at. [saved] is null when no drag was ever stored,
+     * which is the only case that gets [default].
+     */
+    fun restore(
+        saved: Point?,
+        default: Point,
+        screenW: Int,
+        screenH: Int,
+        capsuleW: Int,
+        capsuleH: Int,
+        avoid: Avoid = Avoid.NONE,
+    ): Point {
+        val at = saved ?: default
+        // The default is computed for an unobstructed screen; it goes through
+        // the avoidance too, so it does not land on a landscape gesture bar.
+        if (saved == null && avoid == Avoid.NONE) return default
+        return clamp(at.x, at.y, screenW, screenH, capsuleW, capsuleH, avoid)
+    }
+
+    /**
+     * Keep at least half of the capsule on screen on the left, right and
+     * bottom. A position the user could see half of is left exactly where it
+     * was - parking the capsule against (or partly past) a side edge is how
+     * people use it - while one saved on a larger or rotated screen, or
+     * dragged almost entirely away, is pulled back until half of it shows and
+     * it can be grabbed.
+     *
+     * A side with a non-zero [avoid] inset is the exception: there the
+     * capsule stays entirely clear of the inset instead.
+     *
+     * [T-overlay-no-top-hide] The top always keeps the whole capsule on
+     * screen: y >= [Avoid.top], and y >= 0 when that is 0.
+     */
+    fun clamp(x: Int, y: Int, screenW: Int, screenH: Int, capsuleW: Int, capsuleH: Int, avoid: Avoid = Avoid.NONE): Point =
+        Point(
+            clampAxis(x, screenW, capsuleW, avoidStart = avoid.left, avoidEnd = avoid.right),
+            clampAxis(y, screenH, capsuleH, avoidStart = avoid.top, avoidEnd = avoid.bottom, wholeAtStart = true),
+        )
+
+    /** [wholeAtStart]: the start edge keeps the whole capsule on screen even with no inset there. */
+    private fun clampAxis(pos: Int, screen: Int, size: Int, avoidStart: Int, avoidEnd: Int, wholeAtStart: Boolean = false): Int {
+        val min = if (avoidStart > 0 || wholeAtStart) avoidStart.coerceAtLeast(0) else -(size / 2)
+        val max = (if (avoidEnd > 0) screen - avoidEnd - size else screen - (size - size / 2)).coerceAtLeast(min)
+        return pos.coerceIn(min, max)
+    }
+}
+
+// ─── Merged from SessionUnreadStore.kt ──────────────────────────────────────────────────
+
+/**
+ * [UI-261023-07] Chats with a new reply the user has not seen: a red dot on
+ * the row's avatar and, while their group is closed, on the group tile.
+ *
+ * Mirrors iOS `SessionBadgeState.unread` (SessionBadgeStore.swift): a turn
+ * that ends with a reply while the user is not looking at that chat marks it
+ * unread; opening the chat clears it. Like iOS it is a transient hint, kept
+ * in memory only - never persisted, never synced - so losing it on relaunch
+ * is fine and there is no wire format to agree on.
+ *
+ * Kept apart from [SessionBadgeStore] on purpose: that store's queue head is
+ * the row's bottom corner badge and it is persisted, both wrong for this.
+ */
+object SessionUnreadStore {
+    private val _ids = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Session ids carrying the unread dot. */
+    val ids: StateFlow<Set<String>> = _ids.asStateFlow()
+
+    /**
+     * Chat screens in the foreground, each reporting the id it shows. A
+     * supplier rather than a fixed id: a draft chat gets its real id with the
+     * first message, and the turn that ends is reported under the real one.
+     */
+    private val viewers = LinkedHashMap<Any, () -> String>()
+
+    /** True while a resumed chat screen shows [sessionId]. */
+    fun isViewing(sessionId: String): Boolean = synchronized(this) {
+        viewers.values.any { it() == sessionId }
+    }
+
+    /** A chat screen came to the foreground: it is being read, so it is not unread. */
+    fun startViewing(token: Any, sessionId: () -> String) {
+        synchronized(this) { viewers[token] = sessionId }
+        markRead(sessionId())
+    }
+
+    fun stopViewing(token: Any) {
+        synchronized(this) { viewers.remove(token) }
+    }
+
+    /**
+     * A turn of [sessionId] ended with a reply. Marks it unread unless the
+     * user is looking at it - they saw the reply arrive.
+     */
+    fun markUnread(sessionId: String) {
+        if (sessionId.isEmpty() || isViewing(sessionId)) return
+        _ids.update { it + sessionId }
+    }
+
+    fun markRead(sessionId: String) {
+        if (sessionId.isEmpty()) return
+        _ids.update { it - sessionId }
+    }
+
+    private inline fun MutableStateFlow<Set<String>>.update(f: (Set<String>) -> Set<String>) {
+        synchronized(this@SessionUnreadStore) {
+            val next = f(value)
+            if (next != value) value = next
+        }
+    }
+}
+
+// ─── Merged from ToolOutcome.kt ──────────────────────────────────────────────────
+
+/**
+ * T-overlay-glyph-typed-outcome: typed outcome of a completed tool call.
+ *
+ * Replaces the old `ToolOverlayController.looksLikeFailure(statusText)`
+ * heuristic, which scanned the stale "Running: foo" status string left
+ * behind by [SessionActivityTracker] and therefore always inferred
+ * success. Call sites that know the outcome (success path / catch block
+ * / cancellation) now pass the typed value into
+ * [SessionActivityTracker.clearToolRunning]; the overlay reads it
+ * directly to render the correct glyph.
+ *
+ * - [Success]   – the tool returned a result that the agent loop
+ *                 accepted (non-throwing, non-timeout, non-cancel).
+ * - [Error]     – the tool threw, returned a non-OK exitCode, or was
+ *                 otherwise marked failed by the chat loop.
+ * - [Timeout]   – the tool exceeded its watchdog timeout.
+ * - [Cancelled] – the user cancelled mid-stream (Stop button, etc.).
+ * - [Unknown]   – default for legacy callers / paths that don't yet
+ *                 supply an outcome; the overlay treats this as "no
+ *                 glyph" (hidden / gray) so we don't pretend to know.
+ */
+enum class ToolOutcome {
+    Success,
+    Error,
+    Timeout,
+    Cancelled,
+    Unknown,
+}
+
+// ─── Merged from AgentNotificationContent.kt ──────────────────────────────────────────────────
+
+/**
+ * [T-android-live-update-content] Pure content model for the ongoing agent
+ * notification / Android 16 Live Update chip. Everything here is a function
+ * of tracker state so it can be unit-tested without a Service or a device,
+ * and so the notification and the floating overlay resolve the same
+ * phase from the same inputs.
+ *
+ * The phases mirror what the iOS Dynamic Island and the Android overlay
+ * capsule already distinguish:
+ *  - [COMPLETED]  the run finished and the notification is resting
+ *  - [TOOL]       a tool call is executing (icon/title identify the tool)
+ *  - [THINKING]   the model is emitting reasoning, no visible text yet
+ *  - [GENERATING] the model is streaming the visible reply
+ *  - [IDLE]       service alive with nothing running (presence only)
+ *  - [WAITING]    nothing running, a chat waits for its next scheduled run
+ *                 ([T-port-sched-wait-notification], iOS fa7adaf9e's waiting
+ *                 card): counts down to the run and KEEPS Stop, which is the
+ *                 only way to turn the schedule off from the notification
+ *  - [ASKING]     a user_ask question waits for the user ([T-android-user-ask-chip]):
+ *                 its own icon and text, the clock counting down to the
+ *                 question's timeout, so a backgrounded user sees it needs them
+ *                 instead of a "Running" that never ends
+ */
+internal enum class AgentPhase { COMPLETED, TOOL, THINKING, GENERATING, IDLE, WAITING, ASKING }
+
+internal fun resolveAgentPhase(
+    isCompleted: Boolean,
+    toolName: String?,
+    isThinking: Boolean,
+    hasActiveSessions: Boolean,
+    isScheduledWaiting: Boolean = false,
+    isAwaitingAnswer: Boolean = false,
+): AgentPhase = when {
+    // [T-android-user-ask-chip] First: the run is suspended on the user, and
+    // that is what the chip must say - not the user_ask tool row, not
+    // another chat's streaming, not a scheduled wait.
+    isAwaitingAnswer -> AgentPhase.ASKING
+    // [T-port-sched-wait-notification] Before COMPLETED: between fires the
+    // previous run's finish stamp is still set, which used to rest the
+    // notification on "Task completed" with no Stop.
+    isScheduledWaiting && !hasActiveSessions -> AgentPhase.WAITING
+    isCompleted -> AgentPhase.COMPLETED
+    toolName != null -> AgentPhase.TOOL
+    !hasActiveSessions -> AgentPhase.IDLE
+    isThinking -> AgentPhase.THINKING
+    else -> AgentPhase.GENERATING
+}
+
+/**
+ * Small icon per phase. Notification small icons must be monochrome alpha
+ * masks — the system tints them — so these are the app's own `ic_tool_*`
+ * vectors (white fill), the same set the overlay capsule draws. The legacy
+ * `android.R.drawable.ic_menu_*` bitmaps used before are anti-aliased grey
+ * artwork that renders as an indistinct blob at status-bar size, which is
+ * what the ColorOS chip in the user's recording showed.
+ */
+@DrawableRes
+internal fun notificationSmallIconFor(phase: AgentPhase, toolName: String?, waitHasClock: Boolean = true): Int = when (phase) {
+    // iOS: calendar clock while counting down, hourglass for an on-completion
+    // wait (no time to count down to).
+    AgentPhase.WAITING -> if (waitHasClock) R.drawable.ic_notification_scheduled else R.drawable.ic_notification_hourglass
+    AgentPhase.COMPLETED -> R.drawable.ic_notification_completed
+    AgentPhase.TOOL -> toolIconResFor(toolName)
+    AgentPhase.THINKING -> R.drawable.ic_tool_psychology
+    AgentPhase.ASKING -> R.drawable.ic_notification_question
+    AgentPhase.GENERATING, AgentPhase.IDLE -> R.drawable.ic_launcher_monochrome
+}
+
+/**
+ * Title for the [AgentPhase.TOOL] row: the model-supplied `tool_title`
+ * ("Open Baidu home page") when there is one, otherwise the per-tool label
+ * the overlay uses ("Execute Shell"). Both are far shorter than the old
+ * "Minis is using Shell" sentence, which matters on OEM chips that fall
+ * back to the content title (see [chipTimerText]).
+ */
+internal fun toolRowTitle(toolName: String, toolTitle: String?): String =
+    toolTitle?.takeIf { it.isNotBlank() } ?: friendlyToolTitleFor(toolName)
+
+/**
+ * The tracker's default status line is the raw `"Running: <tool_name>"`.
+ * Replace that exact default with the friendly tool label; keep any richer
+ * status a tool reported itself (offload handlers write their own).
+ */
+internal fun humanizeToolStatus(status: String, toolName: String?): String {
+    if (toolName == null) return status
+    if (status != "Running: $toolName") return status
+    return friendlyToolTitleFor(toolName)
+}
+
+/**
+ * Compact elapsed text for the status-bar chip: `m:ss`, growing to `h:mm:ss`
+ * past an hour. Kept ≤ 7 characters — the length `setShortCriticalText` is
+ * documented to display without truncation.
+ */
+internal fun chipTimerText(elapsedMs: Long): String {
+    val total = (elapsedMs / 1000).coerceAtLeast(0L)
+    val h = total / 3600
+    val m = (total % 3600) / 60
+    val s = total % 60
+    return if (h > 0) String.format("%d:%02d:%02d", h, m, s) else String.format("%d:%02d", m, s)
+}
+
+/**
+ * [T-port-sched-wait-notification] The WAITING status line, iOS's waiting-card
+ * format: "Next run · 2/30", or just "Next run" for a one-shot.
+ */
+internal fun waitStatusText(nextRunLabel: String, runCounter: String?): String =
+    runCounter?.let { "$nextRunLabel · $it" } ?: nextRunLabel
+
+/** When / chronometer settings of the ongoing notification for one phase. */
+internal data class NotificationClock(
+    val showWhen: Boolean,
+    val whenMs: Long,
+    val usesChronometer: Boolean,
+    val countDown: Boolean,
+)
+
+/**
+ * The notification's clock. Running phases count up from the run's start;
+ * COMPLETED freezes at the finish. [T-port-sched-wait-notification] WAITING
+ * counts DOWN to the next run with the system Chronometer
+ * (setChronometerCountDown), so the countdown costs no per-second notify; with
+ * no time to count down to (an on-completion wait, or a run already due) it
+ * shows no clock rather than a frozen or negative one.
+ */
+internal fun notificationClockFor(
+    phase: AgentPhase,
+    runStartWallMs: Long,
+    finishedWallMs: Long,
+    nextRunWallMs: Long?,
+    nowWallMs: Long,
+    presenceOnly: Boolean = false,
+    askExpiresWallMs: Long? = null,
+): NotificationClock = when {
+    // [T-fgs-presence-no-chip] Nothing has run: there is no task to time, and
+    // a clock counting service uptime reads as an agent at work.
+    presenceOnly ->
+        NotificationClock(showWhen = false, whenMs = nowWallMs, usesChronometer = false, countDown = false)
+    // [T-android-user-ask-chip] Counts down to the question's timeout, like
+    // WAITING counts down to the next run; no clock for a question that waits
+    // indefinitely.
+    phase == AgentPhase.ASKING -> clockForPhase(AgentPhase.WAITING, runStartWallMs, finishedWallMs, askExpiresWallMs, nowWallMs)
+    else -> clockForPhase(phase, runStartWallMs, finishedWallMs, nextRunWallMs, nowWallMs)
+}
+
+/**
+ * [T-android-user-ask-chip] The question the ongoing notification shows while
+ * ASKING: of every pending ask, the one that times out first (an indefinite
+ * one only when none has a deadline).
+ */
+internal data class AskingState(val sessionTitle: String?, val expiresAtMs: Long?)
+
+internal fun askingStateFor(asks: Collection<com.openminis.app.agent.userask.PendingAsk>): AskingState? =
+    asks.filter { it.state == com.openminis.app.agent.userask.UserAskState.PENDING }
+        .minWithOrNull(compareBy(nullsLast()) { it.expiresAtMs })
+        ?.let { AskingState(it.sessionTitle?.takeIf { t -> t.isNotBlank() }, it.expiresAtMs) }
+
+/**
+ * [T-android-user-ask-chip] The chip's short text while ASKING: the time left
+ * as m:ss (ticked once a second like a running clock) under an hour, whole
+ * minutes beyond ("2h0m", within the chip's 7 characters), or "?" for a
+ * question with no deadline.
+ */
+internal fun askChipText(remainingMs: Long?): String = when {
+    remainingMs == null -> "?"
+    remainingMs >= 3_600_000L -> waitChipText(remainingMs) ?: "?"
+    else -> chipTimerText(remainingMs.coerceAtLeast(0))
+}
+
+/**
+ * [T-fgs-presence-no-chip] The service is kept only because the user is in a
+ * chat (T166 keep-alive): nothing running, no scheduled task holding a chat,
+ * no finished run to show. The ongoing notification is then a plain
+ * low-priority row - not promoted to the status-bar chip, no clock, no
+ * per-second refresh. Every other phase keeps the chip.
+ */
+internal fun isPresenceOnly(phase: AgentPhase, hasScheduledHold: Boolean): Boolean =
+    phase == AgentPhase.IDLE && !hasScheduledHold
+
+private fun clockForPhase(
+    phase: AgentPhase,
+    runStartWallMs: Long,
+    finishedWallMs: Long,
+    nextRunWallMs: Long?,
+    nowWallMs: Long,
+): NotificationClock = when (phase) {
+    AgentPhase.WAITING ->
+        if (nextRunWallMs != null && nextRunWallMs > nowWallMs) {
+            NotificationClock(showWhen = true, whenMs = nextRunWallMs, usesChronometer = true, countDown = true)
+        } else {
+            NotificationClock(showWhen = false, whenMs = nowWallMs, usesChronometer = false, countDown = false)
+        }
+    AgentPhase.COMPLETED ->
+        NotificationClock(showWhen = true, whenMs = finishedWallMs, usesChronometer = false, countDown = false)
+    else -> NotificationClock(showWhen = true, whenMs = runStartWallMs, usesChronometer = true, countDown = false)
+}
+
+/**
+ * [T-port-sched-wait-notification] The Android 16 chip's short text while
+ * WAITING: whole minutes, rounded up so it never reads 0 while the run is
+ * still ahead - "12m", "1h5m", "2d3h" (at most 6 chars). Minutes, not
+ * seconds, so the chip needs one re-post a minute instead of one a second
+ * during a wait that can last hours. null when there is nothing to count down
+ * to.
+ */
+internal fun waitChipText(remainingMs: Long?): String? {
+    if (remainingMs == null || remainingMs <= 0) return null
+    val minutes = (remainingMs + 59_999) / 60_000
+    return when {
+        minutes < 60 -> "${minutes}m"
+        minutes < 24 * 60 -> "${minutes / 60}h${minutes % 60}m"
+        else -> "${minutes / (24 * 60)}d${(minutes % (24 * 60)) / 60}h"
+    }
+}
+
+/**
+ * [T-port-sched-wait-notification] How long until the WAITING notification
+ * must be re-posted, or null for never (no clock, or already due):
+ * - with the Android 16 chip, at the next whole-minute change of
+ *   [waitChipText];
+ * - otherwise once, just after the countdown ends, so the row drops its
+ *   chronometer instead of counting into negative time if the run is late.
+ */
+internal fun waitRefreshDelayMs(remainingMs: Long?, promotedChip: Boolean): Long? {
+    if (remainingMs == null || remainingMs <= 0) return null
+    if (!promotedChip) return remainingMs + WAIT_REFRESH_MARGIN_MS
+    val toBoundary = remainingMs % 60_000
+    return (if (toBoundary == 0L) 60_000 else toBoundary) + WAIT_REFRESH_MARGIN_MS
+}
+
+private const val WAIT_REFRESH_MARGIN_MS = 250L
+
+/**
+ * [T-port-sched-running-counter] A running phase's status with the scheduled
+ * fire's run counter, iOS "Working… · 2/30": "Running shell · 2/30". Plain
+ * status without a counter.
+ */
+internal fun withRunCounter(status: String, runCounter: String?): String =
+    runCounter?.let { "$status · $it" } ?: status
+
+/**
+ * [T-port-sched-overlay-waiting] The wait the floating capsule shows instead of
+ * "completed" between two scheduled fires: [wait] when it belongs to the chat
+ * the capsule is bound to (or the capsule is bound to none), else null.
+ */
+internal fun overlayWaitFor(
+    wait: com.openminis.app.scheduled.ScheduledWait?,
+    capsuleSessionId: String?,
+): com.openminis.app.scheduled.ScheduledWait? =
+    wait?.takeIf { capsuleSessionId == null || it.sessionId == capsuleSessionId }
+
+/**
+ * [T-port-sched-overlay-waiting] A wall-clock instant on the elapsedRealtime
+ * clock, which is what the capsule's Chronometer counts in.
+ */
+internal fun wallClockToElapsedRealtime(wallMs: Long, nowWallMs: Long, nowElapsedMs: Long): Long =
+    nowElapsedMs + (wallMs - nowWallMs)
+
+/**
+ * [T-port-sched-completed-copy] The COMPLETED line. After the last run of a
+ * schedule (or any run whose capsule keeps the service for its completion
+ * linger) no session is active, present or scheduled any more, so the count
+ * is 0 and the line read "0 个会话 | 用时 0:01". With no session to count,
+ * the line is the duration alone ("用时 0:01" / "Completed in 0:01").
+ */
+@androidx.annotation.StringRes
+internal fun completedTextResFor(sessionCount: Int): Int =
+    if (sessionCount > 0) R.string.bg_service_notification_text_completed
+    else R.string.bg_service_notification_text_completed_no_count
