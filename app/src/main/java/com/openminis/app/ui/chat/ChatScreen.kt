@@ -2748,26 +2748,28 @@ fun ChatScreen(
     var htmlPreviewHolder by remember {
         mutableStateOf<com.openminis.app.ui.preview.WebViewHolder?>(null)
     }
+    var htmlPreviewVisible by remember { mutableStateOf(false) }
     var htmlPreviewFallbackTitle by remember { mutableStateOf("") }
     var htmlPreviewFullscreen by remember { mutableStateOf(false) }
     val appCtx = context.applicationContext
-    val openHtmlPreview = remember<(java.io.File, String) -> Unit>(appCtx) {
-        { file, title ->
-            // Reuse the same WebViewHolder as long as the file path doesn't
-            // change. Tapping the same html link twice should pick up wherever
-            // the user left off rather than reloading from scratch.
-            val url = "file://${file.absolutePath}"
+    val openLiveWebPreview = remember<(String, String, Boolean) -> Unit>(appCtx) {
+        { rawUrl, title, startFullscreen ->
+            val url = com.openminis.app.sandbox.SandboxServerManager.normalizeLocalUrl(rawUrl)
             val existing = htmlPreviewHolder
-            // [T-android-webview-render-process-gone] (GH#341) `isDead` joins
-            // the URL check: a holder whose renderer died has already been
-            // destroyed and cannot be revived, so reusing it would show a
-            // permanently blank preview.
             if (existing == null || existing.currentUrl != url || existing.isDead) {
                 existing?.destroy()
                 htmlPreviewHolder = com.openminis.app.ui.preview.WebViewHolder(appCtx, url)
             }
-            htmlPreviewFallbackTitle = title
-            htmlPreviewFullscreen = false
+            if (title.isNotBlank()) {
+                htmlPreviewFallbackTitle = title
+            }
+            htmlPreviewFullscreen = startFullscreen
+            htmlPreviewVisible = true
+        }
+    }
+    val openHtmlPreview = remember<(java.io.File, String) -> Unit>(appCtx) {
+        { file, title ->
+            openLiveWebPreview("file://${file.absolutePath}", title, false)
         }
     }
     // Pinned-shortcut deep link: minis://session/<id>/<resource-path>
@@ -2794,6 +2796,7 @@ fun ChatScreen(
         htmlPreviewHolder = com.openminis.app.ui.preview.WebViewHolder(appCtx, url)
         htmlPreviewFallbackTitle = pending.title
         htmlPreviewFullscreen = true
+        htmlPreviewVisible = true
     }
     // T-imgswipe-4f446d83: replace previous single-image preview state with a
     // gallery (list + start index) so callers can pass sibling images (input
@@ -2863,29 +2866,39 @@ fun ChatScreen(
                             com.openminis.app.ui.browser.BrowserExternalSchemeHandler
                                 .Origin.USER_INITIATED,
                         )
-                is ChatLinkAction.Web -> previewUrl = action.url
+                is ChatLinkAction.Web -> {
+                    if (com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(action.url)) {
+                        val srv = com.openminis.app.sandbox.SandboxServerManager.getServerForUrl(action.url)
+                        openLiveWebPreview(action.url, srv?.title.orEmpty(), false)
+                    } else {
+                        previewUrl = action.url
+                    }
+                }
             }
         }
     }
 
     // Auto-present the in-app preview when a shell tool's stdout emits an
-    // OSC MinisOpenURL marker (via /usr/local/bin/minis-open). The broker is
-    // populated by ChatViewModel's shell lineCallback; forwarding the URL
-    // into `urlClickHandler` routes it exactly like a chat-link tap —
-    // http(s)/about → UrlPreviewSheet, minis:// deep links → DeepLinkHandler,
-    // minis://<host>/<path> → in-app file preview by extension.
+    // OSC MinisOpenURL marker (via /usr/local/bin/minis-open) or when a live
+    // sandbox server starts on 127.0.0.1:<port>.
     val pendingMinisOpenUrl by com.openminis.app.terminal.MinisOpenUrlBroker.pendingUrl
         .collectAsState()
     val minisOpenTerminalVisible by com.openminis.app.terminal.MinisOpenUrlBroker.terminalVisible
         .collectAsState()
     LaunchedEffect(pendingMinisOpenUrl, minisOpenTerminalVisible) {
         val url = pendingMinisOpenUrl ?: return@LaunchedEffect
-        // The fullscreen TerminalScreen owns the broker while it's up —
-        // let it present its own web preview (mirrors iOS ISHTerminalView)
-        // so we don't try to open a sheet on a covered ChatScreen.
         if (minisOpenTerminalVisible) return@LaunchedEffect
         urlClickHandler(url.toString())
         com.openminis.app.terminal.MinisOpenUrlBroker.consume()
+    }
+
+    val pendingAutoOpenServer by com.openminis.app.sandbox.SandboxServerManager.pendingAutoOpenServer
+        .collectAsState()
+    LaunchedEffect(pendingAutoOpenServer, minisOpenTerminalVisible) {
+        val srv = pendingAutoOpenServer ?: return@LaunchedEffect
+        if (minisOpenTerminalVisible) return@LaunchedEffect
+        openLiveWebPreview(srv.url, srv.title, false)
+        com.openminis.app.sandbox.SandboxServerManager.consumeAutoOpenServer()
     }
 
     // [T-android-markdown-image-gallery-cross-message] Collect every
@@ -5460,49 +5473,46 @@ fun ChatScreen(
                     }.collect { lastToolBlocks = it }
                 }
                 val allToolBlocks = lastToolBlocks
-                // [T-p2-agent-series] The agent block is just another entry of
-                // the floating tool bar (its background block stays RUNNING);
-                // the standalone capsule is gone.
-                if (lastToolBlocks.isNotEmpty()) {
+                val allSandboxServers by com.openminis.app.sandbox.SandboxServerManager.servers.collectAsState()
+                val sessionSandboxServers = remember(allSandboxServers, sessionId) {
+                    allSandboxServers.filter { it.sessionId.isEmpty() || it.sessionId == sessionId }
+                }
+                if (lastToolBlocks.isNotEmpty() || sessionSandboxServers.isNotEmpty()) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
-                            // [T-android-chat-max-content-width] The tool status
-                            // bar is part of the conversation column, so it
-                            // takes the same cap as the message list and the
-                            // composer. Without it the bar alone spanned the
-                            // full pane while everything above and below it was
-                            // capped, so on a tablet it visibly overhung both.
-                            //
-                            // ORDER MATTERS: widthIn must come BEFORE
-                            // fillMaxWidth. fillMaxWidth pins the incoming
-                            // MIN width to the full pane as well as the max, so
-                            // a widthIn placed after it is raised back up by
-                            // that min and does nothing — which is exactly how
-                            // the first attempt at this failed. Declared first,
-                            // widthIn narrows the constraint and fillMaxWidth
-                            // then fills the already-narrowed one.
-                            //
-                            // BottomCenter on the parent centres the result, so
-                            // no extra alignment is needed.
                             .widthIn(max = CHAT_MAX_CONTENT_WIDTH)
                             .fillMaxWidth()
                             .onGloballyPositioned { toolBarHeightPx = it.size.height }
                             .padding(horizontal = 12.dp)
                             .padding(bottom = FloatingToolBarMetrics.WRAPPER_BOTTOM_PADDING),
                     ) {
-                        Column {
-                        FloatingToolStatusBar(
-                            toolBlocks = lastToolBlocks,
-                            // [T-android-stop-late-write] Same per-tool stop
-                            // as the message-list pill, for the shown block.
-                            onStop = { blockId -> viewModel.stopTool(blockId) },
-                            onOpenTerminalWithCommand = onOpenTerminalWithCommand,
-                            // T261: route detail open through the same VM
-                            // state as in-list pills so both surfaces share
-                            // one always-mounted sheet instance.
-                            onOpenDetail = { viewModel.openToolDetail(it) },
-                        )
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (sessionSandboxServers.isNotEmpty()) {
+                                com.openminis.app.ui.preview.LiveSandboxServerBar(
+                                    servers = sessionSandboxServers,
+                                    onOpenCanvas = { srv, fullscreen ->
+                                        openLiveWebPreview(srv.url, srv.title, fullscreen)
+                                    },
+                                    onStopServer = { port ->
+                                        val target = sessionSandboxServers.firstOrNull { it.port == port }
+                                        val removeNow = target?.status == com.openminis.app.sandbox.SandboxServerStatus.STOPPED
+                                        com.openminis.app.sandbox.SandboxServerManager.stopServer(
+                                            context = context,
+                                            port = port,
+                                            removeFromList = removeNow,
+                                        )
+                                    },
+                                )
+                            }
+                            if (lastToolBlocks.isNotEmpty()) {
+                                FloatingToolStatusBar(
+                                    toolBlocks = lastToolBlocks,
+                                    onStop = { blockId -> viewModel.stopTool(blockId) },
+                                    onOpenTerminalWithCommand = onOpenTerminalWithCommand,
+                                    onOpenDetail = { viewModel.openToolDetail(it) },
+                                )
+                            }
                         }
                     }
                 } else {
@@ -8438,37 +8448,52 @@ fun ChatScreen(
         )
     }
 
-    // T146: immersive HTML preview — bottom sheet (90% height) by default,
-    // with a Fullscreen button that swaps to a Dialog-based fullscreen
+    // T146: immersive HTML & Live Sandbox Server preview — bottom sheet (90% height)
+    // by default, with a Fullscreen button that swaps to a Dialog-based fullscreen
     // surface using the SAME WebViewHolder so the page never reloads.
-    htmlPreviewHolder?.let { holder ->
-        val onFullDismiss = {
-            holder.destroy()
-            htmlPreviewHolder = null
-            htmlPreviewFallbackTitle = ""
-            htmlPreviewFullscreen = false
-        }
-        if (htmlPreviewFullscreen) {
-            com.openminis.app.ui.preview.WebPreviewFullscreenScreen(
-                holder = holder,
-                fallbackTitle = htmlPreviewFallbackTitle,
-                onCollapseToSheet = {
+    // For live sandbox servers (127.0.0.1:<port>), dismissing the sheet hides it
+    // while keeping the WebViewHolder alive so re-opening from LiveSandboxServerBar
+    // preserves all in-page interactive state (SQL queries, filters, scroll position).
+    if (htmlPreviewVisible) {
+        htmlPreviewHolder?.let { holder ->
+            val onFullDismiss = {
+                val isLiveLocal = com.openminis.app.sandbox.SandboxServerManager
+                    .getServerForUrl(holder.currentUrl)
+                    ?.status == com.openminis.app.sandbox.SandboxServerStatus.LIVE
+                if (isLiveLocal) {
                     holder.detach()
+                    htmlPreviewVisible = false
                     htmlPreviewFullscreen = false
-                },
-                onDismiss = onFullDismiss,
-            )
-        } else {
-            com.openminis.app.ui.preview.WebPreviewBottomSheet(
-                holder = holder,
-                fallbackTitle = htmlPreviewFallbackTitle,
-                pinSessionId = sessionId,
-                onExpandFullscreen = {
-                    holder.detach()
-                    htmlPreviewFullscreen = true
-                },
-                onDismiss = onFullDismiss,
-            )
+                } else {
+                    holder.destroy()
+                    htmlPreviewHolder = null
+                    htmlPreviewFallbackTitle = ""
+                    htmlPreviewFullscreen = false
+                    htmlPreviewVisible = false
+                }
+            }
+            if (htmlPreviewFullscreen) {
+                com.openminis.app.ui.preview.WebPreviewFullscreenScreen(
+                    holder = holder,
+                    fallbackTitle = htmlPreviewFallbackTitle,
+                    onCollapseToSheet = {
+                        holder.detach()
+                        htmlPreviewFullscreen = false
+                    },
+                    onDismiss = onFullDismiss,
+                )
+            } else {
+                com.openminis.app.ui.preview.WebPreviewBottomSheet(
+                    holder = holder,
+                    fallbackTitle = htmlPreviewFallbackTitle,
+                    pinSessionId = sessionId,
+                    onExpandFullscreen = {
+                        holder.detach()
+                        htmlPreviewFullscreen = true
+                    },
+                    onDismiss = onFullDismiss,
+                )
+            }
         }
     }
 

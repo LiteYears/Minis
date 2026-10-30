@@ -261,16 +261,27 @@ object DeepLinkHandler {
                 else DeepLinkAction.OpenSettingsScreen(Routes.MODEL_GROUPS)
             "usage", "usage-stats", "usage_stats" ->
                 DeepLinkAction.OpenSettingsScreen(Routes.USAGE_STATS)
-            "skills" -> DeepLinkAction.OpenSettingsScreen(Routes.SKILLS)
+            "skills" ->
+                if (arg != null) DeepLinkAction.OpenSettingsScreen(Routes.skillDetail(arg))
+                else DeepLinkAction.OpenSettingsScreen(Routes.SKILLS)
             "memory" -> DeepLinkAction.OpenSettingsScreen(Routes.MEMORY)
-            // [T-p2-agent-settings] Settings › Agents; scheduled tasks list.
+            "mcp" -> DeepLinkAction.OpenSettingsScreen(Routes.MCP)
+            "soul" -> DeepLinkAction.OpenSettingsScreen(Routes.SOUL)
+            "backup", "backups", "backup-restore", "backup_restore" ->
+                DeepLinkAction.OpenSettingsScreen(Routes.BACKUP)
+            // [T-p2-agent-settings] Settings › Agents; scheduled tasks list; tools; sub-agents.
             "agents" -> DeepLinkAction.OpenSettingsScreen(Routes.AGENTS)
+            "sub-agents", "sub_agents", "subagents" -> DeepLinkAction.OpenSettingsScreen(Routes.SUB_AGENTS)
+            "tools", "agent-tools", "agent_tools" -> DeepLinkAction.OpenSettingsScreen(Routes.AGENT_TOOLS)
             "scheduled", "scheduled-tasks", "scheduled_tasks" -> DeepLinkAction.OpenSettingsScreen(Routes.SCHEDULED_TASKS)
             "storage" -> DeepLinkAction.OpenSettingsScreen(Routes.STORAGE)
             "mount-external", "mount_external", "mounts", "mounted-folders", "mounted_folders" ->
                 DeepLinkAction.OpenSettingsScreen(Routes.MOUNTED_FOLDERS)
             "shared-folders", "shared_folders" ->
                 DeepLinkAction.OpenSettingsScreen(Routes.SHARED_FOLDERS)
+            "shizuku" -> DeepLinkAction.OpenSettingsScreen(Routes.SHIZUKU)
+            "system-permissions", "system_permissions" ->
+                DeepLinkAction.OpenSettingsScreen(Routes.SYSTEM_PERMISSIONS)
             "logs" -> {
                 // Optional ?tab=… selects the segmented control on the
                 // Logs screen. Currently recognized: "logs" (default),

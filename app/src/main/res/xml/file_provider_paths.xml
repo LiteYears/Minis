@@ -15,6 +15,8 @@
          FileProvider.getUriForFile threw IllegalArgumentException and the
          user saw "分享失败" toasts instead of the share sheet. -->
     <cache-path name="share" path="share/" />
+    <!-- LargeContentGuard exported full-text messages (${context.cacheDir}/large-messages/). -->
+    <cache-path name="large-messages" path="large-messages/" />
     <!-- PRoot rootfs — expose so inline video/audio cards can hand the host
          file to the system player via ACTION_VIEW. -->
     <files-path name="rootfs" path="alpine-rootfs/" />

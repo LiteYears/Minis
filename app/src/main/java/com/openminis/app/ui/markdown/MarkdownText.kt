@@ -757,10 +757,22 @@ private fun resolveMediaFile(url: String): File? {
     val stripped = url.substringBefore('?')
     val hostFile: File? = when {
         stripped.startsWith("minis://") -> {
-            val decoded = java.net.URLDecoder.decode(stripped.removePrefix("minis://"), "UTF-8")
-            PRootKernel.resolveHostPath("/var/minis/$decoded")
+            val candidates = com.openminis.app.ui.chat.ChatLinkResolver.minisPathCandidates(stripped.removePrefix("minis://"))
+            candidates.asSequence()
+                .map { decoded ->
+                    val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"
+                    PRootKernel.resolveHostPath(linuxPath)
+                }
+                .firstOrNull { it != null && it.exists() && it.isFile }
+                ?: PRootKernel.resolveHostPath("/var/minis/${candidates.first()}")
         }
-        stripped.startsWith("file://") -> File(Uri.parse(stripped).path ?: return null)
+        stripped.startsWith("file://") -> {
+            val rawPath = stripped.removePrefix("file://")
+            if (rawPath.isEmpty()) null else {
+                val candidates = com.openminis.app.ui.chat.ChatLinkResolver.minisPathCandidates(rawPath).map { File(it) }
+                candidates.firstOrNull { it.exists() && it.isFile } ?: candidates.first()
+            }
+        }
         stripped.startsWith("/") -> File(stripped)
         else -> null
     }
@@ -772,9 +784,7 @@ private fun resolveMediaFile(url: String): File? {
 private fun filenameFromUrl(url: String): String {
     val stripped = url.substringBefore('?')
     val last = stripped.substringAfterLast('/')
-    return try {
-        java.net.URLDecoder.decode(last, "UTF-8")
-    } catch (_: Throwable) { last }
+    return com.openminis.app.ui.chat.ChatLinkResolver.minisPathCandidates(last).last()
 }
 
 /**

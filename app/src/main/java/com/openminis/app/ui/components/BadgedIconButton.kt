@@ -1233,15 +1233,33 @@ object SpeedTierIcons {
 fun UrlPreviewSheet(
     url: String,
     onDismiss: () -> Unit,
+    initialFullscreen: Boolean = false,
 ) {
     val holder = rememberWebViewHolder(url)
-    WebPreviewBottomSheet(
-        holder = holder,
-        onDismiss = {
-            holder.destroy()
-            onDismiss()
-        },
-    )
+    var isFullscreen by remember(url) { mutableStateOf(initialFullscreen) }
+    val onFullDismiss = {
+        holder.destroy()
+        onDismiss()
+    }
+    if (isFullscreen) {
+        com.openminis.app.ui.preview.WebPreviewFullscreenScreen(
+            holder = holder,
+            onCollapseToSheet = {
+                holder.detach()
+                isFullscreen = false
+            },
+            onDismiss = onFullDismiss,
+        )
+    } else {
+        WebPreviewBottomSheet(
+            holder = holder,
+            onExpandFullscreen = {
+                holder.detach()
+                isFullscreen = true
+            },
+            onDismiss = onFullDismiss,
+        )
+    }
 }
 
 // ─── Merged from MinisButton.kt ──────────────────────────────────────────────────

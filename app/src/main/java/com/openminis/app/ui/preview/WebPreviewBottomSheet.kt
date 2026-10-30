@@ -199,16 +199,24 @@ fun WebPreviewBottomSheet(
                 .fillMaxWidth()
                 .fillMaxHeight(1f),
         ) {
+            val isLocalSandbox = com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(holder.currentUrl)
+            val localSandboxPort = com.openminis.app.sandbox.SandboxServerManager.extractPort(holder.currentUrl)
+            val sandboxSrv = localSandboxPort?.let { com.openminis.app.sandbox.SandboxServerManager.getServerByPort(it) }
             val displayTitle = holder.pageTitle.ifBlank {
                 fallbackTitle.ifBlank {
-                    runCatching { Uri.parse(holder.currentUrl).host }.getOrNull()
+                    sandboxSrv?.title?.ifBlank { null }
+                        ?: runCatching { Uri.parse(holder.currentUrl).host }.getOrNull()
                         ?: holder.currentUrl
                 }
             }
-            val displayHost = runCatching { Uri.parse(holder.currentUrl).host }
-                .getOrNull()
-                ?.removePrefix("www.")
-                ?: holder.currentUrl
+            val displayHost = if (isLocalSandbox && localSandboxPort != null) {
+                "127.0.0.1:$localSandboxPort"
+            } else {
+                runCatching { Uri.parse(holder.currentUrl).host }
+                    .getOrNull()
+                    ?.removePrefix("www.")
+                    ?: holder.currentUrl
+            }
             WebPreviewToolbar(
                 topInsetPadding = true,
                 title = displayTitle,
@@ -222,10 +230,6 @@ fun WebPreviewBottomSheet(
                     openExternalFromSheet(context, holder.currentUrl)
                 },
                 onToggleDesktop = { holder.toggleDesktopMode() },
-                // TODO(webapp-hidden): WebApp "Pin to Home Screen" entry
-                // temporarily hidden — feature not yet validated/complete.
-                // Re-enable by removing the `@Suppress` block and restoring
-                // the original `if (pinSessionId != null && …)` guard.
                 onPinToHome = if (pinSessionId != null && holder.currentUrl.startsWith("file://") && WEBAPP_PIN_ENTRY_ENABLED) {
                     {
                         com.openminis.app.ui.preview.WebPreviewShortcut.pin(
@@ -245,22 +249,18 @@ fun WebPreviewBottomSheet(
                     }
                 },
             )
+            if (isLocalSandbox && localSandboxPort != null) {
+                SandboxCanvasSubbar(
+                    holder = holder,
+                    port = localSandboxPort,
+                )
+            }
             if (holder.isLoading) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp))
             }
             Box(modifier = Modifier.fillMaxSize()) {
                 AndroidView(
                     factory = {
-                        // Issue #24: ModalBottomSheet's nested-scroll grabbed
-                        // every vertical drag on the hosted WebView, so the
-                        // user could never scroll the HTML report inside the
-                        // sheet (drag would either do nothing or try to drag
-                        // the sheet itself). AndroidView-hosted WebView does
-                        // not participate in Compose nested scroll, so the
-                        // sheet's drag handler wins by default. Mirror the
-                        // BrowserWebView fix: as soon as a finger touches the
-                        // WebView, ask every ancestor (the sheet included)
-                        // to stop intercepting; release on UP/CANCEL.
                         holder.webView.setOnTouchListener { v, event ->
                             when (event.actionMasked) {
                                 MotionEvent.ACTION_DOWN,
@@ -277,6 +277,9 @@ fun WebPreviewBottomSheet(
                     },
                     modifier = Modifier.fillMaxSize(),
                 )
+                if (holder.isWarmingUpLocalServer && localSandboxPort != null) {
+                    SandboxWarmingUpOverlay(hostPort = "127.0.0.1:$localSandboxPort")
+                }
             }
         }
     }
@@ -346,6 +349,19 @@ internal fun WebPreviewToolbar(
                 icon = Icons.Default.Stop,
                 description = stringResource(R.string.webpreview_stop),
                 onClick = onStop,
+            )
+        } else {
+            ToolbarIcon(
+                icon = Icons.Default.Refresh,
+                description = stringResource(R.string.webpreview_reload),
+                onClick = onReload,
+            )
+        }
+        if (onExpand != null) {
+            ToolbarIcon(
+                icon = Icons.Default.Fullscreen,
+                description = stringResource(R.string.webpreview_open_fullscreen),
+                onClick = onExpand,
             )
         }
         Box {
@@ -472,9 +488,10 @@ internal fun openExternalFromSheet(context: android.content.Context, url: String
     AppLogger.info("WebPreviewSheet", "open external: $url")
     val intent = if (url.startsWith("file://")) {
         runCatching {
-            val raw = Uri.parse(url).path ?: return@runCatching null
-            val file = java.io.File(java.net.URLDecoder.decode(raw, "UTF-8"))
-            if (!file.exists()) return@runCatching null
+            val rawPath = url.removePrefix("file://").substringBefore('?')
+            if (rawPath.isEmpty()) return@runCatching null
+            val candidates = com.openminis.app.ui.chat.ChatLinkResolver.minisPathCandidates(rawPath).map { java.io.File(it) }
+            val file = candidates.firstOrNull { it.exists() } ?: return@runCatching null
             val authority = context.packageName + ".fileprovider"
             val contentUri = androidx.core.content.FileProvider.getUriForFile(
                 context, authority, file,

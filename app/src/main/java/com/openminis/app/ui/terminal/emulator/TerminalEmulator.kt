@@ -386,10 +386,15 @@ class TerminalEmulator(cols: Int = 80, rows: Int = 24) {
 
     private fun handleITermOsc(payload: String) {
         val eq = payload.indexOf('=')
-        if (eq <= 0 || payload.substring(0, eq) != "MinisOpenURL") return
-        val urlString = payload.substring(eq + 1)
-        if (urlString.isEmpty()) return
-        com.openminis.app.terminal.MinisOpenUrlBroker.offer(urlString)
+        if (eq <= 0) return
+        val key = payload.substring(0, eq)
+        val value = payload.substring(eq + 1)
+        if (value.isEmpty()) return
+        when (key) {
+            "MinisOpenURL" -> com.openminis.app.terminal.MinisOpenUrlBroker.offer(value)
+            "MinisSandboxServer" -> com.openminis.app.sandbox.SandboxServerManager
+                .extractAndProcessMarkers("\u001B]1337;$payload\u0007", "")
+        }
     }
 
     private fun switchBuffer(toAlternate: Boolean) {

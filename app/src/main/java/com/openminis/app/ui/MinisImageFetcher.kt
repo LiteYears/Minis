@@ -182,33 +182,38 @@ class MinisImageFetcher(
             resolve(context.filesDir, uri, sessionId)
 
         internal fun resolve(filesDir: java.io.File, uri: String, sessionId: String?): java.io.File? {
-            // Strip minis:// and any ?query, then percent-decode so
-            // Chinese/emoji/space filenames resolve to the actual file.
+            // Strip minis:// and any ?query, then percent-decode via
+            // minisPathCandidates so Chinese/emoji/space/'+' filenames and
+            // double-encoded URLs resolve to the actual file.
             val stripped = uri.removePrefix("minis://").substringBefore('?')
-            val decoded = try {
-                java.net.URLDecoder.decode(stripped, "UTF-8")
-            } catch (_: Throwable) {
-                stripped
-            }
-            if (decoded.split('/').any { it == ".." }) return null
-            val linuxPath = "/var/minis/$decoded"
-            val sub = decoded.substringBefore('/')
-            val rest = decoded.substringAfter('/', "")
+            val candidates = com.openminis.app.ui.chat.ChatLinkResolver.minisPathCandidates(stripped)
+            var fallbackResult: java.io.File? = null
+            for (decoded in candidates) {
+                if (decoded.split('/').any { it == ".." }) continue
+                val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"
+                val rel = linuxPath.removePrefix("/var/minis/")
+                val sub = rel.substringBefore('/')
+                val rest = rel.substringAfter('/', "")
 
-            if (PRootKernel.isPerSessionPath(linuxPath)) {
-                if (sessionId != null) {
-                    val direct = SessionMounts.sessionDir(filesDir, sessionId, sub)
-                        .let { if (rest.isEmpty()) it else java.io.File(it, rest) }
-                    if (direct.isFile) return direct
+                val resolved: java.io.File? = if (PRootKernel.isPerSessionPath(linuxPath)) {
+                    val direct = if (sessionId != null) {
+                        SessionMounts.sessionDir(filesDir, sessionId, sub)
+                            .let { if (rest.isEmpty()) it else java.io.File(it, rest) }
+                            .takeIf { it.isFile }
+                    } else null
+                    direct
+                        ?: PRootKernel.resolveHostPath(linuxPath)?.takeIf { it.isFile }
+                        ?: searchSessions(filesDir, sub, rest, exclude = sessionId)
+                } else if (sub in SessionMounts.GLOBAL_SUBDIRS) {
+                    java.io.File(filesDir, "minis-global/$rel").takeIf { it.isFile }
+                        ?: PRootKernel.resolveHostPath(linuxPath)
+                } else {
+                    PRootKernel.resolveHostPath(linuxPath)
                 }
-                PRootKernel.resolveHostPath(linuxPath)?.takeIf { it.isFile }?.let { return it }
-                return searchSessions(filesDir, sub, rest, exclude = sessionId)
+                if (resolved != null && resolved.isFile) return resolved
+                if (fallbackResult == null) fallbackResult = resolved
             }
-            if (sub in SessionMounts.GLOBAL_SUBDIRS) {
-                val f = java.io.File(filesDir, "minis-global/$decoded")
-                if (f.isFile) return f
-            }
-            return PRootKernel.resolveHostPath(linuxPath)
+            return fallbackResult
         }
 
         /** Newest `minis-sessions/<any>/<sub>/<rest>`; last resort for orphan links. */

@@ -476,6 +476,22 @@
     <string name="webpreview_pin_to_home">Add to Home screen</string>
     <string name="webpreview_pin_to_home_requested">Shortcut requested — confirm on your launcher</string>
     <string name="webpreview_pin_to_home_unsupported">Your launcher doesn\'t support pinned shortcuts</string>
+    <string name="sandbox_canvas_badge_live">LIVE</string>
+    <string name="sandbox_canvas_badge_starting">STARTING</string>
+    <string name="sandbox_canvas_badge_stopped">STOPPED</string>
+    <string name="sandbox_canvas_open">Open Canvas</string>
+    <string name="sandbox_canvas_logs">Logs</string>
+    <string name="sandbox_canvas_restart">Restart</string>
+    <string name="sandbox_canvas_stop">Stop</string>
+    <string name="sandbox_canvas_dismiss">Dismiss</string>
+    <string name="sandbox_canvas_server_logs_tab">Server Logs</string>
+    <string name="sandbox_canvas_js_console_tab">JS Console (%1$d)</string>
+    <string name="sandbox_canvas_no_server_logs">No server log output yet.</string>
+    <string name="sandbox_canvas_no_console_logs">No JavaScript console messages.</string>
+    <string name="sandbox_canvas_clear_console">Clear</string>
+    <string name="sandbox_canvas_refresh_logs">Refresh logs</string>
+    <string name="sandbox_canvas_warming_up_title">Starting live sandbox server…</string>
+    <string name="sandbox_canvas_warming_up_subtitle">Connecting to %1$s inside Alpine Linux</string>
 
     <!-- T-browser-use-per-tab-serial-android: returned to the model when a
          browser_use call can't acquire the per-tab serial lock within the wait

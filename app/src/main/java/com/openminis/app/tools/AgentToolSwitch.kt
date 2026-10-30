@@ -946,15 +946,26 @@ object ReadImageTool {
                 return ToolExecutionResult("Error: 'path' is required", false, toolTitle = toolTitle)
             }
 
-            val path = if (rawPath.startsWith("minis://")) {
-                "/var/minis/" + java.net.URLDecoder.decode(rawPath.removePrefix("minis://"), "UTF-8")
-            } else rawPath
+            val pathCandidates = if (rawPath.startsWith("minis://")) {
+                com.openminis.app.ui.chat.ChatLinkResolver
+                    .minisPathCandidates(rawPath.removePrefix("minis://").substringBefore('?'))
+                    .map { if (it.startsWith("/")) it else "/var/minis/$it" }
+            } else {
+                listOf(rawPath)
+            }
 
-            val file = (
-                if (sessionId != null && context != null) {
-                    PRootKernel.resolveSessionHostPath(sessionId, path, context)
-                } else null
-            ) ?: PRootKernel.resolveHostPath(path)
+            fun resolveCandidate(p: String): java.io.File? =
+                (if (sessionId != null && context != null) {
+                    PRootKernel.resolveSessionHostPath(sessionId, p, context)
+                } else null) ?: PRootKernel.resolveHostPath(p)
+
+            val matchedPair = pathCandidates.asSequence()
+                .map { p -> p to resolveCandidate(p) }
+                .firstOrNull { (_, f) -> f != null && f.exists() && !f.isDirectory }
+                ?: (pathCandidates.first() to resolveCandidate(pathCandidates.first()))
+
+            val path = matchedPair.first
+            val file = matchedPair.second
                 ?: return ToolExecutionResult(failureText(path, resolved = false, file = null), false, toolTitle = toolTitle)
 
             if (!file.exists() || file.isDirectory) {

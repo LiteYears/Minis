@@ -481,6 +481,59 @@
                     android:port="3002"
                     android:path="/callback" />
             </intent-filter>
+            <!-- xAI: http://127.0.0.1:56121/callback and http://localhost:56121/callback -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="http"
+                    android:host="127.0.0.1"
+                    android:port="56121"
+                    android:path="/callback" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="http"
+                    android:host="localhost"
+                    android:port="56121"
+                    android:path="/callback" />
+            </intent-filter>
+            <!-- MCP OAuth: http://localhost:54546/callback and http://127.0.0.1:54546/callback -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="http"
+                    android:host="localhost"
+                    android:port="54546"
+                    android:path="/callback" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="http"
+                    android:host="127.0.0.1"
+                    android:port="54546"
+                    android:path="/callback" />
+            </intent-filter>
+            <!-- Antigravity: http://localhost:8086/oauth2callback -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="http"
+                    android:host="localhost"
+                    android:port="8086"
+                    android:path="/oauth2callback" />
+            </intent-filter>
         </activity>
 
         <!-- Agent foreground service -->
@@ -609,6 +662,18 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/minis_accessibility_service" />
         </service>
+
+        <!-- SAF DocumentsProvider exposing minis-global/{memory,skills,shared} to the Files app -->
+        <provider
+            android:name=".providers.MinisDocumentsProvider"
+            android:authorities="com.openminis.minis.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
 
     </application>
 </manifest>

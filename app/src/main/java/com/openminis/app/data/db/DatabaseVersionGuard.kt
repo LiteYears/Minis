@@ -111,7 +111,9 @@ object DatabaseVersionGuard {
     fun isHandledDowngrade(onDiskVersion: Int): Boolean =
         (onDiskVersion == 12 && CODE_DB_VERSION == 11) ||
             // [T-p1-delegate-task] 13 → 12: MIGRATION_13_12 is a verified no-op.
-            (onDiskVersion == 13 && CODE_DB_VERSION == 12)
+            (onDiskVersion == 13 && CODE_DB_VERSION == 12) ||
+            // 14 → 13: MIGRATION_14_13 is a verified no-op.
+            (onDiskVersion == 14 && CODE_DB_VERSION == 13)
 
     /** Result of the launch-time check. */
     enum class Decision {

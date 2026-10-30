@@ -16002,6 +16002,7 @@ class ChatViewModel(
             if (foregroundTools.isInterrupted(toolId) || ExecutionCoordinator.stoppedSince(dispatchSessionId, stopEpoch)) {
                 return stoppedBeforeStart(toolBlocks, toolId, toolTitle, "while preparing bash")
             }
+            val beforeListeningPorts = com.openminis.app.sandbox.SandboxServerManager.snapshotListeningPorts()
             var result = ExecutionCoordinator.execute(
                 sessionId = dispatchSessionId,
                 stopEpoch = stopEpoch,
@@ -16009,13 +16010,13 @@ class ChatViewModel(
                 command = command,
                 timeout = timeoutSec * 1000L,
                 lineCallback = lc@{ rawLine ->
-                    // Strip any OSC MinisOpenURL markers emitted by
-                    // /usr/local/bin/minis-open and forward the captured
-                    // URLs to the broker so the chat screen can present the
-                    // in-app preview. Lines that were *entirely* a marker
-                    // (nothing visible afterwards) are dropped so the tool
-                    // output doesn't grow blank rows.
-                    val (cleanedLine, capturedUrls) = MinisUrlMarker.extract(rawLine)
+                    // Strip any OSC MinisOpenURL and MinisSandboxServer markers emitted by
+                    // /usr/local/bin/minis-open or /usr/local/bin/minis-serve and forward
+                    // captured URLs / server instances to the host so the chat screen can
+                    // auto-present the Interactive Micro-App Canvas.
+                    val afterServerMarker = com.openminis.app.sandbox.SandboxServerManager
+                        .extractAndProcessMarkers(rawLine, fsSessionId, originalCommand)
+                    val (cleanedLine, capturedUrls) = MinisUrlMarker.extract(afterServerMarker)
                     for (raw in capturedUrls) MinisOpenUrlBroker.offer(raw)
                     if (cleanedLine.isEmpty() && rawLine.isNotEmpty()) return@lc
 
@@ -16068,10 +16069,20 @@ class ChatViewModel(
             }
 
             // Also scrub markers from the aggregated one-shot output and
-            // broker any URLs that only appeared there (defensive — handles
-            // executors that don't fire lineCallback for every line).
-            val (cleanedOutput, oneShotUrls) = MinisUrlMarker.extract(result.output)
+            // broker any URLs / sandbox servers that only appeared there.
+            val afterOneShotServer = com.openminis.app.sandbox.SandboxServerManager
+                .extractAndProcessMarkers(result.output, fsSessionId, originalCommand)
+            val (cleanedOutput, oneShotUrls) = MinisUrlMarker.extract(afterOneShotServer)
             for (raw in oneShotUrls) MinisOpenUrlBroker.offer(raw)
+            // Automatically detect newly listening sandbox web servers on 127.0.0.1:<port>
+            // (even if started via raw setsid/nohup/python3/node without minis-serve).
+            com.openminis.app.sandbox.SandboxServerManager.detectAfterCommand(
+                context = context,
+                sessionId = fsSessionId,
+                command = originalCommand,
+                output = cleanedOutput,
+                beforePorts = beforeListeningPorts,
+            )
             val output = if (cleanedOutput.isBlank()) "(no output)" else cleanedOutput
             // [T-android-parity-fixes] The coordinator already annotates every
             // non-zero status except its own timeout (124); ensureSuffix adds
@@ -16919,7 +16930,7 @@ File creation guidelines:
 - Also (BusyBox ash, NOT bash): brace expansion ({a,b,c}) and bash arrays (arr=(...), ${'$'}{arr[@]}) are unsupported — use space-separated strings with a for loop or multiple arguments instead.
 - Python packages: many PyPI packages (numpy, pandas, scipy, pillow, etc.) lack musllinux_aarch64 wheels and will fail to build from source. Use Alpine's native packages instead: `apk search py3-<name>` then `apk add py3-numpy py3-pandas py3-matplotlib py3-pillow py3-scipy py3-requests`. Only fall back to `pip install` for pure-Python packages not available via apk. For matplotlib, always set `matplotlib.use('Agg')` before importing pyplot — there is no display server in the sandbox.
 - Java: install a JDK with `apk add openjdk21-jdk` (openjdk17-jdk / openjdk11-jdk / openjdk8 for older projects). JDK 8's javac needs the `-d` output directory to exist.
-- Background services: each shell_execute runs in an isolated process. When starting a background server (e.g. `python3 -m http.server &`), you MUST redirect stdout/stderr to avoid SIGPIPE when the shell exits: `python3 -m http.server 8765 > /dev/null 2>&1 &`. Without redirection the server dies silently after the command finishes.
+- Background services & Live Sandbox Micro-App Canvas (`minis-serve`): you can build and host full-stack interactive mini-apps, dashboards, SQLite query explorers, Streamlit apps, FastAPI/Flask APIs, Node.js servers, Go servers, or Three.js apps inside `/var/minis/workspace` listening on `127.0.0.1:<port>` and automatically render them in the embedded Live Micro-App Canvas inside the chat. Prefer launching local web servers with `minis-serve start --port <port> --title "<App Title>" --workdir /var/minis/workspace -- <command>` (or shorthand `minis-serve <port> <command>`, e.g. `minis-serve 8000 python3 app.py`). `minis-serve` runs the server detached in its own session (`setsid`), redirects stdout/stderr to `/tmp/minis-server-<port>.log`, waits until `127.0.0.1:<port>` is accepting connections (or prints the crash log if it fails to bind), registers the live port in the chat's Live Sandbox Server bar, and automatically opens the embedded Interactive Micro-App Canvas bottom sheet. You can also manage servers with `minis-serve list`, `minis-serve logs <port>`, and `minis-serve stop <port>`. If starting a background daemon manually without `minis-serve`, always detach and redirect stdout/stderr (`setsid <cmd> > /tmp/server.log 2>&1 < /dev/null &`) so the shell pipe closes cleanly.
 - File search & text scanning: use ripgrep (`rg`) for EVERY scan of files — finding names, keyword/regex search, field extraction, log analysis — on one file or a whole tree. Never use grep/awk/sed/find here, rg is far faster. Contents: `rg -n 'pattern' <dir>` (`-i` ignore case, `-w` whole word, `-F` literal, `-l` file names only, `-t py` or `-g '*.md'` to filter files). File names: `rg --files <dir> -g '*.pdf'`, or `rg --files <dir> | rg 'name'`. rg skips hidden, .gitignored and binary files by default; add `-uuu` to search everything. If `which rg` finds nothing, install it once with `apk add ripgrep`. `**` recursive glob (globstar) is not supported by the shell — use rg instead. When looking for user files, do NOT scan the whole filesystem: search /var/minis/ first (workspace/attachments/shared for the current session, mounts/* for user-provided external folders), and widen the scope only if the file is clearly not there.
 
 Tool call style:
@@ -16950,7 +16961,8 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
 - android-weather <latitude> <longitude> — Open-Meteo forecast (current + hourly + daily). No API key needed.
 - android-shizuku-cli — invoke privileged Android system APIs (package management, settings, system commands) via Shizuku when granted. Curated subcommands return structured JSON; for anything not covered, fall back to `android-shizuku-cli exec <any shell command>` which runs the command via `sh -c` with Shizuku privilege (same surface as `adb shell`). Run with no args (or --help) for the subcommand list.
 - android-a11y-cli — drive system UI (read screen, tap, type, swipe, scroll) via the Android AccessibilityService when enabled. Run with no args (or --help) for the subcommand list.
-- minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
+- minis-serve: Spin up a real local web server in the Alpine sandbox on `127.0.0.1:<port>` (Python FastAPI/Flask/http.server, SQLite interactive dashboard, Node.js, Go, Streamlit, or Three.js) and automatically open it in the embedded Interactive Micro-App Canvas inside chat. Usage: `minis-serve start --port <port> --title "<Title>" --workdir /var/minis/workspace -- <command>` (or `minis-serve <port> <command>`), `minis-serve list`, `minis-serve logs <port>`, `minis-serve stop <port>`.
+- minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (including local sandbox servers like `http://127.0.0.1:<port>` → built-in Live Micro-App Canvas preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open http://127.0.0.1:8000, minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Run android-open via shell_execute for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
 - minis-sessions-cli: Read chat history. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read (add `--tools` for each tool call's exact input, e.g. the shell command, and its output). Run --help for full options.
 - minis-model-use: Invoke other LLM models pre-configured by the user. Run `minis-model-use list` via shell_execute to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.${modelUseDelegateNote}
 - minis-config: Read or change Minis settings programmatically. Run `minis-config --help` for subcommands and `minis-config topic-help <topic>` for details on a specific area. For array-valued fields (e.g. `models`, `groups`, `envvars`, `defaults.agentLoopEntries`) the `get` subcommand accepts `--filter <keywords>` (whitespace-AND, case-insensitive substring match against each element's JSON) and `--page <N> --page-size <N>` (default 20, max 100) — use these instead of dumping the full list when you only need a subset, and check the response's `pagination` / `agent_hint` fields for the next-page command. Every write triggers an in-app confirmation sheet and is logged to a revertable audit (1000-entry rolling log). After a successful change the response includes a `user_message` field — relay it (or paraphrase) so the user knows how to review or revert via Settings → Logs → Config Changes. If the call returns `permission_denied`, the user has disabled minis-config in [Settings → Permissions](minis://settings/permissions); relay that message and don't retry. You CAN add new providers and write their `apiKey` (literal string OR a `${'$'}${'$'}ENV_VAR` reference to copy from an env var at write time), but `get` never echoes API keys / OAuth tokens / env var values back — those reads return `permission_denied` by design. OAuth tokens and env var values are not settable via this tool; for an env var, point the user at [Set ENV_NAME](minis://settings/environments?create_key=ENV_NAME&create_value=) so they enter the value themselves. Network routing and live Tailscale status live under the `network` topic (`minis-config get network.tailscale.status` returns the state and the tailnet device list).

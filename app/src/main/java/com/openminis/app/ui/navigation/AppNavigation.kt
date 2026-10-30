@@ -144,12 +144,12 @@ object Routes {
     const val SKILL_FILE = "skill_file/{skillId}/{relativePath}"
     const val MINIS_SKILLS_BROWSER = "minis_skills_browser"
 
-    fun skillDetail(skillId: String) = "skill/$skillId"
+    fun skillDetail(skillId: String) = "skill/${android.net.Uri.encode(skillId)}"
     fun skillFile(skillId: String, relativePath: String = "SKILL.md"): String {
         // Path may contain `/`, which the nav library treats as a route
         // separator. URL-encode so subdirectory paths survive a round-trip.
         val encoded = java.net.URLEncoder.encode(relativePath, "UTF-8").replace("+", "%20")
-        return "skill_file/$skillId/$encoded"
+        return "skill_file/${android.net.Uri.encode(skillId)}/$encoded"
     }
     const val TERMINAL = "terminal?initCommand={initCommand}&sessionId={sessionId}"
     fun terminal(initCommand: String? = null, sessionId: String? = null): String {
@@ -219,10 +219,10 @@ object Routes {
     const val SCHEDULED_TASK_RUNS = "scheduled_tasks/runs/{taskId}"
     fun scheduledTaskRuns(taskId: String): String = "scheduled_tasks/runs/$taskId"
 
-    fun logDetail(fileName: String) = "log_detail/$fileName"
-    fun configAuditDetail(auditId: String) = "config_audit_detail/$auditId"
-    fun sessionStorageDetail(sessionId: String) = "session_storage/$sessionId"
-    fun memoryFileEdit(fileName: String, isGlobal: Boolean) = "memory_file/$fileName/$isGlobal"
+    fun logDetail(fileName: String) = "log_detail/${android.net.Uri.encode(fileName)}"
+    fun configAuditDetail(auditId: String) = "config_audit_detail/${android.net.Uri.encode(auditId)}"
+    fun sessionStorageDetail(sessionId: String) = "session_storage/${android.net.Uri.encode(sessionId)}"
+    fun memoryFileEdit(fileName: String, isGlobal: Boolean) = "memory_file/${android.net.Uri.encode(fileName)}/$isGlobal"
     fun chat(sessionId: String) = "chat/$sessionId"
     fun providerDetail(instanceId: String) = "provider/$instanceId"
     fun shadowVoiceDetail(instanceId: String) = "voice_service/$instanceId"
@@ -317,6 +317,9 @@ fun AppNavigation(
             }
             is DeepLinkAction.OpenPermissionSettings -> {
                 navController.safeNavigate(Routes.PERMISSIONS)
+            }
+            is DeepLinkAction.OpenAlarmList -> {
+                navController.safeNavigate(Routes.SCHEDULED_TASKS)
             }
             // OpenHtmlPreview is handled by setting startDestination
             // (see below) so the NavHost mounts directly into the right
@@ -1358,7 +1361,7 @@ fun AppNavigation(
         ) { backStackEntry ->
             val skillId = backStackEntry.arguments?.getString("skillId") ?: return@composable
             val rawPath = backStackEntry.arguments?.getString("relativePath") ?: "SKILL.md"
-            val relativePath = java.net.URLDecoder.decode(rawPath, "UTF-8")
+            val relativePath = runCatching { java.net.URLDecoder.decode(rawPath, "UTF-8") }.getOrDefault(rawPath)
             if (skillRepository != null) {
                 SkillFileViewerScreen(
                     skillId = skillId,
@@ -1512,14 +1515,14 @@ fun AppNavigation(
         composable(Routes.AGENTS) {
             com.openminis.app.ui.settings.SubAgentsScreen(
                 onBack = { navController.safePopBackStack() },
-                onOpen = { id -> navController.navigate("sub_agent/$id") },
+                onOpen = { id -> navController.safeNavigate("sub_agent/${android.net.Uri.encode(id)}") },
             )
         }
 
         composable(Routes.SUB_AGENTS) {
             com.openminis.app.ui.settings.SubAgentsScreen(
                 onBack = { navController.safePopBackStack() },
-                onOpen = { id -> navController.navigate("sub_agent/$id") },
+                onOpen = { id -> navController.safeNavigate("sub_agent/${android.net.Uri.encode(id)}") },
             )
         }
 

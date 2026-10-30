@@ -105,6 +105,29 @@ abstract class ProviderDatabase : RoomDatabase() {
         }
 
 
+        /**
+         * Reverse no-op downgrade migrations for pure additive schema changes
+         * (1 ↔ 2 ↔ 3 ↔ 4). Extra columns with defaults and the standalone
+         * `provider_thinking_rules` table are harmless to older builds.
+         */
+        val MIGRATION_4_3 = object : Migration(4, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // No-op: provider_thinking_rules is unused by v3 and harmless on disk.
+            }
+        }
+
+        val MIGRATION_3_2 = object : Migration(3, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // No-op: nullable image_endpoint_* columns are ignored by v2 SELECTs.
+            }
+        }
+
+        val MIGRATION_2_1 = object : Migration(2, 1) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // No-op: azure_mode has NOT NULL DEFAULT 0 and is ignored by v1 SELECTs.
+            }
+        }
+
         fun getInstance(context: Context): ProviderDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -112,7 +135,14 @@ abstract class ProviderDatabase : RoomDatabase() {
                     ProviderDatabase::class.java,
                     "provider.db",
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(
+                        MIGRATION_1_2,
+                        MIGRATION_2_3,
+                        MIGRATION_3_4,
+                        MIGRATION_4_3,
+                        MIGRATION_3_2,
+                        MIGRATION_2_1,
+                    )
                     .build()
                     .also { INSTANCE = it }
             }

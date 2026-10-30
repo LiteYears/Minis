@@ -2105,7 +2105,9 @@ class DebugRPCHandler(private val context: Context) {
                 command = command,
                 timeout = timeoutSec * 1000L,
                 lineCallback = { rawLine ->
-                    val (_, urls) = com.openminis.app.terminal.MinisUrlMarker.extract(rawLine)
+                    val afterSrv = com.openminis.app.sandbox.SandboxServerManager
+                        .extractAndProcessMarkers(rawLine, session, command)
+                    val (_, urls) = com.openminis.app.terminal.MinisUrlMarker.extract(afterSrv)
                     capturedUrls.addAll(urls)
                 },
             )
@@ -2115,6 +2117,8 @@ class DebugRPCHandler(private val context: Context) {
             // Always put the global strategy back, success or failure.
             ExecutionCoordinator.executionStrategy = previousStrategy
         }
+        com.openminis.app.sandbox.SandboxServerManager
+            .extractAndProcessMarkers(result.output, session, command)
         for (raw in capturedUrls) {
             com.openminis.app.terminal.MinisOpenUrlBroker.offer(raw)
         }

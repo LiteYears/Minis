@@ -1,0 +1,304 @@
+#!/bin/sh
+# /usr/local/bin/minis-serve — Start, manage, and auto-preview live local web
+# servers ("Interactive Micro-App Canvas") inside the Minis Alpine sandbox.
+#
+# Runs servers detached via setsid with stdin/stdout/stderr redirected to
+# /tmp/minis-server-<port>.log so shell_execute returns immediately once the
+# port is listening, while PRoot stays attached to the background server.
+# Emits OSC 1337 MinisSandboxServer + MinisOpenURL markers so the Android host
+# automatically registers the live port and opens the Interactive Micro-App Canvas.
+
+usage() {
+    cat <<'EOF'
+Usage:
+  minis-serve [start] --port <port> [--title "<title>"] [--workdir <dir>] [--path </subpath>] [--] <command...>
+  minis-serve <port> <command...>
+  minis-serve open <port> [--path </subpath>] [--title "<title>"]
+  minis-serve list
+  minis-serve logs <port> [lines]
+  minis-serve stop [<port>|--all]
+
+Examples:
+  minis-serve 8000 python3 app.py
+  minis-serve --port 8080 --title "SQLite Dashboard" --workdir /var/minis/workspace -- python3 server.py
+  minis-serve 5000 flask --app dashboard.py run --host 127.0.0.1 --port 5000
+  minis-serve logs 8000
+  minis-serve stop 8000
+EOF
+}
+
+is_port_listening() {
+    _p="$1"
+    # Convert decimal port to 4-digit uppercase hex for /proc/net/tcp & tcp6
+    _hex=$(printf "%04X" "$_p" 2>/dev/null)
+    if [ -n "$_hex" ]; then
+        if awk -v h=":$_hex" '$4 == "0A" && index(toupper($2), h) > 0 { found=1; exit 0 } END { exit !found }' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if command -v nc >/dev/null 2>&1; then
+        nc -z -w 1 127.0.0.1 "$_p" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/ /g'
+}
+
+stop_port() {
+    _p="$1"
+    _pidfile="/tmp/minis-server-${_p}.pid"
+    if [ -f "$_pidfile" ]; then
+        _oldpid=$(cat "$_pidfile" 2>/dev/null)
+        if [ -n "$_oldpid" ]; then
+            kill -TERM "-$_oldpid" 2>/dev/null || kill -TERM "$_oldpid" 2>/dev/null
+            sleep 0.2
+            kill -KILL "-$_oldpid" 2>/dev/null || kill -KILL "$_oldpid" 2>/dev/null
+        fi
+        rm -f "$_pidfile" "/tmp/minis-server-${_p}.json"
+    fi
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -k "${_p}/tcp" >/dev/null 2>&1
+    fi
+}
+
+if [ $# -eq 0 ]; then
+    usage >&2
+    exit 1
+fi
+
+SUBCMD="$1"
+case "$SUBCMD" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    list|status)
+        found=0
+        for jf in /tmp/minis-server-*.json; do
+            [ -f "$jf" ] || continue
+            port=$(printf '%s' "$jf" | sed -e 's|^/tmp/minis-server-||' -e 's|\.json$||')
+            pidfile="/tmp/minis-server-${port}.pid"
+            pid=""
+            [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null)
+            if is_port_listening "$port"; then
+                state="LIVE"
+            elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                state="STARTING"
+            else
+                state="STOPPED"
+            fi
+            printf "port=%s state=%s pid=%s meta=%s\n" "$port" "$state" "${pid:-none}" "$(cat "$jf" 2>/dev/null)"
+            found=1
+        done
+        if [ "$found" -eq 0 ]; then
+            echo "No sandbox servers registered via minis-serve."
+        fi
+        exit 0
+        ;;
+    logs)
+        shift
+        port="$1"
+        lines="${2:-60}"
+        if [ -z "$port" ]; then
+            echo "Usage: minis-serve logs <port> [lines]" >&2
+            exit 1
+        fi
+        logfile="/tmp/minis-server-${port}.log"
+        if [ ! -f "$logfile" ]; then
+            echo "No log file found at $logfile" >&2
+            exit 1
+        fi
+        tail -n "$lines" "$logfile"
+        exit 0
+        ;;
+    stop)
+        shift
+        target="$1"
+        if [ "$target" = "--all" ] || [ -z "$target" ]; then
+            for pf in /tmp/minis-server-*.pid; do
+                [ -f "$pf" ] || continue
+                p=$(printf '%s' "$pf" | sed -e 's|^/tmp/minis-server-||' -e 's|\.pid$||')
+                stop_port "$p"
+                printf '\033]1337;MinisSandboxServer={"action":"stop","port":%s}\007' "$p"
+                echo "[minis-serve] Stopped server on port $p"
+            done
+        else
+            stop_port "$target"
+            printf '\033]1337;MinisSandboxServer={"action":"stop","port":%s}\007' "$target"
+            echo "[minis-serve] Stopped server on port $target"
+        fi
+        exit 0
+        ;;
+    open)
+        shift
+        port="$1"
+        shift 2>/dev/null || true
+        subpath="/"
+        title=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --path) subpath="$2"; shift 2 ;;
+                --title) title="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        case "$subpath" in
+            /*) ;;
+            *) subpath="/$subpath" ;;
+        esac
+        url="http://127.0.0.1:${port}${subpath}"
+        esc_title=$(json_escape "$title")
+        printf '\033]1337;MinisSandboxServer={"action":"open","port":%s,"url":"%s","title":"%s"}\007' "$port" "$url" "$esc_title"
+        printf '\033]1337;MinisOpenURL=%s\007' "$url"
+        echo "[minis-serve] Opened live preview: $url"
+        exit 0
+        ;;
+    start)
+        shift
+        ;;
+esac
+
+PORT=""
+TITLE=""
+WORKDIR=""
+SUBPATH="/"
+WAIT_SECS=15
+
+# Support shorthand: minis-serve <port> <command...>
+case "$1" in
+    ''|*[!0-9]*) ;;
+    *)
+        PORT="$1"
+        shift
+        ;;
+esac
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--port)
+            PORT="$2"
+            shift 2
+            ;;
+        -t|--title|--name)
+            TITLE="$2"
+            shift 2
+            ;;
+        -w|--workdir|--cwd|--dir)
+            WORKDIR="$2"
+            shift 2
+            ;;
+        --path)
+            SUBPATH="$2"
+            shift 2
+            ;;
+        --wait)
+            WAIT_SECS="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ -z "$PORT" ] || [ $# -eq 0 ]; then
+    usage >&2
+    exit 1
+fi
+
+if [ -z "$WORKDIR" ]; then
+    if [ -d "/var/minis/workspace" ] && [ "$PWD" = "/root" ]; then
+        WORKDIR="/var/minis/workspace"
+    else
+        WORKDIR="$PWD"
+    fi
+fi
+
+case "$SUBPATH" in
+    /*) ;;
+    *) SUBPATH="/$SUBPATH" ;;
+esac
+
+if [ -z "$TITLE" ]; then
+    TITLE="Sandbox App (:${PORT})"
+fi
+
+# Stop any prior server on this port
+stop_port "$PORT"
+
+LOGFILE="/tmp/minis-server-${PORT}.log"
+PIDFILE="/tmp/minis-server-${PORT}.pid"
+METAFILE="/tmp/minis-server-${PORT}.json"
+: > "$LOGFILE"
+
+CMD_STR="$*"
+
+if [ ! -d "$WORKDIR" ]; then
+    mkdir -p "$WORKDIR" 2>/dev/null || WORKDIR="/tmp"
+fi
+
+# Launch in its own session (setsid) with fds 0/1/2 detached from the command pipe
+setsid /bin/sh -c '
+    cd "$1" || exit 1
+    shift
+    echo "$$" > "'"$PIDFILE"'"
+    if [ $# -eq 1 ]; then
+        exec /bin/sh -c "$1"
+    else
+        exec "$@"
+    fi
+' sh "$WORKDIR" "$@" </dev/null >>"$LOGFILE" 2>&1 &
+
+sleep 0.15
+SERVER_PID=""
+[ -f "$PIDFILE" ] && SERVER_PID=$(cat "$PIDFILE" 2>/dev/null)
+
+ESC_TITLE=$(json_escape "$TITLE")
+ESC_CMD=$(json_escape "$CMD_STR")
+ESC_WORKDIR=$(json_escape "$WORKDIR")
+URL="http://127.0.0.1:${PORT}${SUBPATH}"
+
+cat > "$METAFILE" <<EOF
+{"port":${PORT},"url":"${URL}","title":"${ESC_TITLE}","pid":${SERVER_PID:-0},"workdir":"${ESC_WORKDIR}","cmd":"${ESC_CMD}"}
+EOF
+
+# Wait for the server to bind and accept connections on 127.0.0.1:<PORT>
+MAX_TICKS=$((WAIT_SECS * 5))
+i=0
+while [ "$i" -lt "$MAX_TICKS" ]; do
+    if is_port_listening "$PORT"; then
+        printf '\033]1337;MinisSandboxServer={"action":"start","port":%s,"url":"%s","title":"%s","pid":%s,"workdir":"%s","cmd":"%s"}\007' \
+            "$PORT" "$URL" "$ESC_TITLE" "${SERVER_PID:-0}" "$ESC_WORKDIR" "$ESC_CMD"
+        printf '\033]1337;MinisOpenURL=%s\007' "$URL"
+        echo "[minis-serve] Live server ready at $URL (PID ${SERVER_PID:-unknown}, workdir: $WORKDIR, logs: $LOGFILE)"
+        exit 0
+    fi
+    if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "[minis-serve] Server process (PID $SERVER_PID) exited before binding port $PORT. Log output:" >&2
+        cat "$LOGFILE" >&2
+        exit 1
+    fi
+    sleep 0.2
+    i=$((i + 1))
+done
+
+# Even if it hasn't finished binding after WAIT_SECS (e.g. heavy framework boot),
+# if the process is still alive, register it and open the preview (WebViewHolder
+# will auto-retry while it finishes warming up).
+if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    printf '\033]1337;MinisSandboxServer={"action":"start","port":%s,"url":"%s","title":"%s","pid":%s,"workdir":"%s","cmd":"%s"}\007' \
+        "$PORT" "$URL" "$ESC_TITLE" "${SERVER_PID:-0}" "$ESC_WORKDIR" "$ESC_CMD"
+    printf '\033]1337;MinisOpenURL=%s\007' "$URL"
+    echo "[minis-serve] Server starting on $URL (PID $SERVER_PID still warming up, logs: $LOGFILE)"
+    exit 0
+fi
+
+echo "[minis-serve] Timed out waiting for port $PORT. Log output:" >&2
+cat "$LOGFILE" >&2
+exit 1

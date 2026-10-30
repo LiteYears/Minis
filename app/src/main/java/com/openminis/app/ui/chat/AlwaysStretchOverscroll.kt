@@ -487,7 +487,10 @@ object ChatLinkResolver {
             }
             "file" -> {
                 val path = raw.removePrefix("file://").substringBefore('?')
-                if (path.isEmpty()) null else File(java.net.URLDecoder.decode(path, "UTF-8"))
+                if (path.isEmpty()) null else {
+                    val candidates = minisPathCandidates(path).map { File(it) }
+                    candidates.firstOrNull { it.exists() } ?: candidates.first()
+                }
             }
             null -> {
                 if (raw.startsWith("/")) lookup(raw) else null

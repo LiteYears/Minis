@@ -28,6 +28,14 @@ import com.openminis.app.logging.AppLogger
  *    feel instant. Tearing down + recreating the WebView would reload
  *    the page, breaking that illusion.
  */
+data class WebConsoleEntry(
+    val level: String,
+    val message: String,
+    val sourceId: String,
+    val lineNumber: Int,
+    val timestampMs: Long = System.currentTimeMillis(),
+)
+
 class WebViewHolder(
     appContext: Context,
     initialUrl: String,
@@ -35,41 +43,49 @@ class WebViewHolder(
 
     var pageTitle by mutableStateOf("")
         private set
-    var currentUrl by mutableStateOf(initialUrl)
+    var currentUrl by mutableStateOf(
+        com.openminis.app.sandbox.SandboxServerManager.normalizeLocalUrl(initialUrl)
+    )
 
-    /**
-     * [T-android-webview-render-process-gone] (GH#341) True once this holder's
-     * renderer died and [destroy] ran, so the WebView inside is a dead object.
-     *
-     * [webView] is a `val` created at construction and there is no way to swap
-     * a fresh one in, so the holder cannot heal itself — the OWNER has to build
-     * a new holder. Exposing the state (rather than making `webView` a `var`
-     * and rebuilding in place) is the smaller change: every consumer already
-     * re-creates the holder when `currentUrl` no longer matches, so they only
-     * need one more condition on that same check, and no existing reference to
-     * `holder.webView` can go stale underneath a composition.
-     *
-     * Compose state, so a screen currently showing this holder recomposes and
-     * can react rather than sitting on a blank view.
-     */
     var isDead by mutableStateOf(false)
         private set
 
     var isLoading by mutableStateOf(true)
         private set
+    var isWarmingUpLocalServer by mutableStateOf(false)
+        private set
     var desktopMode by mutableStateOf(false)
         private set
     var pageFavicon by mutableStateOf<Bitmap?>(null)
         private set
+    var consoleLogs by mutableStateOf<List<WebConsoleEntry>>(emptyList())
+        private set
 
+    private var localRetryCount = 0
     private var mobileUserAgent: String = ""
+
+    fun clearConsoleLogs() {
+        consoleLogs = emptyList()
+    }
+
+    fun navigateTo(newUrl: String) {
+        val normalized = com.openminis.app.sandbox.SandboxServerManager.normalizeLocalUrl(newUrl)
+        currentUrl = normalized
+        localRetryCount = 0
+        isWarmingUpLocalServer = false
+        webView.loadUrl(normalized)
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     val webView: WebView = WebView(appContext).apply {
         settings.javaScriptEnabled = true       // sandbox HTML demos rely on JS
         settings.domStorageEnabled = true
+        settings.databaseEnabled = true
         settings.allowFileAccess = true         // file:// for sandbox previews
         settings.allowContentAccess = true
+        // Allow local HTTP sandbox servers (http://127.0.0.1:<port>) to load
+        // HTTPS CDN assets (Chart.js, Three.js, Tailwind, Plotly, etc.) and vice-versa.
+        settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         // Same-origin file:// access is needed so `<script src="game.js">`
         // sitting next to a sandbox HTML loads correctly. We accept the small
         // attack surface because all paths come from PRoot-resolved sandbox
@@ -78,36 +94,9 @@ class WebViewHolder(
         settings.allowFileAccessFromFileURLs = true
         @Suppress("DEPRECATION")
         settings.allowUniversalAccessFromFileURLs = true
-        // T-htmlpreview-2d5c4f3d: pages that use viewport units (`100vh` /
-        // `height: 100%`) combined with `overflow: hidden` would render
-        // blank inside the bottom-sheet preview, because the WebView starts
-        // life detached (created with the Application context — no window)
-        // and loadUrl can fire before Compose attaches it. With no
-        // metaviewport handling, Blink resolves CSS viewport units against
-        // a zero container, collapsing `body { height: 100vh; overflow:
-        // hidden }` to a 0-height clipped box that the resize after attach
-        // never re-expands.
-        //
-        // Turning on useWideViewPort + loadWithOverviewMode tells WebView
-        // to honor the page's <meta viewport> (or fall back to 980 CSS px
-        // when missing) and shrink-to-fit, which decouples the CSS viewport
-        // from the initial measured size and makes 100vh resolve against
-        // the metaviewport instead. Matches the WebApp path (WebAppActivity)
-        // implicitly via WebViewAssetLoader's defaults.
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
         mobileUserAgent = settings.userAgentString
-        // T-android-webview-v3-port: enable first- + third-party cookies so
-        // the in-chat preview matches Chrome cookie semantics. Without
-        // third-party cookies the embedded captcha/auth iframes that
-        // production sites use (hCaptcha, Cloudflare Turnstile, OAuth
-        // popups) silently drop tokens — the same flow the user clears in
-        // a real browser tab fails inside our preview. WebView ships with
-        // 3P cookies disabled by default; first-party defaults to true on
-        // every Android version we support, but we set both explicitly so
-        // the intent is grep-able. `this` here is the outer
-        // WebView(appContext).apply{…} receiver — capture it locally so
-        // the nested CookieManager.apply{} stays readable.
         val wv = this
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
@@ -121,13 +110,6 @@ class WebViewHolder(
                 super.onReceivedHttpAuthRequest(view, handler, host, realm)
             }
 
-            // [T-android-webview-render-process-gone] (GH#341) Route to this
-            // holder's own destroy(), which detaches, stops loading and blanks
-            // the page before destroying, and is documented safe to call twice
-            // — so the later teardown from the owner is still fine. Then flag
-            // the holder dead so the owner rebuilds instead of reusing a
-            // destroyed WebView (it cannot be swapped in place: `webView` is a
-            // val).
             override fun onRenderProcessGone(
                 view: WebView?,
                 detail: android.webkit.RenderProcessGoneDetail?,
@@ -143,18 +125,12 @@ class WebViewHolder(
                 request: android.webkit.WebResourceRequest,
             ): Boolean {
                 val urlStr = request.url?.toString()
-                // T234: Google permanently disallows WebView for sign-in /
-                // OAuth. Hand auth-domain navigation to Chrome Custom Tab.
                 if (com.openminis.app.browser.GoogleAuthRouter.shouldRouteExternally(urlStr)) {
                     if (urlStr != null) {
                         com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(view.context, urlStr)
                     }
                     return true
                 }
-                // T134: intent:// / market:// / tel: / mailto: get routed
-                // out instead of trying to load as a page.
-                // [T-android-user-initiated-scheme-dispatch] This WebView is
-                // on screen and the user tapped the link inside it.
                 return com.openminis.app.ui.browser
                     .BrowserExternalSchemeHandler
                     .handle(
@@ -166,30 +142,48 @@ class WebViewHolder(
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                isLoading = true
-                currentUrl = url
+                if (url != "about:blank") {
+                    isLoading = true
+                    currentUrl = url
+                }
                 AppLogger.debug(TAG, "onPageStarted url=${url.take(160)}")
             }
 
+            override fun onReceivedError(
+                view: WebView,
+                request: android.webkit.WebResourceRequest,
+                error: android.webkit.WebResourceError,
+            ) {
+                super.onReceivedError(view, request, error)
+                if (!request.isForMainFrame) return
+                val failingUrl = request.url?.toString().orEmpty()
+                if (com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(failingUrl) &&
+                    localRetryCount < 6
+                ) {
+                    localRetryCount += 1
+                    isWarmingUpLocalServer = true
+                    val normalized = com.openminis.app.sandbox.SandboxServerManager.normalizeLocalUrl(failingUrl)
+                    AppLogger.info(TAG, "Local sandbox server warming up (attempt $localRetryCount/6): $normalized")
+                    view.postDelayed({
+                        if (!isDead) {
+                            view.loadUrl(normalized)
+                        }
+                    }, 650L)
+                } else {
+                    isWarmingUpLocalServer = false
+                }
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
+                if (url == "about:blank") return
                 isLoading = false
+                isWarmingUpLocalServer = false
+                localRetryCount = 0
                 pageTitle = view.title.orEmpty()
+                if (com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(url) && pageTitle.isNotBlank()) {
+                    com.openminis.app.sandbox.SandboxServerManager.updatePageTitle(url, pageTitle)
+                }
                 AppLogger.debug(TAG, "onPageFinished title=${pageTitle.take(60)}")
-                // T-htmlpreview-resize: WebView commits its first layout
-                // against whatever viewport height the container had at
-                // loadUrl-time. If that height was a transient pre-animation
-                // value (bottom-sheet still expanding, IME inset not yet
-                // settled), Blink resolves `100vh` / `height:100%` against
-                // it once and never re-evaluates — pages with
-                // `overflow:hidden` collapse to a clipped 0-height box
-                // (white screen), and `position:fixed` popups that read
-                // `window.innerHeight` on first paint cache the wrong
-                // coordinates inline. Android WebView, unlike desktop
-                // Chrome, does NOT auto-dispatch a viewport `resize` when
-                // the container resizes. Mirror what BrowserUseManager
-                // does (T-webview-popup-d3c6e10f): post a synthetic
-                // `resize` after first commit so vh/innerHeight readers
-                // recompute against the stabilised height.
                 view.postDelayed({
                     view.evaluateJavascript(
                         "window.dispatchEvent(new Event('resize'));",
@@ -200,11 +194,29 @@ class WebViewHolder(
         }
         webChromeClient = object : android.webkit.WebChromeClient() {
             override fun onReceivedTitle(view: WebView?, title: String?) {
-                if (!title.isNullOrEmpty()) pageTitle = title
+                if (!title.isNullOrEmpty() && title != "about:blank") {
+                    pageTitle = title
+                    if (com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(currentUrl)) {
+                        com.openminis.app.sandbox.SandboxServerManager.updatePageTitle(currentUrl, title)
+                    }
+                }
             }
 
             override fun onReceivedIcon(view: WebView?, icon: Bitmap?) {
                 if (icon != null) pageFavicon = icon
+            }
+
+            override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
+                if (consoleMessage != null) {
+                    val entry = WebConsoleEntry(
+                        level = consoleMessage.messageLevel()?.name ?: "LOG",
+                        message = consoleMessage.message().orEmpty(),
+                        sourceId = consoleMessage.sourceId().orEmpty().substringAfterLast('/'),
+                        lineNumber = consoleMessage.lineNumber(),
+                    )
+                    consoleLogs = (consoleLogs + entry).takeLast(100)
+                }
+                return super.onConsoleMessage(consoleMessage)
             }
 
             // [T-android-js-dialogs-256] Show real alert/confirm/prompt dialogs.

@@ -195,8 +195,8 @@ private fun FilePreviewContent(
             val ok = try {
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     item.file.inputStream().use { it.copyTo(out) }
-                }
-                true
+                    true
+                } ?: false
             } catch (e: Exception) {
                 AppLogger.warning("FilePreview", "Save-As failed: ${e.message}")
                 false
