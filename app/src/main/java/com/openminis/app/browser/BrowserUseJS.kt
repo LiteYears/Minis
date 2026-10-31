@@ -138,19 +138,36 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             var el = document.querySelector('${jsQuote(selector)}');
             if (!el) return JSON.stringify({error: 'Element not found: ${jsQuote(selector)}'});
             el.focus();
+            var valToSet = '${jsQuote(text)}';
+            if (el.tagName === 'SELECT') {
+                var matchedOpt = null;
+                var lowerTarget = valToSet.toLowerCase().trim();
+                for (var oi = 0; oi < el.options.length; oi++) {
+                    var opt = el.options[oi];
+                    if (opt.value === valToSet || (opt.text || '').trim() === valToSet ||
+                        opt.value.toLowerCase() === lowerTarget || (opt.text || '').toLowerCase().trim() === lowerTarget) {
+                        matchedOpt = opt;
+                        break;
+                    }
+                }
+                el.value = matchedOpt ? matchedOpt.value : valToSet;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return JSON.stringify({typed: true, selector: '${jsQuote(selector)}', length: valToSet.length});
+            }
             if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
                 var nativeSetter = Object.getOwnPropertyDescriptor(
                     el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value'
                 );
                 if (nativeSetter && nativeSetter.set) {
-                    nativeSetter.set.call(el, '${jsQuote(text)}');
+                    nativeSetter.set.call(el, valToSet);
                 } else {
-                    el.value = '${jsQuote(text)}';
+                    el.value = valToSet;
                 }
             } else {
-                el.innerText = '${jsQuote(text)}';
+                el.innerText = valToSet;
             }
-            var chars = '${jsQuote(text)}';
+            var chars = valToSet;
             for (var i = 0; i < chars.length; i++) {
                 var c = chars[i];
                 el.dispatchEvent(new KeyboardEvent('keydown', {key: c, bubbles: true}));
@@ -587,24 +604,34 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
 
                 var customSel = $customSelector;
                 var rawSet = new Set();
-                try {
-                    var matched = document.querySelectorAll(customSel || defaultQuery);
-                    for (var i = 0; i < matched.length; i++) rawSet.add(matched[i]);
-                } catch (e) {
-                    return JSON.stringify({error: 'Invalid selector for Set-of-Marks: ' + e.message});
-                }
-
-                if (!customSel && document.body) {
-                    var allNodes = document.body.querySelectorAll('*');
-                    var maxScan = Math.min(allNodes.length, 2500);
-                    for (var k = 0; k < maxScan; k++) {
-                        var cand = allNodes[k];
-                        if (rawSet.has(cand)) continue;
-                        var st = window.getComputedStyle(cand);
-                        if (st.cursor === 'pointer' && cand.children.length <= 4) {
-                            rawSet.add(cand);
+                var queryToRun = customSel || defaultQuery;
+                function collectFromRoot(root) {
+                    try {
+                        var matched = root.querySelectorAll(queryToRun);
+                        for (var i = 0; i < matched.length; i++) rawSet.add(matched[i]);
+                    } catch (e) {
+                        if (root === document) throw e;
+                    }
+                    if (!customSel) {
+                        var allNodes = root.querySelectorAll('*');
+                        var maxScan = Math.min(allNodes.length, 2500);
+                        for (var k = 0; k < maxScan; k++) {
+                            var cand = allNodes[k];
+                            if (cand.shadowRoot) {
+                                collectFromRoot(cand.shadowRoot);
+                            }
+                            if (rawSet.has(cand)) continue;
+                            var st = window.getComputedStyle(cand);
+                            if (st.cursor === 'pointer' && cand.children.length <= 4) {
+                                rawSet.add(cand);
+                            }
                         }
                     }
+                }
+                try {
+                    collectFromRoot(document);
+                } catch (e) {
+                    return JSON.stringify({error: 'Invalid selector for Set-of-Marks: ' + e.message});
                 }
 
                 function isVisibleInViewport(el) {
@@ -628,6 +655,18 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                     return tag;
                 }
 
+                function extractFallbackLabel(el) {
+                    var direct = (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('data-tooltip') || el.getAttribute('name') || '').trim();
+                    if (direct) return direct;
+                    try {
+                        var child = el.querySelector('[aria-label], [title], img[alt], svg title');
+                        if (child) {
+                            return (child.getAttribute('aria-label') || child.getAttribute('title') || child.getAttribute('alt') || child.textContent || '').trim();
+                        }
+                    } catch (e) {}
+                    return '';
+                }
+
                 var candidates = [];
                 rawSet.forEach(function(el) {
                     if (!isVisibleInViewport(el)) return;
@@ -643,7 +682,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                     for (var j = 0; j < candidates.length; j++) {
                         if (i === j) continue;
                         var other = candidates[j];
-                        if (other.el.contains(cur.el)) {
+                        if (other.el.contains && other.el.contains(cur.el)) {
                             var sameBox = Math.abs(other.rect.left - cur.rect.left) < 8 &&
                                           Math.abs(other.rect.top - cur.rect.top) < 8 &&
                                           Math.abs(other.rect.width - cur.rect.width) < 12 &&
@@ -693,6 +732,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                     '#00ACC1'  // cyan
                 ];
 
+                window.__minis_som_map__ = {};
                 var marksOut = [];
                 var count = Math.min(deduped.length, $limit);
                 for (var idx = 0; idx < count; idx++) {
@@ -703,6 +743,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                     var color = palette[idx % palette.length];
 
                     el.setAttribute('data-minis-mark', String(markNum));
+                    window.__minis_som_map__[markNum] = el;
 
                     var x = Math.max(0, Math.round(r.left));
                     var y = Math.max(0, Math.round(r.top));
@@ -750,7 +791,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                     if (el.tagName === 'INPUT' && el.type === 'password' && el.value) {
                         rawText = '[password redacted]';
                     }
-                    var ariaLabel = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+                    var ariaLabel = extractFallbackLabel(el);
                     var placeholder = (el.getAttribute('placeholder') || '').trim();
                     var role = (el.getAttribute('role') || '').trim();
                     var typeAttr = (el.getAttribute('type') || '').trim();
@@ -808,6 +849,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                 for (var i = 0; i < marked.length; i++) {
                     marked[i].removeAttribute('data-minis-mark');
                 }
+                window.__minis_som_map__ = {};
             }
             return JSON.stringify({cleared: true, removedOverlay: removedOverlay});
         })()
@@ -818,7 +860,8 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
      */
     fun clickMark(mark: Int): String = guardedRead("""
         (function() {
-            var el = document.querySelector('[data-minis-mark="$mark"]');
+            var el = (window.__minis_som_map__ && window.__minis_som_map__[$mark]) ||
+                     document.querySelector('[data-minis-mark="$mark"]');
             if (!el) {
                 return JSON.stringify({
                     error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'
@@ -860,7 +903,8 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
      */
     fun typeMark(mark: Int, text: String): String = guardedRead("""
         (function() {
-            var el = document.querySelector('[data-minis-mark="$mark"]');
+            var el = (window.__minis_som_map__ && window.__minis_som_map__[$mark]) ||
+                     document.querySelector('[data-minis-mark="$mark"]');
             if (!el) {
                 return JSON.stringify({
                     error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'
@@ -870,19 +914,36 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                 el.scrollIntoView({block: 'nearest', inline: 'nearest'});
             } catch (e) {}
             el.focus();
+            var valToSet = '${jsQuote(text)}';
+            if (el.tagName === 'SELECT') {
+                var matchedOpt = null;
+                var lowerTarget = valToSet.toLowerCase().trim();
+                for (var oi = 0; oi < el.options.length; oi++) {
+                    var opt = el.options[oi];
+                    if (opt.value === valToSet || (opt.text || '').trim() === valToSet ||
+                        opt.value.toLowerCase() === lowerTarget || (opt.text || '').toLowerCase().trim() === lowerTarget) {
+                        matchedOpt = opt;
+                        break;
+                    }
+                }
+                el.value = matchedOpt ? matchedOpt.value : valToSet;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return JSON.stringify({typed: true, selector: '[mark=$mark] <SELECT>', mark: $mark, length: valToSet.length});
+            }
             if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
                 var nativeSetter = Object.getOwnPropertyDescriptor(
                     el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value'
                 );
                 if (nativeSetter && nativeSetter.set) {
-                    nativeSetter.set.call(el, '${jsQuote(text)}');
+                    nativeSetter.set.call(el, valToSet);
                 } else {
-                    el.value = '${jsQuote(text)}';
+                    el.value = valToSet;
                 }
             } else {
-                el.innerText = '${jsQuote(text)}';
+                el.innerText = valToSet;
             }
-            var chars = '${jsQuote(text)}';
+            var chars = valToSet;
             for (var i = 0; i < chars.length; i++) {
                 var c = chars[i];
                 el.dispatchEvent(new KeyboardEvent('keydown', {key: c, bubbles: true}));
@@ -904,7 +965,8 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
      */
     fun hoverMark(mark: Int): String = guardedRead("""
         (function() {
-            var el = document.querySelector('[data-minis-mark="$mark"]');
+            var el = (window.__minis_som_map__ && window.__minis_som_map__[$mark]) ||
+                     document.querySelector('[data-minis-mark="$mark"]');
             if (!el) {
                 return JSON.stringify({
                     error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'

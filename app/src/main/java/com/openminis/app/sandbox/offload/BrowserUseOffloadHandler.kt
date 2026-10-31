@@ -234,6 +234,7 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
         args.get("url")?.let { obj.put("url", it) }
         args.get("selector")?.let { obj.put("selector", it) }
         args.get("text")?.let { obj.put("text", it) }
+        args.getInt("mark", "mark-id", "mark_id")?.let { obj.put("mark", it) }
         args.getInt("coordinate-x", "coordinate_x", "x")?.let { obj.put("coordinate_x", it) }
         args.getInt("coordinate-y", "coordinate_y", "y")?.let { obj.put("coordinate_y", it) }
         args.get("direction")?.let { obj.put("direction", it) }
@@ -242,6 +243,10 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
         args.get("user-agent", "user_agent", "ua")?.let { obj.put("user_agent", it) }
         args.getInt("max-depth", "max_depth")?.let { obj.put("max_depth", it) }
         args.getInt("tab-id", "tab_id")?.let { obj.put("tab_id", it) }
+        if (args.hasFlag("full-page", "full_page")) obj.put("full_page", true)
+        if (args.hasFlag("som")) obj.put("som", true)
+        if (args.hasFlag("keep-overlay", "keep_overlay")) obj.put("keep_overlay", true)
+        args.get("profile-name", "profile_name", "profile")?.let { obj.put("profile_name", it) }
         // set_viewport parameters
         args.getInt("width")?.let { obj.put("viewport_width", it) }
         args.getInt("height")?.let { obj.put("viewport_height", it) }
@@ -368,6 +373,20 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
                     Log.w(TAG, "Failed to persist screenshot to ${dest.absolutePath}")
                 }
             }
+        } else if (!r.imageFilePath.isNullOrEmpty() && browserHostDir != null) {
+            // Visual-change auto-snapshots populate imageFilePath on host cacheDir without base64Image.
+            // Copy into browserHostDir so the guest shell receives a valid /var/minis/browser/ path.
+            val srcFile = File(r.imageFilePath)
+            if (srcFile.isFile) {
+                val filename = srcFile.name.ifEmpty { "snapshot_${System.currentTimeMillis()}.jpg" }
+                val dest = File(browserHostDir, filename)
+                if (runCatching { srcFile.copyTo(dest, overwrite = true) }.isSuccess) {
+                    val linuxPath = "$VAR_MINIS_BROWSER/$filename"
+                    persistedImagePath = linuxPath
+                    out.put("image_path", linuxPath)
+                    out.put("minis_url", "minis://browser/$filename")
+                }
+            }
         } else if (!base64.isNullOrEmpty()) {
             Log.w(TAG, "No /var/minis/browser mount — falling back to base64-only output")
         }
@@ -464,25 +483,32 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
         val sel = input.optString("selector", "").takeIf { it.isNotBlank() }
         val txt = input.optString("text", "").takeIf { it.isNotBlank() }
         val dir = input.optString("direction", "").takeIf { it.isNotBlank() }
+        val mark = if (input.has("mark")) "[${input.optInt("mark")}]" else null
+        val profile = input.optString("profile_name", "").takeIf { it.isNotBlank() }
         return when (action) {
-            "navigate"           -> "browser: navigate ${url ?: ""}".trim()
-            "screenshot"         -> "browser: screenshot"
-            "click"              -> "browser: click ${sel ?: ""}".trim()
-            "type"               -> "browser: type"
-            "scroll"             -> "browser: scroll${dir?.let { " $it" } ?: ""}"
-            "scroll_and_collect" -> "browser: scroll & collect"
-            "get_text"           -> "browser: read text"
-            "get_readable"       -> "browser: extract readable"
-            "get_backbone"       -> "browser: extract structure"
-            "fetch"              -> "browser: fetch ${url ?: ""}".trim()
-            "execute_js"         -> "browser: run JS"
-            "set_viewport"       -> "browser: set viewport"
-            "get_cookies"        -> "browser: read cookies"
-            "set_cookies"        -> "browser: write cookies"
-            "go_back", "back"    -> "browser: go back"
-            "reload"             -> "browser: reload"
-            "find"               -> "browser: find ${txt ?: sel ?: ""}".trim()
-            else                 -> "browser: $action"
+            "navigate"             -> "browser: navigate ${url ?: ""}".trim()
+            "screenshot"           -> "browser: screenshot"
+            "som_snapshot"         -> "browser: Set-of-Marks snapshot"
+            "click", "click_element" -> "browser: click ${mark ?: sel ?: ""}".trim()
+            "type"                 -> "browser: type ${mark ?: sel ?: ""}".trim()
+            "scroll"               -> "browser: scroll${dir?.let { " $it" } ?: ""}"
+            "scroll_and_collect"   -> "browser: scroll & collect"
+            "get_text"             -> "browser: read text"
+            "get_readable"         -> "browser: extract readable"
+            "get_backbone"         -> "browser: extract structure"
+            "fetch"                -> "browser: fetch ${url ?: ""}".trim()
+            "execute_js"           -> "browser: run JS"
+            "set_viewport"         -> "browser: set viewport"
+            "get_cookies"          -> "browser: read cookies"
+            "set_cookies"          -> "browser: write cookies"
+            "save_auth_profile"    -> "browser: save vault ${profile ?: ""}".trim()
+            "load_auth_profile"    -> "browser: load vault ${profile ?: ""}".trim()
+            "list_auth_profiles"   -> "browser: list vault profiles"
+            "delete_auth_profile"  -> "browser: delete vault ${profile ?: ""}".trim()
+            "go_back", "back"      -> "browser: go back"
+            "reload"               -> "browser: reload"
+            "find"                 -> "browser: find ${txt ?: sel ?: ""}".trim()
+            else                   -> "browser: $action"
         }
     }
 
@@ -500,6 +526,7 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
          */
         private val BOOLEAN_FLAGS = setOf(
             "compact", "quiet", "with-base64", "with_base64",
+            "full-page", "full_page", "som", "keep-overlay", "keep_overlay",
             "reset", "fuzzy", "help",
         )
 
@@ -519,15 +546,17 @@ USAGE:
 
 ACTIONS:
   navigate        --url <url>
-  screenshot
-  click           --selector <css> | --coordinate-x <n> --coordinate-y <n>
-  type            --selector <css> --text <text>
-  get_text        --selector <css>
+  screenshot      [--full-page] [--som] [--keep-overlay]
+  som_snapshot    [--selector <css>] [--keep-overlay]
+  click           --mark <n> | --selector <css> | --coordinate-x <n> --coordinate-y <n>
+  click_element   --mark <n> | --selector <css>
+  type            (--mark <n> | --selector <css>) --text <text>
+  get_text        [--selector <css>]
   scroll          [--selector <css>] [--direction up|down] [--amount <px>]
   get_page_info
   execute_js      --script <js>
   find_elements   --selector <css>
-  hover           --selector <css>
+  hover           --mark <n> | --selector <css>
   get_readable
   set_user_agent  --user-agent mobile_chrome|desktop_chrome   (this tab only; aliases mobile, desktop)
   set_viewport    --width <n> --height <n> | --reset
@@ -549,6 +578,10 @@ ACTIONS:
                   (curl/wget/browser export, TAB-separated).
                   Prefer --cookies-file: the JSON's quotes/braces survive
                   the shell intact — write the array to a temp file first.
+  save_auth_profile   [--profile-name <name>]
+  load_auth_profile   [--profile-name <name>]
+  list_auth_profiles
+  delete_auth_profile --profile-name <name>
   scroll_and_collect --scroll-count <n> --item-selector <css> [--keywords <list>]
   wait_for_dom_stable [--timeout <ms>]
 

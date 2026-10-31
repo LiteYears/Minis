@@ -260,17 +260,34 @@ object BrowserAuthVault {
             cookieMgr.setAcceptCookie(true)
             for (c in profile.cookies) {
                 val targetOrigin = c.originUrl.ifBlank { "https://${c.domain}" }
-                val cookiePair = "${c.name}=${c.value}; Path=/"
+                val isHttps = targetOrigin.startsWith("https://", ignoreCase = true)
+                val isHostPrefix = c.name.startsWith("__Host-")
+                val isSecurePrefix = isHostPrefix || c.name.startsWith("__Secure-")
+                val secureAttr = if (isHttps || isSecurePrefix) "; Secure" else ""
+
+                // RFC 6265bis: __Host- cookies MUST have Secure, Path=/, and NO Domain attribute.
+                val cookiePair = "${c.name}=${c.value}; Path=/$secureAttr"
                 cookieMgr.setCookie(targetOrigin, cookiePair)
-                if (c.domain.isNotBlank() && !c.domain.startsWith("localhost")) {
+
+                if (!isHostPrefix && c.domain.isNotBlank() && !c.domain.startsWith("localhost")) {
                     val root = extractRootDomain(c.domain)
                     if (root.isNotBlank()) {
-                        cookieMgr.setCookie("https://$root", "${c.name}=${c.value}; Domain=.$root; Path=/")
+                        cookieMgr.setCookie(
+                            "https://$root",
+                            "${c.name}=${c.value}; Domain=.$root; Path=/$secureAttr",
+                        )
                     }
                 }
                 restoredCookies++
             }
             cookieMgr.flush()
+        }
+
+        // Restore saved User-Agent profile if it differs from the tab's current profile
+        if (profile.userAgentProfile.isNotBlank() &&
+            !profile.userAgentProfile.equals(manager.currentProfile.value, ignoreCase = true)
+        ) {
+            manager.applyUserAgentForVault(profile.userAgentProfile)
         }
 
         // Navigate or reload so cookies & storage take effect on the target origin
@@ -283,15 +300,17 @@ object BrowserAuthVault {
             manager.loadURLAndWaitForVault(profile.savedUrl)
         }
 
-        // Restore localStorage & sessionStorage if we are on the matching origin
+        // Restore localStorage & sessionStorage now that the WebView is on the matching origin
         val restoredStorage = manager.restoreCurrentWebStorage(
             localStorage = profile.localStorage,
             sessionStorage = profile.sessionStorage,
         )
 
-        if (sameDomain && profile.savedUrl.isNotBlank()) {
+        // If we injected storage keys (or were already on the same domain), reload and wait
+        // so SPA startup scripts read the restored localStorage/sessionStorage and cookies.
+        if ((sameDomain || restoredStorage > 0) && profile.savedUrl.isNotBlank()) {
             withContext(Dispatchers.Main) {
-                manager.reload()
+                manager.reloadAndWait()
             }
         }
 
@@ -476,7 +495,13 @@ object BrowserAuthVault {
                 put("version", 1)
                 put("profiles", arr)
             }
-            vaultFile(context).writeText(root.toString())
+            val target = vaultFile(context)
+            val tmp = File(context.filesDir, "$VAULT_FILENAME.tmp")
+            tmp.writeText(root.toString())
+            if (!tmp.renameTo(target)) {
+                target.writeText(root.toString())
+                tmp.delete()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write auth vault: ${e.message}")
         }

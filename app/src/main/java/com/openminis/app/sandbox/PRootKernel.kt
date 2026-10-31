@@ -50,7 +50,7 @@ object PRootKernel {
     private val bootMutex = kotlinx.coroutines.sync.Mutex()
 
     /** Custom environment variables injected into every proot command. */
-    val customEnvironment: MutableMap<String, String> = mutableMapOf()
+    val customEnvironment: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
 
     /**
      * Bind mounts: Linux path -> host filesystem path. GLOBAL mounts only —
@@ -62,7 +62,7 @@ object PRootKernel {
      * wrote last. Those mounts live in each shell's own argv
      * ([SessionMounts]); [addBindMount] refuses them.
      */
-    val bindMounts: MutableMap<String, String> = linkedMapOf()
+    val bindMounts: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
 
     /**
      * [T-android-session-private-mounts] LEGACY fallback for readers that
@@ -816,7 +816,7 @@ object PRootKernel {
         val sorted = bindMounts.keys.sortedByDescending { it.length }
         for (mountPoint in sorted) {
             if (linuxPath == mountPoint || linuxPath.startsWith("$mountPoint/")) {
-                val hostBase = bindMounts[mountPoint]!!
+                val hostBase = bindMounts[mountPoint] ?: continue
                 val relativePath = linuxPath.removePrefix(mountPoint).removePrefix("/")
                 return if (relativePath.isEmpty()) {
                     File(hostBase)

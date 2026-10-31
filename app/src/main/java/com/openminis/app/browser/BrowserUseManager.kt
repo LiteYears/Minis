@@ -844,8 +844,11 @@ class BrowserUseManager(
         return try {
             delay(300) // Let page settle
             val bitmap = captureWebViewBitmap(gpu = true) ?: return result
-            val file = saveBitmapToFile(bitmap, "snapshot", SNAPSHOT_QUALITY)
-            bitmap.recycle()
+            val file = try {
+                saveBitmapToFile(bitmap, "snapshot", SNAPSHOT_QUALITY)
+            } finally {
+                bitmap.recycle()
+            }
             result.copy(imageFilePath = file.absolutePath)
         } catch (e: Exception) {
             Log.w(TAG, "Auto-snapshot failed: ${e.message}")
@@ -1019,15 +1022,20 @@ class BrowserUseManager(
             }
         } ?: return BrowserActionResult.error("Failed to capture screenshot")
 
-        val out = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_QUALITY, out)
-        val jpegBytes = out.toByteArray()
+        val w = bitmap.width
+        val h = bitmap.height
+        val jpegBytes = try {
+            val out = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_QUALITY, out)
+            out.toByteArray()
+        } finally {
+            bitmap.recycle()
+        }
 
-        val file = saveBitmapToFile(bitmap, "screenshot")
+        val filename = "screenshot_${System.currentTimeMillis()}.jpg"
+        val file = File(screenshotsDir, filename)
+        file.writeBytes(jpegBytes)
         val base64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
-
-        val w = bitmap.width; val h = bitmap.height
-        bitmap.recycle()
 
         Log.i(TAG, "Screenshot saved: ${file.absolutePath}, ${w}x$h, ${jpegBytes.size} bytes (full_page=$fullPage)")
 
@@ -2328,6 +2336,20 @@ class BrowserUseManager(
 
     internal suspend fun loadURLAndWaitForVault(url: String) {
         navigate(url)
+    }
+
+    internal suspend fun applyUserAgentForVault(profileName: String) {
+        val target = UserAgentProfile.parse(profileName) ?: return
+        if (target == currentProfile || target == UserAgentProfile.CUSTOM) return
+        currentProfile = target
+        val ua = target.userAgentString
+        withContext(Dispatchers.Main) {
+            if (ua != null) {
+                webView.settings.userAgentString = ua
+            }
+            val (vw, vh) = viewportOverride() ?: target.viewportSize
+            applyViewport(vw, vh)
+        }
     }
 
 }
