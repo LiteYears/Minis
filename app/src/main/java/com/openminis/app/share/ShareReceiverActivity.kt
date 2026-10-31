@@ -274,8 +274,13 @@ class ShareReceiverActivity : ComponentActivity() {
 
     /** Copy a ContentResolver-backed URI to the staging dir. Returns
      *  the staged filename (relative to sharedFileDirectory) or null on
-     *  failure. */
+     *  failure. Rejects file:// URIs or symlinks that resolve inside the
+     *  app's private data directories to prevent self-exfiltration. */
     private fun copyUriToStaging(uri: Uri, mimeType: String): String? {
+        if (isBlockedInternalFileUri(uri)) {
+            AppLogger.warning(TAG, "Blocked share URI targeting internal app storage: $uri")
+            return null
+        }
         val ext = guessExtension(mimeType, uri)
         val prefix = when {
             mimeType.startsWith("image/") -> "shared-image"
@@ -285,13 +290,88 @@ class ShareReceiverActivity : ComponentActivity() {
         val name = "$prefix-${shortId()}${if (ext.isNotEmpty()) ".$ext" else ""}"
         val dest = File(SharedShareStore.sharedFileDirectory(this), name)
         return try {
-            contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { input.copyTo(it) }
-            }
+            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                if (isFdPointingToPrivateAppStorage(pfd)) {
+                    AppLogger.warning(TAG, "Blocked share fd resolving to private app storage: $uri")
+                    return null
+                }
+                java.io.FileInputStream(pfd.fileDescriptor).use { input ->
+                    dest.outputStream().use { out ->
+                        copyBounded(input, out, maxBytes = 256L * 1024 * 1024)
+                    }
+                }
+            } ?: return null
             name
         } catch (e: Exception) {
+            runCatching { dest.delete() }
             AppLogger.warning(TAG, "copyUriToStaging($uri): ${e.message}")
             null
+        }
+    }
+
+    private fun isBlockedInternalFileUri(uri: Uri): Boolean {
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != null && scheme != "file" && scheme != "content") {
+            return true
+        }
+        if (scheme == "file") {
+            val rawPath = uri.path ?: return true
+            val canonical = try {
+                File(rawPath).canonicalPath
+            } catch (_: Exception) {
+                return true
+            }
+            return isPathInsidePrivateAppStorage(canonical)
+        }
+        return false
+    }
+
+    private fun isFdPointingToPrivateAppStorage(pfd: android.os.ParcelFileDescriptor): Boolean {
+        return try {
+            val fdInt = pfd.fd
+            val resolved = android.system.Os.readlink("/proc/self/fd/$fdInt")
+            val canonical = File(resolved).canonicalPath
+            isPathInsidePrivateAppStorage(canonical)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun isPathInsidePrivateAppStorage(canonicalPath: String): Boolean {
+        val allowedRoots = listOfNotNull(
+            runCatching { SharedShareStore.sharedFileDirectory(this).canonicalPath }.getOrNull(),
+            runCatching { File(filesDir, "logs").canonicalPath }.getOrNull(),
+            runCatching { File(filesDir, "rootfs/root").canonicalPath }.getOrNull(),
+            runCatching { File(filesDir, "rootfs/tmp").canonicalPath }.getOrNull(),
+            runCatching { File(filesDir, "minis-sessions").canonicalPath }.getOrNull(),
+        )
+        if (allowedRoots.any { canonicalPath == it || canonicalPath.startsWith("$it${File.separator}") }) {
+            return false
+        }
+        val privateRoots = listOfNotNull(
+            runCatching { File(applicationInfo.dataDir).canonicalPath }.getOrNull(),
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                runCatching { File(applicationInfo.deviceProtectedDataDir).canonicalPath }.getOrNull()
+            } else null,
+        )
+        return privateRoots.any { canonicalPath == it || canonicalPath.startsWith("$it${File.separator}") }
+    }
+
+    private fun copyBounded(
+        input: java.io.InputStream,
+        out: java.io.OutputStream,
+        maxBytes: Long,
+    ) {
+        val buf = ByteArray(DEFAULT_BUFFER_SIZE)
+        var total = 0L
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            total += n
+            if (total > maxBytes) {
+                throw java.io.IOException("Shared stream exceeds maximum allowed size ($maxBytes bytes)")
+            }
+            out.write(buf, 0, n)
         }
     }
 

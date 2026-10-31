@@ -234,7 +234,7 @@ class OAuthCallbackServer(
                 var bound = false
                 for (p in portsToTry) {
                     try {
-                        serverSocket = ServerSocket(p)
+                        serverSocket = ServerSocket(p, 50, java.net.InetAddress.getByName("127.0.0.1"))
                         boundPort = p
                         bound = true
                         break
@@ -275,9 +275,14 @@ class OAuthCallbackServer(
                                     origin = h.substringAfter(":").trim()
                                 }
                             }
-                            val trustedHosts = listOf("auth.x.ai", "accounts.x.ai")
-                            val allowOrigin = if (origin != null && trustedHosts.any { origin!!.contains(it) }) {
-                                origin
+                            val trustedHosts = setOf("auth.x.ai", "accounts.x.ai")
+                            val parsedOrigin = origin?.let { runCatching { java.net.URI(it) }.getOrNull() }
+                            val allowOrigin = if (
+                                parsedOrigin != null &&
+                                parsedOrigin.scheme?.lowercase() == "https" &&
+                                parsedOrigin.host?.lowercase() in trustedHosts
+                            ) {
+                                "${parsedOrigin.scheme.lowercase()}://${parsedOrigin.host.lowercase()}"
                             } else {
                                 "null"
                             }

@@ -162,15 +162,21 @@ class DebugServer(
                 var contentLength = 0
                 var providedToken: String? = null
                 var accept = ""
-                while (true) {
+                var isBrowserCrossOriginRequest = false
+                var headerCount = 0
+                while (headerCount < 128) {
                     val headerLine = reader.readLine() ?: break
                     if (headerLine.isEmpty()) break
+                    headerCount++
                     val lower = headerLine.lowercase()
                     if (lower.startsWith("content-length:")) {
                         contentLength = headerLine.substringAfter(":").trim().toIntOrNull() ?: 0
                     }
                     if (lower.startsWith("accept:")) {
                         accept = lower.substringAfter(":").trim()
+                    }
+                    if (lower.startsWith("origin:") || lower.startsWith("sec-fetch-site:")) {
+                        isBrowserCrossOriginRequest = true
                     }
                     // [T-android-debugserver-auth] Token via X-Minis-Token or
                     // Authorization: Bearer — either spelling accepted.
@@ -186,9 +192,12 @@ class DebugServer(
                 }
 
                 // [T-android-debugserver-auth] Gate BEFORE any RPC dispatch:
-                // loopback (adb forward) is exempt; LAN clients need the token.
+                // loopback (adb forward) is exempt for non-browser CLI tools;
+                // LAN clients and browser-originated requests ALWAYS require the token
+                // to prevent drive-by localhost CSRF from malicious web pages.
                 val isLoopback = s.inetAddress?.isLoopbackAddress == true
-                if (!isAuthorized(isLoopback, providedToken, authToken)) {
+                val allowLoopbackBypass = isLoopback && !isBrowserCrossOriginRequest
+                if (!isAuthorized(allowLoopbackBypass, providedToken, authToken)) {
                     Log.w(TAG, "401 unauthorized ${if (isLoopback) "loopback" else s.inetAddress?.hostAddress ?: "?"} (missing/wrong token)")
                     sendResponse(writer, 401, rpcHandler.errorJSON(-32000, "Unauthorized — send X-Minis-Token (see `adb shell run-as com.openminis.app cat files/debug_server_token`)"))
                     return
@@ -241,6 +250,10 @@ class DebugServer(
 
                 if (contentLength <= 0) {
                     sendResponse(writer, 400, rpcHandler.errorJSON(-32700, "Empty body"))
+                    return
+                }
+                if (contentLength > 32 * 1024 * 1024) {
+                    sendResponse(writer, 400, rpcHandler.errorJSON(-32600, "Request body too large"))
                     return
                 }
 
@@ -379,13 +392,14 @@ class DebugServer(
         fun readLine(): String? {
             buf.reset()
             var sawAny = false
-            while (true) {
+            while (buf.size() < 64 * 1024) {
                 val b = input.read()
                 if (b < 0) return if (sawAny) buf.toString("UTF-8") else null
                 sawAny = true
                 if (b == '\n'.code) return buf.toString("UTF-8")
                 if (b != '\r'.code) buf.write(b)
             }
+            return buf.toString("UTF-8")
         }
 
         /** Reads exactly [len] BYTES into [dst], returning how many arrived. */

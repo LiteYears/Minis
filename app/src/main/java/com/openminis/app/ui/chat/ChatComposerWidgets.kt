@@ -594,6 +594,7 @@ private fun ToolPreviewThumbnail(
                 (remember(block.content, block.toolStatus, block.toolTitle) { parseHelperBlock(block) }.phase as? HelperPhase.Running)?.tool != null
             )
     val subAgentGlow = helperAccent()
+    val thumbBorderColor = if (isLive) toolAccent.copy(alpha = 0.55f) else ChatColors.thumbnailBorder
     Box(
         modifier = Modifier
             .size(width = 100.dp, height = 65.dp)
@@ -606,9 +607,16 @@ private fun ToolPreviewThumbnail(
                     else -> Color(0xFF1A1A1E)
                 }
             )
-            .border(0.5.dp, ChatColors.thumbnailBorder, thumbnailShape)
+            .border(if (isLive) 0.85.dp else 0.5.dp, thumbBorderColor, thumbnailShape)
             .drawWithContent {
                 drawContent()
+                if (isLive && !subAgentLive) {
+                    drawRect(
+                        color = toolAccent.copy(alpha = 0.75f),
+                        topLeft = Offset.Zero,
+                        size = Size(size.width, 1.5.dp.toPx()),
+                    )
+                }
                 if (!subAgentLive) return@drawWithContent
                 // An INNER glow: concentric strokes walking inward from the
                 // edge, drawn after the content and inside the clip so the
@@ -1125,6 +1133,31 @@ internal fun FloatingToolStatusBar(
             .padding(top = if (previewEnabled) thumbnailOverhang else 0.dp),  // reserve space for overhang
     ) {
         // Layer 1: Status bar (bottom layer, fills from bottom)
+        val statusAccent = when {
+            isRunning -> toolAccent
+            isDone -> ToolCheckColor
+            isFailed -> ToolErrorColor
+            isCancelled -> ToolCancelColor
+            else -> toolAccent
+        }
+        val inputBgColor = ChatColors.inputBg
+        val toolBorderColor = ChatColors.toolBorder
+        val barSurfaceBrush = remember(statusAccent, isRunning, inputBgColor) {
+            Brush.horizontalGradient(
+                colors = listOf(
+                    inputBgColor,
+                    statusAccent.copy(alpha = if (isRunning) 0.11f else 0.045f),
+                ),
+            )
+        }
+        val barBorderBrush = remember(statusAccent, isRunning, toolBorderColor) {
+            Brush.horizontalGradient(
+                colors = listOf(
+                    statusAccent.copy(alpha = if (isRunning) 0.45f else 0.24f),
+                    toolBorderColor,
+                ),
+            )
+        }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1132,33 +1165,42 @@ internal fun FloatingToolStatusBar(
                 .align(Alignment.BottomCenter)
                 .shadow(elevation = 8.dp, shape = RoundedCornerShape(10.dp), ambientColor = Color.Black.copy(alpha = 0.06f), spotColor = Color.Black.copy(alpha = 0.12f))
                 .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
-                .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp))
-                .padding(start = barStartPadding, end = 12.dp),
+                .background(barSurfaceBrush, RoundedCornerShape(10.dp))
+                .border(0.75.dp, barBorderBrush, RoundedCornerShape(10.dp))
+                .padding(start = barStartPadding, end = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Status icon
-            if (isRunning) {
-                // [T-android-decorative-anim-perf] Clock-driven arc, not
-                // Material's spinner. A layer boundary alone still left the
-                // screen at 87 fps: Material's private InfiniteTransition asks
-                // for every frame regardless of who wraps it. This records the
-                // arc once and rotates a layer at ~30 fps.
-                DecorativeSpinner(
-                    color = toolAccent,
-                    modifier = Modifier.size(15.dp),
-                    strokeWidth = 1.5.dp,
-                )
-            } else {
-                val (icon, tint) = when {
-                    isDone -> Icons.Default.CheckCircle to ToolCheckColor
-                    isFailed -> Icons.Default.Error to ToolErrorColor
-                    isCancelled -> Icons.Default.Close to ToolCancelColor
-                    else -> Icons.Default.Build to MaterialTheme.colorScheme.onSurfaceVariant
+            // Status icon housed in a subtle 22dp circular badge
+            Box(
+                modifier = Modifier
+                    .size(22.dp)
+                    .background(statusAccent.copy(alpha = 0.14f), CircleShape)
+                    .border(0.5.dp, statusAccent.copy(alpha = 0.28f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (isRunning) {
+                    // [T-android-decorative-anim-perf] Clock-driven arc, not
+                    // Material's spinner. A layer boundary alone still left the
+                    // screen at 87 fps: Material's private InfiniteTransition asks
+                    // for every frame regardless of who wraps it. This records the
+                    // arc once and rotates a layer at ~30 fps.
+                    DecorativeSpinner(
+                        color = toolAccent,
+                        modifier = Modifier.size(13.dp),
+                        strokeWidth = 1.5.dp,
+                    )
+                } else {
+                    val (icon, tint) = when {
+                        isDone -> Icons.Default.CheckCircle to ToolCheckColor
+                        isFailed -> Icons.Default.Error to ToolErrorColor
+                        isCancelled -> Icons.Default.Close to ToolCancelColor
+                        else -> Icons.Default.Build to MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                    Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(13.dp))
                 }
-                Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(15.dp))
             }
 
-            Spacer(modifier = Modifier.width(6.dp))
+            Spacer(modifier = Modifier.width(8.dp))
 
             // [T-step-timestamp v2 aa8b1128] Inline HH:mm:ss prefix
             // removed — see ToolDetailSheet header for the new
@@ -1199,7 +1241,13 @@ internal fun FloatingToolStatusBar(
             if (toolBlocks.size > 1) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(0.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    modifier = Modifier
+                        .background(
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.055f),
+                            RoundedCornerShape(50),
+                        )
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
                 ) {
                     Icon(
                         Icons.Default.ChevronLeft,
@@ -1207,7 +1255,7 @@ internal fun FloatingToolStatusBar(
                         tint = if (currentIndex > 0) MaterialTheme.colorScheme.onSurface
                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
                         modifier = Modifier
-                            .size(18.dp)
+                            .size(17.dp)
                             // [T-android-tool-pager-longpress] Long-press jumps
                             // to the first call. A turn can carry 60+ tool
                             // calls, and stepping back one at a time is the
@@ -1229,9 +1277,10 @@ internal fun FloatingToolStatusBar(
                     )
                     Text(
                         "${currentIndex + 1}/${toolBlocks.size}",
-                        fontSize = 11.sp,
+                        fontSize = 10.5.sp,
                         fontWeight = FontWeight.Medium,
                         fontFamily = FontFamily.Monospace,
+                        style = TextStyle(fontFeatureSettings = "tnum"),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         // [T-android-tool-pager-a11y] Say what this counts.
                         // It sits immediately right of the tool TITLE, so when
@@ -1250,7 +1299,7 @@ internal fun FloatingToolStatusBar(
                         tint = if (currentIndex < toolBlocks.lastIndex) MaterialTheme.colorScheme.onSurface
                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
                         modifier = Modifier
-                            .size(18.dp)
+                            .size(17.dp)
                             // [T-android-tool-pager-longpress] Long-press jumps
                             // to the last call — the live one while a turn is
                             // still running, which is the position this bar

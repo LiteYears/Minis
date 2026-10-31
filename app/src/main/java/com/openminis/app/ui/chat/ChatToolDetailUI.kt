@@ -341,12 +341,31 @@ internal fun ToolDetailSheet(
                 // out to the inline ToolCallPill's trailing column (under
                 // the elapsed-duration text) so it sits next to where the
                 // user is already scanning timing info.
-                Text(
-                    text = "Minis Computer",
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = ChatColors.primaryText,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(22.dp)
+                            .background(toolAccent.copy(alpha = 0.15f), CircleShape)
+                            .border(0.5.dp, toolAccent.copy(alpha = 0.32f), CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            toolIconFor(block.toolName),
+                            contentDescription = null,
+                            tint = toolAccent,
+                            modifier = Modifier.size(12.dp),
+                        )
+                    }
+                    Text(
+                        text = "Minis Computer",
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = ChatColors.primaryText,
+                    )
+                }
 
                 Spacer(modifier = Modifier.weight(1f))
 
@@ -518,69 +537,117 @@ internal fun ToolDetailSheet(
                             // 11sp text ≈ 22dp). Reserve enough bottom padding
                             // inside the scroll content so the last output line
                             // never slides under the HUD when scrolled to end.
-                            val hudReservePadding = if (isLive) 28.dp else 0.dp
+                            val hudReservePadding = if (isLive) 32.dp else 0.dp
+                            val termBorderColor = if (isLive) Color(0xFF34C759).copy(alpha = 0.45f) else Color(0xFF404040)
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .fillMaxHeight()
                                     .heightIn(min = cardMinHeight)
                                     .clip(RoundedCornerShape(10.dp))
-                                    .background(Color.Black)
+                                    .background(Color(0xFF0A0A0D))
                                     .border(
-                                        width = 0.5.dp,
-                                        color = Color(0xFF404040),
+                                        width = 0.75.dp,
+                                        color = termBorderColor,
                                         shape = RoundedCornerShape(10.dp),
                                     ),
                             ) {
-                                // T193 (supersedes T191): nested SelectionContainer
-                                // gives shell output its own SelectionRegistrar so a
-                                // long-press inside the ToolLiveSheet copy stays within
-                                // this subtree (no cross-tree findCommonAncestor crash)
-                                // while still letting the user select / copy command
-                                // output and the linkified URLs inside it.
-                                androidx.compose.foundation.text.selection.SelectionContainer {
-                                    Column(
+                                Column(modifier = Modifier.fillMaxSize()) {
+                                    // Terminal top bar (window controls + shell badge)
+                                    Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .verticalScroll(outputScrollState)
-                                            .padding(14.dp)
-                                            .padding(bottom = hudReservePadding),
+                                            .background(Color(0xFF16161B))
+                                            .padding(horizontal = 12.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
                                     ) {
+                                        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                            Box(modifier = Modifier.size(7.dp).background(Color(0xFFFF5F56), CircleShape))
+                                            Box(modifier = Modifier.size(7.dp).background(Color(0xFFFFBD2E), CircleShape))
+                                            Box(modifier = Modifier.size(7.dp).background(Color(0xFF27C93F), CircleShape))
+                                        }
+                                        Spacer(modifier = Modifier.width(10.dp))
                                         Text(
-                                            text = "$ ${remember(command) { ToolTextTail.capLongLines(command) }}",
-                                            fontSize = 13.sp,
-                                            fontWeight = FontWeight.Bold,
+                                            text = "bash · alpine",
+                                            fontSize = 11.sp,
                                             fontFamily = FontFamily.Monospace,
-                                            color = Color.White,
-                                            lineHeight = 18.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            color = Color.White.copy(alpha = 0.55f),
                                         )
-                                        if (block.content.isNotEmpty()) {
-                                            // T38: linkify http/https URLs in shell output so the user can
-                                            // tap them to open the in-app web preview (matches iOS
-                                            // TerminalCanvasView.addURLLinks → MinisOpenURLBroker).
-                                            val urlClick = LocalMarkdownUrlClickHandler.current
-                                            // [T-android-tool-text-line-cap] One huge line here
-                                            // froze the main thread the same way it did in the
-                                            // preview tile, and this sheet is one tap away from
-                                            // it. Only the display is cut; Copy above still
-                                            // copies block.content whole.
-                                            val linkified = remember(block.content, urlClick) {
-                                                val shown = ToolTextTail.capLongLines(block.content)
-                                                if (urlClick != null) {
-                                                    com.openminis.app.ui.util.linkifyUrls(
-                                                        text = shown,
-                                                        onClick = urlClick,
-                                                        linkColor = Color(0xFF7CC4FF), // light blue on dark terminal bg
-                                                    )
-                                                } else androidx.compose.ui.text.AnnotatedString(shown)
+                                        Spacer(modifier = Modifier.weight(1f))
+                                        if (isLive) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                modifier = Modifier
+                                                    .background(Color(0xFF34C759).copy(alpha = 0.15f), RoundedCornerShape(50))
+                                                    .padding(horizontal = 6.dp, vertical = 1.5.dp),
+                                            ) {
+                                                Box(modifier = Modifier.size(5.dp).background(Color(0xFF34C759), CircleShape))
+                                                Text(
+                                                    text = "EXEC",
+                                                    fontSize = 9.5.sp,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color(0xFF34C759),
+                                                )
                                             }
+                                        }
+                                    }
+                                    HorizontalDivider(thickness = 0.5.dp, color = Color(0xFF282830))
+
+                                    // T193 (supersedes T191): nested SelectionContainer
+                                    // gives shell output its own SelectionRegistrar so a
+                                    // long-press inside the ToolLiveSheet copy stays within
+                                    // this subtree (no cross-tree findCommonAncestor crash)
+                                    // while still letting the user select / copy command
+                                    // output and the linkified URLs inside it.
+                                    androidx.compose.foundation.text.selection.SelectionContainer {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .weight(1f)
+                                                .verticalScroll(outputScrollState)
+                                                .padding(14.dp)
+                                                .padding(bottom = hudReservePadding),
+                                        ) {
                                             Text(
-                                                text = linkified,
+                                                text = "$ ${remember(command) { ToolTextTail.capLongLines(command) }}",
                                                 fontSize = 13.sp,
+                                                fontWeight = FontWeight.Bold,
                                                 fontFamily = FontFamily.Monospace,
-                                                color = Color(0xFF34C759),  // iOS .green
+                                                color = Color.White,
                                                 lineHeight = 18.sp,
                                             )
+                                            if (block.content.isNotEmpty()) {
+                                                Spacer(modifier = Modifier.height(6.dp))
+                                                // T38: linkify http/https URLs in shell output so the user can
+                                                // tap them to open the in-app web preview (matches iOS
+                                                // TerminalCanvasView.addURLLinks → MinisOpenURLBroker).
+                                                val urlClick = LocalMarkdownUrlClickHandler.current
+                                                // [T-android-tool-text-line-cap] One huge line here
+                                                // froze the main thread the same way it did in the
+                                                // preview tile, and this sheet is one tap away from
+                                                // it. Only the display is cut; Copy above still
+                                                // copies block.content whole.
+                                                val linkified = remember(block.content, urlClick) {
+                                                    val shown = ToolTextTail.capLongLines(block.content)
+                                                    if (urlClick != null) {
+                                                        com.openminis.app.ui.util.linkifyUrls(
+                                                            text = shown,
+                                                            onClick = urlClick,
+                                                            linkColor = Color(0xFF7CC4FF), // light blue on dark terminal bg
+                                                        )
+                                                    } else androidx.compose.ui.text.AnnotatedString(shown)
+                                                }
+                                                Text(
+                                                    text = linkified,
+                                                    fontSize = 13.sp,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    color = Color(0xFF34C759),  // iOS .green
+                                                    lineHeight = 18.sp,
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -595,8 +662,8 @@ internal fun ToolDetailSheet(
                                         modifier = Modifier
                                             .align(Alignment.BottomCenter)
                                             .fillMaxWidth()
-                                            .background(Color(0xFF141414))
-                                            .padding(vertical = 2.5.dp),
+                                            .background(Color(0xFF141418).copy(alpha = 0.94f))
+                                            .padding(vertical = 4.dp),
                                         horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
@@ -605,13 +672,20 @@ internal fun ToolDetailSheet(
                                             fontSize = 11.sp,
                                             fontWeight = FontWeight.Medium,
                                             fontFamily = FontFamily.Monospace,
+                                            style = TextStyle(fontFeatureSettings = "tnum"),
                                             color = Color(0xFF34C759),  // iOS .green
+                                        )
+                                        Text(
+                                            text = "·",
+                                            fontSize = 11.sp,
+                                            color = Color.White.copy(alpha = 0.35f),
                                         )
                                         Text(
                                             text = sheetMonitor.formattedMem(),
                                             fontSize = 11.sp,
                                             fontWeight = FontWeight.Medium,
                                             fontFamily = FontFamily.Monospace,
+                                            style = TextStyle(fontFeatureSettings = "tnum"),
                                             color = Color(0xFF34C759),
                                         )
                                     }
@@ -1184,25 +1258,34 @@ internal fun ToolDetailSheet(
                         .padding(top = 10.dp, bottom = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // Status icon (iOS: 18x18)
-                    if (isLive) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            color = toolAccent,
-                            strokeWidth = 2.dp,
-                        )
-                    } else {
-                        val (icon, tint) = when (block.toolStatus) {
-                            ToolBlockStatus.SUCCESS -> Icons.Default.CheckCircle to ToolCheckColor
-                            ToolBlockStatus.FAILED -> Icons.Default.Error to ToolErrorColor
-                            ToolBlockStatus.CANCELLED -> Icons.Default.Cancel to ToolCancelColor
-                            ToolBlockStatus.TIMEOUT -> Icons.Default.Schedule to ToolErrorColor
-                            else -> Icons.Default.CheckCircle to ToolCheckColor
+                    // Status icon housed in a 28dp circular badge
+                    val (statusIcon, statusTint) = when (block.toolStatus) {
+                        ToolBlockStatus.SUCCESS -> Icons.Default.CheckCircle to ToolCheckColor
+                        ToolBlockStatus.FAILED -> Icons.Default.Error to ToolErrorColor
+                        ToolBlockStatus.CANCELLED -> Icons.Default.Cancel to ToolCancelColor
+                        ToolBlockStatus.TIMEOUT -> Icons.Default.Schedule to ToolErrorColor
+                        else -> Icons.Default.CheckCircle to ToolCheckColor
+                    }
+                    val badgeAccent = if (isLive) toolAccent else statusTint
+                    Box(
+                        modifier = Modifier
+                            .size(28.dp)
+                            .background(badgeAccent.copy(alpha = 0.14f), CircleShape)
+                            .border(0.5.dp, badgeAccent.copy(alpha = 0.28f), CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (isLive) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(15.dp),
+                                color = toolAccent,
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            Icon(statusIcon, contentDescription = null, tint = statusTint, modifier = Modifier.size(16.dp))
                         }
-                        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(18.dp))
                     }
 
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
 
                     // Title + subtitle
                     Column(modifier = Modifier.weight(1f)) {
@@ -1248,6 +1331,7 @@ internal fun ToolDetailSheet(
                                     text = formatToolDuration(shownDurationMs),
                                     fontSize = 11.sp,
                                     fontFamily = FontFamily.Monospace,
+                                    style = TextStyle(fontFeatureSettings = "tnum"),
                                     color = ChatColors.tertiaryText,
                                 )
                             }
@@ -1256,6 +1340,7 @@ internal fun ToolDetailSheet(
                                     text = formatStepTimestamp(block.startTimeMs),
                                     fontSize = 9.sp,
                                     fontFamily = FontFamily.Monospace,
+                                    style = TextStyle(fontFeatureSettings = "tnum"),
                                     color = ChatColors.tertiaryText.copy(alpha = 0.75f),
                                 )
                             }
@@ -1291,7 +1376,11 @@ internal fun ToolDetailSheet(
                     if (isLive) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            modifier = Modifier
+                                .background(Color(0xFF34C759).copy(alpha = 0.14f), RoundedCornerShape(50))
+                                .border(0.5.dp, Color(0xFF34C759).copy(alpha = 0.32f), RoundedCornerShape(50))
+                                .padding(horizontal = 10.dp, vertical = 3.dp),
                         ) {
                             Box(
                                 modifier = Modifier
@@ -1300,19 +1389,27 @@ internal fun ToolDetailSheet(
                             )
                             Text(
                                 "Live",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = ChatColors.primaryText,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF34C759),
                             )
                         }
                     } else {
-                        Text(
-                            "${currentIdx + 1} / ${toolBlocks.size}",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Medium,
-                            fontFamily = FontFamily.Monospace,
-                            color = ChatColors.secondaryText,
-                        )
+                        Box(
+                            modifier = Modifier
+                                .background(ChatColors.secondaryBg, RoundedCornerShape(50))
+                                .padding(horizontal = 10.dp, vertical = 3.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                "${currentIdx + 1} / ${toolBlocks.size}",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                fontFamily = FontFamily.Monospace,
+                                style = TextStyle(fontFeatureSettings = "tnum"),
+                                color = ChatColors.secondaryText,
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.weight(1f))

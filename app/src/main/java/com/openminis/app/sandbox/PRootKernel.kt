@@ -787,6 +787,54 @@ object PRootKernel {
     private val perSessionSubdirs = SessionMounts.SESSION_SUBDIRS.toSet()
 
     /**
+     * Normalize a virtual Linux path by collapsing `.` and `..` segments
+     * so mount matching and relative path extraction cannot be bypassed
+     * via `/var/minis/workspace/../../...`.
+     */
+    private fun normalizeLinuxPath(rawPath: String): String {
+        val segments = ArrayDeque<String>()
+        for (part in rawPath.split('/')) {
+            when (part) {
+                "", "." -> Unit
+                ".." -> if (segments.isNotEmpty()) segments.removeLast()
+                else -> segments.addLast(part)
+            }
+        }
+        return "/" + segments.joinToString("/")
+    }
+
+    /**
+     * Resolve [relativePath] inside [baseDir] and verify that the resulting
+     * path does not escape [baseDir] via `..` segments or symlinks pointing
+     * into sensitive host app directories (`shared_prefs`, `databases`, etc.).
+     */
+    private fun resolveContainedFile(baseDir: File, relativePath: String): File? {
+        val candidate = if (relativePath.isEmpty()) baseDir else File(baseDir, relativePath)
+        return try {
+            val baseCanonical = baseDir.canonicalPath
+            val candidateCanonical = candidate.canonicalPath
+            val basePrefix = if (baseCanonical.endsWith(File.separator)) baseCanonical else baseCanonical + File.separator
+            if (candidateCanonical == baseCanonical || candidateCanonical.startsWith(basePrefix)) {
+                candidate
+            } else {
+                Log.w(TAG, "Blocked path escape outside mount root: $relativePath -> $candidateCanonical (base=$baseCanonical)")
+                null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to canonicalize path $candidate: ${e.message}")
+            null
+        }
+    }
+
+    private fun isSafeSessionId(sessionId: String): Boolean =
+        sessionId.isNotEmpty() &&
+            sessionId != "." &&
+            sessionId != ".." &&
+            !sessionId.contains('/') &&
+            !sessionId.contains('\\') &&
+            !sessionId.contains('\u0000')
+
+    /**
      * Resolve a `/var/minis/...` Linux path directly against a specific session's
      * host directory, bypassing the global [bindMounts] map. Use this when the
      * caller knows the owning session (chat link resolver, file preview, etc.) —
@@ -797,53 +845,56 @@ object PRootKernel {
      * shared subdirs (memory/skills/shared) which don't depend on sessionId.
      */
     fun resolveSessionHostPath(sessionId: String, linuxPath: String, context: Context): File? {
-        if (!linuxPath.startsWith("/var/minis/")) return resolveHostPath(linuxPath)
-        val rest = linuxPath.removePrefix("/var/minis/")
+        val normalized = normalizeLinuxPath(linuxPath)
+        if (!normalized.startsWith("/var/minis/")) return resolveHostPath(normalized)
+        if (!isSafeSessionId(sessionId)) {
+            Log.w(TAG, "Rejected unsafe sessionId in resolveSessionHostPath: $sessionId")
+            return null
+        }
+        val rest = normalized.removePrefix("/var/minis/")
         val slash = rest.indexOf('/')
         val subdir = if (slash < 0) rest else rest.substring(0, slash)
-        if (subdir !in perSessionSubdirs) return resolveHostPath(linuxPath)
+        if (subdir !in perSessionSubdirs) return resolveHostPath(normalized)
         val sessionBase = File(context.filesDir, "minis-sessions/$sessionId/$subdir")
         val tail = if (slash < 0) "" else rest.substring(slash + 1)
-        return if (tail.isEmpty()) sessionBase else File(sessionBase, tail)
+        return resolveContainedFile(sessionBase, tail)
     }
 
     /**
      * Resolve a Linux path to a host filesystem File by checking bind mounts.
-     * Returns null if no matching mount is found.
+     * Returns null if no matching mount is found or if the resolved path escapes its mount root.
      */
     fun resolveHostPath(linuxPath: String): File? {
+        val normalized = normalizeLinuxPath(linuxPath)
         // Check bind mounts (longest prefix match)
         val sorted = bindMounts.keys.sortedByDescending { it.length }
         for (mountPoint in sorted) {
-            if (linuxPath == mountPoint || linuxPath.startsWith("$mountPoint/")) {
+            if (normalized == mountPoint || normalized.startsWith("$mountPoint/")) {
                 val hostBase = bindMounts[mountPoint] ?: continue
-                val relativePath = linuxPath.removePrefix(mountPoint).removePrefix("/")
-                return if (relativePath.isEmpty()) {
-                    File(hostBase)
-                } else {
-                    File(hostBase, relativePath)
-                }
+                val relativePath = normalized.removePrefix(mountPoint).removePrefix("/")
+                return resolveContainedFile(File(hostBase), relativePath)
             }
         }
 
         // [T-android-session-private-mounts] Per-session path with no session
         // context: the legacy "most recent session" answer (see
         // [legacySessionId]). Logged so the remaining callers stay findable.
-        if (isPerSessionPath(linuxPath)) {
+        if (isPerSessionPath(normalized)) {
             val sid = legacySessionId
             val filesDir = legacyFilesDir
-            if (sid != null && filesDir != null) {
+            if (sid != null && filesDir != null && isSafeSessionId(sid)) {
                 legacyResolveCount++
-                val rest = linuxPath.removePrefix("/var/minis/")
-                Log.d(TAG, "legacy session resolve $linuxPath -> session $sid")
-                return File(filesDir, "minis-sessions/$sid/$rest")
+                val rest = normalized.removePrefix("/var/minis/")
+                Log.d(TAG, "legacy session resolve $normalized -> session $sid")
+                val sessionRoot = File(filesDir, "minis-sessions/$sid")
+                return resolveContainedFile(sessionRoot, rest)
             }
         }
 
         // Fallback: resolve relative to rootfs
         if (!::rootfsManager.isInitialized) return null
-        val stripped = linuxPath.removePrefix("/")
-        return if (stripped.isEmpty()) rootfsManager.rootfsDir else File(rootfsManager.rootfsDir, stripped)
+        val stripped = normalized.removePrefix("/")
+        return resolveContainedFile(rootfsManager.rootfsDir, stripped)
     }
 
     /**

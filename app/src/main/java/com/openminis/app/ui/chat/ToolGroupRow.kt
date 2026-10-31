@@ -1,6 +1,8 @@
 package com.openminis.app.ui.chat
 
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -22,6 +24,8 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -49,16 +53,26 @@ internal fun ToolGroupRow(item: FlatChatItem.AssistantToolGroup, onToggle: () ->
         if (item.failedCount > 0) add(failed)
         if (item.cancelledCount > 0) add(cancelled)
     }.joinToString(", ")
-    val chevronAngle = animateFloatAsState(if (item.expanded) 90f else 0f, label = "toolGroupChevron")
+    val chevronAngle = animateFloatAsState(
+        targetValue = if (item.expanded) 90f else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "toolGroupChevron",
+    )
     val text = buildAnnotatedString {
-        append(title)
+        withStyle(SpanStyle(fontWeight = FontWeight.Medium)) { append(title) }
         if (duration != null) {
             append(" · ")
-            withStyle(SpanStyle(fontFeatureSettings = "tnum")) { append(duration) }
+            withStyle(
+                SpanStyle(
+                    fontFamily = FontFamily.Monospace,
+                    fontFeatureSettings = "tnum",
+                    fontSize = 11.5.sp,
+                ),
+            ) { append(duration) }
         }
         if (item.failedCount > 0) {
             append(" · ")
-            withStyle(SpanStyle(color = ToolErrorColor)) { append(failed) }
+            withStyle(SpanStyle(color = ToolErrorColor, fontWeight = FontWeight.Medium)) { append(failed) }
         }
         if (item.cancelledCount > 0) {
             append(" · ")
@@ -85,7 +99,7 @@ internal fun ToolGroupRow(item: FlatChatItem.AssistantToolGroup, onToggle: () ->
                 },
         ) {
             FoldChevron(angle = chevronAngle.value, color = ChatColors.secondaryText)
-            Spacer(Modifier.width(5.dp))
+            Spacer(Modifier.width(6.dp))
             Text(
                 text = text,
                 fontSize = 13.sp,

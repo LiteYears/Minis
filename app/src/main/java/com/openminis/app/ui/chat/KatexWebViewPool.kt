@@ -230,6 +230,11 @@ internal object KatexWebViewPool {
             setBackgroundColor(Color.TRANSPARENT)
             settings.javaScriptEnabled = true
             settings.allowFileAccess = true
+            settings.allowContentAccess = false
+            @Suppress("DEPRECATION")
+            settings.allowFileAccessFromFileURLs = false
+            @Suppress("DEPRECATION")
+            settings.allowUniversalAccessFromFileURLs = false
             settings.cacheMode = WebSettings.LOAD_NO_CACHE
             addJavascriptInterface(JsBridge { w, h, err ->
                 pending?.complete(Triple(w, h, err))
@@ -375,6 +380,8 @@ internal object KatexWebViewPool {
             .replace("'", "\\'")
             .replace("\n", "\\n")
             .replace("\r", "")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
 
     private class JsBridge(private val onResult: (Int, Int, String) -> Unit) {
         @JavascriptInterface

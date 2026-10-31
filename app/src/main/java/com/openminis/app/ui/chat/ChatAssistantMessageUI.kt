@@ -32,7 +32,12 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -695,7 +700,7 @@ private fun ToolStopButton(
         Box(
             modifier = Modifier
                 .requiredSize(24.dp)
-                .clip(RoundedCornerShape(6.dp))
+                .clip(CircleShape)
                 .clickable(
                     onClickLabel = label,
                     onClick = onStop,
@@ -704,10 +709,18 @@ private fun ToolStopButton(
         ) {
             Box(
                 modifier = Modifier
-                    .size(10.dp)
-                    .clip(RoundedCornerShape(2.dp))
-                    .background(Color(0xFFFF3B30)),
-            )
+                    .size(18.dp)
+                    .background(Color(0xFFFF3B30).copy(alpha = 0.16f), CircleShape)
+                    .border(0.5.dp, Color(0xFFFF3B30).copy(alpha = 0.35f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(Color(0xFFFF3B30)),
+                )
+            }
         }
     }
 }
@@ -864,6 +877,38 @@ internal fun ToolCallPill(
     // Pill stretches up to the full row width so long titles can ellipsize
     // without pushing the duration out of view. Title takes the remaining
     // space via weight(1f), duration stays fixed-width (softWrap=false).
+    val capsuleBg = ChatColors.toolCapsuleBg
+    val toolBorderColor = ChatColors.toolBorder
+    val pillSurfaceBrush = remember(iconTint, toolAccent, isRunning, isFailed, capsuleBg) {
+        val leadTint = if (isRunning) toolAccent else iconTint
+        val leadAlpha = when {
+            isRunning -> 0.14f
+            isFailed -> 0.10f
+            else -> 0.06f
+        }
+        Brush.horizontalGradient(
+            colors = listOf(
+                leadTint.copy(alpha = leadAlpha),
+                capsuleBg,
+                capsuleBg,
+            ),
+        )
+    }
+    val pillBorderBrush = remember(iconTint, toolAccent, isRunning, isFailed, isDone, toolBorderColor) {
+        val leadTint = if (isRunning) toolAccent else iconTint
+        val leadAlpha = when {
+            isRunning -> 0.48f
+            isFailed -> 0.42f
+            isDone -> 0.28f
+            else -> 0.22f
+        }
+        Brush.horizontalGradient(
+            colors = listOf(
+                leadTint.copy(alpha = leadAlpha),
+                toolBorderColor,
+            ),
+        )
+    }
     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
       Box(modifier = Modifier.weight(1f, fill = false)) {
         Row(
@@ -872,7 +917,11 @@ internal fun ToolCallPill(
                     ChatColors.toolCapsuleBg,
                     CircleShape,
                 )
-                .border(0.5.dp, ChatColors.toolBorder, CircleShape)
+                .background(
+                    pillSurfaceBrush,
+                    CircleShape,
+                )
+                .border(0.75.dp, pillBorderBrush, CircleShape)
                 .clip(CircleShape)
                 .combinedClickable(
                     onClick = { onOpenDetail(block.id) },
@@ -880,20 +929,37 @@ internal fun ToolCallPill(
                         { showToolMenu = true }
                     } else null,
                 )
-                .padding(horizontal = 12.dp)
+                .padding(start = 7.dp, end = 11.dp)
                 .height(36.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Status icon — always the typed tool icon. Color shifts to
-            // reflect terminal status (success / failed / cancelled); while
-            // running it stays in the tool's accent color so the user can
-            // still recognize the tool at a glance.
-            Icon(
-                displayIcon,
-                contentDescription = null,
-                tint = iconTint,
-                modifier = Modifier.size(14.dp),
-            )
+            // Status icon housed in a tinted 22dp badge disc so each tool's
+            // signature color and icon silhouette stand out immediately.
+            // While running, the badge subtly breathes on the shared ~30fps
+            // decorative clock inside graphicsLayer (zero recomposition/layout).
+            Box(
+                modifier = Modifier
+                    .size(22.dp)
+                    .graphicsLayer {
+                        if (shimmerTick != null) {
+                            val phase = decorativePhase(shimmerTick.value, 1400)
+                            val pulse = kotlin.math.sin(phase * 2f * kotlin.math.PI.toFloat())
+                            val s = 1f + 0.06f * pulse
+                            scaleX = s
+                            scaleY = s
+                        }
+                    }
+                    .background(iconTint.copy(alpha = if (isRunning) 0.18f else 0.13f), CircleShape)
+                    .border(0.5.dp, iconTint.copy(alpha = if (isRunning) 0.36f else 0.24f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    displayIcon,
+                    contentDescription = null,
+                    tint = iconTint,
+                    modifier = Modifier.size(13.dp),
+                )
+            }
 
             Spacer(modifier = Modifier.width(8.dp))
 
@@ -932,19 +998,29 @@ internal fun ToolCallPill(
             }
 
             // Duration badge (iOS: monospaced gray text after title) — fixed width,
-            // never compressed by the title. The HH:mm:ss start time is
-            // surfaced inside the tool detail bottom sheet's bottom bar
-            // instead of here — the inline pill list stays clean.
+            // never compressed by the title. Styled as a crisp tabular micro-pill.
             if (durationText != null) {
                 Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = durationText,
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                    softWrap = false,
-                    maxLines = 1,
-                )
+                Box(
+                    modifier = Modifier
+                        .background(
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.055f),
+                            RoundedCornerShape(50),
+                        )
+                        .padding(horizontal = 6.dp, vertical = 1.5.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = durationText,
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        fontFamily = FontFamily.Monospace,
+                        style = TextStyle(fontFeatureSettings = "tnum"),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                        softWrap = false,
+                        maxLines = 1,
+                    )
+                }
             }
             // T168: restore per-tool stop button (reverts T117). Renders only
             // for running/streaming/pending blocks so completed pills stay
@@ -970,12 +1046,14 @@ internal fun ToolCallPill(
                         translationX = (-1f + phase * 3f) * size.width
                     }
                     .drawWithCache {
-                        val band = size.width * 0.6f
+                        val band = size.width * 0.65f
                         val brush = Brush.linearGradient(
                             colors = listOf(
-                                Color.White.copy(alpha = 0f),
-                                Color.White.copy(alpha = 0.18f),
-                                Color.White.copy(alpha = 0f),
+                                Color.Transparent,
+                                toolAccent.copy(alpha = 0.16f),
+                                Color.White.copy(alpha = 0.20f),
+                                toolAccent.copy(alpha = 0.12f),
+                                Color.Transparent,
                             ),
                             start = Offset(0f, 0f),
                             end = Offset(band, 0f),
@@ -1133,12 +1211,34 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
     val canOpenFull = !isStreaming
     var showFullContent by remember(block.id) { mutableStateOf(false) }
 
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "thinkingChevron",
+    )
+    val thinkingSurfaceBrush = remember(thinkingBlue, isStreaming) {
+        Brush.horizontalGradient(
+            colors = listOf(
+                thinkingBlue.copy(alpha = if (isStreaming) 0.11f else 0.075f),
+                thinkingBlue.copy(alpha = 0.035f),
+            ),
+        )
+    }
+    val thinkingBorderBrush = remember(thinkingBlue, isStreaming) {
+        Brush.horizontalGradient(
+            colors = listOf(
+                thinkingBlue.copy(alpha = if (isStreaming) 0.35f else 0.22f),
+                thinkingBlue.copy(alpha = 0.10f),
+            ),
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
-            .background(thinkingBlue.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
-            .border(0.5.dp, thinkingBlue.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
+            .background(thinkingSurfaceBrush, RoundedCornerShape(12.dp))
+            .border(0.75.dp, thinkingBorderBrush, RoundedCornerShape(12.dp))
             .clip(RoundedCornerShape(12.dp))
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
@@ -1187,24 +1287,31 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                     }
                 },
         ) {
-            if (isStreaming && block.toolStatus != ToolBlockStatus.SUCCESS) {
-                // iOS: ProgressView().controlSize(.mini) while streaming
-                // [T-android-decorative-anim-perf] See DecorativeAnimation.kt.
-                DecorativeSpinner(
-                    color = thinkingBlue,
-                    modifier = Modifier.size(13.dp),
-                    strokeWidth = 1.5.dp,
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-            } else {
-                Icon(
-                    imageVector = Icons.Default.Psychology,
-                    contentDescription = null,
-                    tint = thinkingBlue,
-                    modifier = Modifier.size(14.dp),
-                )
-                Spacer(modifier = Modifier.width(6.dp))
+            Box(
+                modifier = Modifier
+                    .size(22.dp)
+                    .background(thinkingBlue.copy(alpha = 0.14f), CircleShape)
+                    .border(0.5.dp, thinkingBlue.copy(alpha = 0.26f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (isStreaming && block.toolStatus != ToolBlockStatus.SUCCESS) {
+                    // iOS: ProgressView().controlSize(.mini) while streaming
+                    // [T-android-decorative-anim-perf] See DecorativeAnimation.kt.
+                    DecorativeSpinner(
+                        color = thinkingBlue,
+                        modifier = Modifier.size(12.dp),
+                        strokeWidth = 1.5.dp,
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.Psychology,
+                        contentDescription = null,
+                        tint = thinkingBlue,
+                        modifier = Modifier.size(13.dp),
+                    )
+                }
             }
+            Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = stringResource(R.string.chat_thinking_block_title),
                 fontSize = 13.sp,
@@ -1213,14 +1320,22 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
             )
             Spacer(modifier = Modifier.weight(1f))
             if (charCount > 0) {
-                Text(
-                    text = charLabel,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    fontFamily = FontFamily.Monospace,
-                    color = thinkingBlue.copy(alpha = 0.6f),
-                )
-                Spacer(modifier = Modifier.width(4.dp))
+                Box(
+                    modifier = Modifier
+                        .background(thinkingBlue.copy(alpha = 0.12f), RoundedCornerShape(50))
+                        .padding(horizontal = 6.dp, vertical = 1.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = charLabel,
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        fontFamily = FontFamily.Monospace,
+                        style = TextStyle(fontFeatureSettings = "tnum"),
+                        color = thinkingBlue.copy(alpha = 0.78f),
+                    )
+                }
+                Spacer(modifier = Modifier.width(6.dp))
             }
             if (overHardCap) {
                 // [T-thinking-render-perf-android] No expand/collapse chevron —
@@ -1234,10 +1349,12 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                 )
             } else {
                 Icon(
-                    imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    imageVector = Icons.Default.KeyboardArrowDown,
                     contentDescription = if (expanded) "Collapse" else "Expand",
-                    tint = thinkingBlue.copy(alpha = 0.5f),
-                    modifier = Modifier.size(14.dp),
+                    tint = thinkingBlue.copy(alpha = 0.65f),
+                    modifier = Modifier
+                        .size(15.dp)
+                        .graphicsLayer { rotationZ = chevronRotation },
                 )
             }
         }
@@ -1247,7 +1364,11 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
         // block is streaming, manual drag at any time, and pause-on-user-scroll
         // so a user reading earlier reasoning isn't yanked back to the tail by
         // the next token.
-        AnimatedVisibility(visible = expanded && !overHardCap) {
+        AnimatedVisibility(
+            visible = expanded && !overHardCap,
+            enter = expandVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) + fadeIn(),
+            exit = shrinkVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) + fadeOut(),
+        ) {
             val scrollState = rememberScrollState()
             // [T-thinking-render-perf-android] Render only the tail window so
             // Compose lays out at most `thinkingWindowSize` chars. `remember`
@@ -1321,6 +1442,19 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
             Column(
                 modifier = Modifier
                     .padding(top = 6.dp)
+                    .drawBehind {
+                        val barWidth = 2.dp.toPx()
+                        drawRoundRect(
+                            color = thinkingBlue.copy(alpha = 0.28f),
+                            topLeft = Offset(3.dp.toPx(), 2.dp.toPx()),
+                            size = androidx.compose.ui.geometry.Size(
+                                width = barWidth,
+                                height = (size.height - 4.dp.toPx()).coerceAtLeast(0f),
+                            ),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidth / 2f),
+                        )
+                    }
+                    .padding(start = 11.dp)
                     .heightIn(max = 300.dp)
                     .verticalScroll(scrollState),
             ) {

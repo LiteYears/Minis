@@ -47,6 +47,10 @@ internal object ProviderImportZip {
         }
     }
 
+    private const val MAX_ZIP_ENTRIES = 1_000
+    private const val MAX_SINGLE_ENTRY_BYTES = 10L * 1024 * 1024 // 10 MB
+    private const val MAX_TOTAL_EXTRACTED_BYTES = 50L * 1024 * 1024 // 50 MB
+
     /**
      * Extracts the zip behind [uri], runs every .json/.txt entry through
      * [onImportSingle], and dispatches a summary / failure toast via the
@@ -80,6 +84,9 @@ internal object ProviderImportZip {
                 return
             }
             try {
+                var entryCount = 0
+                var totalExtractedBytes = 0L
+                val copyBuf = ByteArray(DEFAULT_BUFFER_SIZE)
                 ZipInputStream(input.buffered()).use { zin ->
                     while (true) {
                         val entry = zin.nextEntry ?: break
@@ -87,6 +94,11 @@ internal object ProviderImportZip {
                             if (entry.isDirectory) continue
                             val rawName = entry.name
                             if (shouldSkipEntry(rawName)) continue
+
+                            entryCount += 1
+                            if (entryCount > MAX_ZIP_ENTRIES) {
+                                throw IOException("Zip archive exceeds maximum entry limit ($MAX_ZIP_ENTRIES)")
+                            }
 
                             val target = File(stagingDir, rawName)
                             val canonical = target.canonicalPath
@@ -96,7 +108,22 @@ internal object ProviderImportZip {
                                 continue
                             }
                             target.parentFile?.mkdirs()
-                            target.outputStream().use { out -> zin.copyTo(out) }
+                            var entryBytes = 0L
+                            target.outputStream().use { out ->
+                                while (true) {
+                                    val n = zin.read(copyBuf)
+                                    if (n < 0) break
+                                    entryBytes += n
+                                    totalExtractedBytes += n
+                                    if (entryBytes > MAX_SINGLE_ENTRY_BYTES) {
+                                        throw IOException("Zip entry '$rawName' exceeds max size ($MAX_SINGLE_ENTRY_BYTES bytes)")
+                                    }
+                                    if (totalExtractedBytes > MAX_TOTAL_EXTRACTED_BYTES) {
+                                        throw IOException("Zip archive exceeds max total extracted size ($MAX_TOTAL_EXTRACTED_BYTES bytes)")
+                                    }
+                                    out.write(copyBuf, 0, n)
+                                }
+                            }
                         } finally {
                             zin.closeEntry()
                         }
@@ -122,6 +149,7 @@ internal object ProviderImportZip {
             var ok = 0
             for (file in candidates) {
                 try {
+                    if (file.length() > MAX_SINGLE_ENTRY_BYTES) continue
                     val content = file.readText()
                     val label = onImportSingle(content)
                     if (label != null) ok += 1

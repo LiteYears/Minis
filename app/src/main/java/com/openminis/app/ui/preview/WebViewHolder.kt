@@ -68,8 +68,44 @@ class WebViewHolder(
         consoleLogs = emptyList()
     }
 
+    private val appPrivateDataDir: String? =
+        runCatching { java.io.File(appContext.applicationInfo.dataDir).canonicalPath }.getOrNull()
+    private val allowedLocalFileRoots: List<String> = listOfNotNull(
+        runCatching { java.io.File(appContext.filesDir, "rootfs").canonicalPath }.getOrNull(),
+        runCatching { java.io.File(appContext.filesDir, "minis-sessions").canonicalPath }.getOrNull(),
+        runCatching { appContext.cacheDir.canonicalPath }.getOrNull(),
+    )
+
+    private fun isSafeLocalFileUrl(url: String): Boolean {
+        if (!url.startsWith("file://", ignoreCase = true)) return false
+        if (url.startsWith("file:///android_asset/", ignoreCase = true)) return true
+        val rawPath = runCatching { android.net.Uri.parse(url).path }.getOrNull() ?: return false
+        val canonical = runCatching { java.io.File(rawPath).canonicalPath }.getOrNull() ?: return false
+        val dataDir = appPrivateDataDir
+        if (dataDir != null && (canonical == dataDir || canonical.startsWith("$dataDir${java.io.File.separator}"))) {
+            return allowedLocalFileRoots.any { root ->
+                canonical == root || canonical.startsWith("$root${java.io.File.separator}")
+            }
+        }
+        return true
+    }
+
+    private fun applyFileAccessPolicyForUrl(wv: WebView, url: String) {
+        val allowLocalFile = isSafeLocalFileUrl(url)
+        wv.settings.allowFileAccess = allowLocalFile
+        @Suppress("DEPRECATION")
+        wv.settings.allowFileAccessFromFileURLs = allowLocalFile
+        @Suppress("DEPRECATION")
+        wv.settings.allowUniversalAccessFromFileURLs = allowLocalFile
+    }
+
     fun navigateTo(newUrl: String) {
         val normalized = com.openminis.app.sandbox.SandboxServerManager.normalizeLocalUrl(newUrl)
+        if (normalized.startsWith("file://", ignoreCase = true) && !isSafeLocalFileUrl(normalized)) {
+            AppLogger.warning(TAG, "Blocked navigation to restricted internal file URL: $normalized")
+            return
+        }
+        applyFileAccessPolicyForUrl(webView, normalized)
         currentUrl = normalized
         localRetryCount = 0
         isWarmingUpLocalServer = false
@@ -78,22 +114,21 @@ class WebViewHolder(
 
     @SuppressLint("SetJavaScriptEnabled")
     val webView: WebView = WebView(appContext).apply {
+        val initialAllowFile = isSafeLocalFileUrl(currentUrl)
         settings.javaScriptEnabled = true       // sandbox HTML demos rely on JS
         settings.domStorageEnabled = true
         settings.databaseEnabled = true
-        settings.allowFileAccess = true         // file:// for sandbox previews
-        settings.allowContentAccess = true
+        settings.allowFileAccess = initialAllowFile
+        settings.allowContentAccess = false
         // Allow local HTTP sandbox servers (http://127.0.0.1:<port>) to load
         // HTTPS CDN assets (Chart.js, Three.js, Tailwind, Plotly, etc.) and vice-versa.
         settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-        // Same-origin file:// access is needed so `<script src="game.js">`
-        // sitting next to a sandbox HTML loads correctly. We accept the small
-        // attack surface because all paths come from PRoot-resolved sandbox
-        // outputs, never untrusted user content from the network.
+        // Same-origin file:// access is scoped strictly to verified sandbox file://
+        // previews and disabled when browsing http:// or https:// pages.
         @Suppress("DEPRECATION")
-        settings.allowFileAccessFromFileURLs = true
+        settings.allowFileAccessFromFileURLs = initialAllowFile
         @Suppress("DEPRECATION")
-        settings.allowUniversalAccessFromFileURLs = true
+        settings.allowUniversalAccessFromFileURLs = initialAllowFile
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
         mobileUserAgent = settings.userAgentString
@@ -125,6 +160,15 @@ class WebViewHolder(
                 request: android.webkit.WebResourceRequest,
             ): Boolean {
                 val urlStr = request.url?.toString()
+                if (urlStr != null && urlStr.startsWith("file://", ignoreCase = true)) {
+                    if (!isSafeLocalFileUrl(urlStr) || !currentUrl.startsWith("file://", ignoreCase = true)) {
+                        AppLogger.warning(TAG, "Blocked WebView navigation to file URL: $urlStr")
+                        return true
+                    }
+                }
+                if (urlStr != null && request.isForMainFrame) {
+                    applyFileAccessPolicyForUrl(view, urlStr)
+                }
                 if (com.openminis.app.browser.GoogleAuthRouter.shouldRouteExternally(urlStr)) {
                     if (urlStr != null) {
                         com.openminis.app.browser.GoogleAuthRouter.openInCustomTab(view.context, urlStr)

@@ -27,6 +27,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -110,13 +111,29 @@ internal fun TaskCardFrame(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val shape = RoundedCornerShape(TaskCardMetrics.corner)
+    val surfaceBrush = remember(accent) {
+        Brush.horizontalGradient(
+            colors = listOf(
+                accent.copy(alpha = 0.13f),
+                accent.copy(alpha = 0.045f),
+            ),
+        )
+    }
+    val borderBrush = remember(accent) {
+        Brush.horizontalGradient(
+            colors = listOf(
+                accent.copy(alpha = 0.45f),
+                accent.copy(alpha = 0.20f),
+            ),
+        )
+    }
     Column(
         modifier = modifier
             .fillMaxWidth()
             .padding(vertical = TaskCardMetrics.outerVertical)
             .clip(shape)
-            .background(accent.copy(alpha = 0.07f))
-            .border(0.8.dp, accent.copy(alpha = 0.35f), shape)
+            .background(surfaceBrush)
+            .border(0.85.dp, borderBrush, shape)
             .then(
                 if (expandsInPlace) {
                     Modifier.expandToggleClickable(onClickLabel = onClickLabel, pressedShape = RectangleShape, onClick = onClick)
@@ -149,7 +166,11 @@ private fun TaskCardHeadRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
-            modifier = Modifier.size(TaskCardMetrics.iconDisc).clip(CircleShape).background(accent.copy(alpha = 0.15f)),
+            modifier = Modifier
+                .size(TaskCardMetrics.iconDisc)
+                .clip(CircleShape)
+                .background(accent.copy(alpha = 0.16f))
+                .border(0.75.dp, accent.copy(alpha = 0.32f), CircleShape),
             contentAlignment = Alignment.Center,
         ) { icon() }
         Spacer(Modifier.width(TaskCardMetrics.iconGap))
@@ -166,7 +187,7 @@ private fun TaskCardHeadRow(
         Icon(
             Icons.AutoMirrored.Filled.KeyboardArrowRight,
             contentDescription = null,
-            tint = ChatColors.tertiaryText,
+            tint = accent.copy(alpha = 0.65f),
             modifier = Modifier.size(TaskCardMetrics.chevron),
         )
     }
@@ -229,6 +250,7 @@ internal fun taskCardStatusLineHeight(): Dp =
 /** The label pill before a task card's title ("Agent" / "Scheduled task"). */
 @Composable
 internal fun TaskCardChip(text: String, accent: Color) {
+    val pillShape = RoundedCornerShape(50)
     Text(
         text,
         fontSize = TaskCardMetrics.chipSize,
@@ -237,8 +259,9 @@ internal fun TaskCardChip(text: String, accent: Color) {
         color = accent,
         maxLines = 1,
         modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            .background(accent.copy(alpha = 0.15f))
+            .clip(pillShape)
+            .background(accent.copy(alpha = 0.16f))
+            .border(0.5.dp, accent.copy(alpha = 0.30f), pillShape)
             .padding(horizontal = 5.dp, vertical = 1.dp),
     )
 }

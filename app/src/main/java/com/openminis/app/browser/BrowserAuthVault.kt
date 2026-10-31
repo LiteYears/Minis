@@ -498,12 +498,23 @@ object BrowserAuthVault {
             val target = vaultFile(context)
             val tmp = File(context.filesDir, "$VAULT_FILENAME.tmp")
             tmp.writeText(root.toString())
+            restrictToOwnerOnly(tmp)
             if (!tmp.renameTo(target)) {
                 target.writeText(root.toString())
                 tmp.delete()
             }
+            restrictToOwnerOnly(target)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write auth vault: ${e.message}")
+        }
+    }
+
+    private fun restrictToOwnerOnly(file: File) {
+        runCatching {
+            file.setReadable(false, false)
+            file.setReadable(true, true)
+            file.setWritable(false, false)
+            file.setWritable(true, true)
         }
     }
 }

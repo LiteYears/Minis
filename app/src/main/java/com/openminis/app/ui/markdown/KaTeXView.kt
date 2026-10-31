@@ -223,6 +223,11 @@ fun KaTeXRenderView(
                     layoutParams = ViewGroup.LayoutParams(1, 1)
                     settings.javaScriptEnabled = true
                     settings.allowFileAccess = true
+                    settings.allowContentAccess = false
+                    @Suppress("DEPRECATION")
+                    settings.allowFileAccessFromFileURLs = false
+                    @Suppress("DEPRECATION")
+                    settings.allowUniversalAccessFromFileURLs = false
                     // T208 Layer A: keep WebView text-zoom at 100% regardless
                     // of the user's accessibility font-size setting. Without
                     // this, the bitmap KaTeX renders is multiplied by the
@@ -346,6 +351,8 @@ fun KaTeXRenderView(
                                 .replace("'", "\\'")
                                 .replace("\n", "\\n")
                                 .replace("\r", "")
+                                .replace("\u2028", "\\u2028")
+                                .replace("\u2029", "\\u2029")
                             evaluateJavascript(
                                 "renderMath('$escapedLatex', $displayMode, $fontSize, $isDark)",
                                 null

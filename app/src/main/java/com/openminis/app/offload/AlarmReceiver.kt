@@ -43,21 +43,33 @@ class AlarmReceiver : BroadcastReceiver() {
             return
         }
 
-        val alarmId = intent.getStringExtra(AlarmOffloadManager.EXTRA_ALARM_ID) ?: "unknown"
-        val label = intent.getStringExtra(AlarmOffloadManager.EXTRA_ALARM_LABEL) ?: "Alarm"
+        val action = intent.action
+        if (action != null && action != AlarmOffloadManager.ACTION_TRIGGER_ALARM) {
+            AppLogger.warning(TAG, "Ignoring unexpected broadcast action: $action")
+            return
+        }
+
+        val alarmId = intent.getStringExtra(AlarmOffloadManager.EXTRA_ALARM_ID)?.takeIf { it.isNotBlank() }
+        if (alarmId == null) {
+            AppLogger.warning(TAG, "Ignoring alarm broadcast without valid EXTRA_ALARM_ID")
+            return
+        }
+
+        // Verify the alarmId against persisted alarms and use the persisted label
+        // so third-party apps cannot spoof notifications via the exported receiver.
+        val verifiedLabel = try {
+            AlarmOffloadManager(context).onAlarmFired(alarmId)
+        } catch (e: Throwable) {
+            AppLogger.warning(TAG, "onAlarmFired($alarmId) failed: ${e.message}")
+            null
+        }
+        if (verifiedLabel == null) {
+            AppLogger.warning(TAG, "Ignoring unverified alarm broadcast for id=$alarmId")
+            return
+        }
+        val label = verifiedLabel
 
         AppLogger.debug(TAG, "Alarm triggered: id=$alarmId label=$label")
-
-        // Drop the entry from prefs for ONCE alarms / timers so the next
-        // `android-alarm list` call no longer surfaces them. DAILY/WEEKDAYS
-        // are kept (the OS re-fires them).
-        if (alarmId != "unknown") {
-            try {
-                AlarmOffloadManager(context).onAlarmFired(alarmId)
-            } catch (e: Throwable) {
-                AppLogger.warning(TAG, "onAlarmFired($alarmId) failed: ${e.message}")
-            }
-        }
 
         val notificationId = alarmId.hashCode() and 0x7FFFFFFF
 

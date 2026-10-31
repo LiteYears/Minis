@@ -21,4 +21,6 @@
     <exclude domain="sharedpref" path="backup_rclone_secrets_plain_fallback.xml" />
     <exclude domain="sharedpref" path="minis_network_secrets.xml" />
     <exclude domain="sharedpref" path="minis_network_secrets_plain_fallback.xml" />
+    <exclude domain="file" path="browser_auth_vault.json" />
+    <exclude domain="file" path="debug_server_token" />
 </full-backup-content>

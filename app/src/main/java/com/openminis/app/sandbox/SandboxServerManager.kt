@@ -577,7 +577,8 @@ object SandboxServerManager {
         scope.launch {
             val srv = getServerByPort(port)
             val pid = readRootfsPid(context, port) ?: srv?.pid ?: 0
-            if (pid > 1) {
+            val myPid = android.os.Process.myPid()
+            if (pid > 1 && pid != myPid) {
                 runCatching { Os.kill(-pid, OsConstants.SIGTERM) }
                 runCatching { Os.kill(pid, OsConstants.SIGTERM) }
                 delay(150)
@@ -635,13 +636,15 @@ object SandboxServerManager {
                 status = SandboxServerStatus.STARTING,
             )
             val sessionId = srv.sessionId.ifBlank { "default" }
-            val launchCmd = if (cmd.contains("minis-serve")) {
-                cmd
+            val safeTitle = srv.title.replace("'", "'\\''")
+            val safeWorkdir = srv.workdir.ifBlank { "/var/minis/workspace" }.replace("'", "'\\''")
+            val innerCmd = if (cmd.contains("minis-serve") && cmd.contains(" -- ")) {
+                cmd.substringAfter(" -- ").trim()
             } else {
-                val safeTitle = srv.title.replace("'", "'\\''")
-                val safeWorkdir = srv.workdir.ifBlank { "/var/minis/workspace" }.replace("'", "'\\''")
-                "/usr/local/bin/minis-serve start --port $port --title '$safeTitle' --workdir '$safeWorkdir' -- $cmd"
-            }
+                cmd
+            }.replace('\n', ' ').replace('\r', ' ').replace("\u0000", "")
+            val safeInnerCmd = innerCmd.replace("'", "'\\''")
+            val launchCmd = "/usr/local/bin/minis-serve start --port $port --title '$safeTitle' --workdir '$safeWorkdir' -- /bin/sh -c '$safeInnerCmd'"
             runCatching {
                 ExecutionCoordinator.execute(
                     sessionId = sessionId,

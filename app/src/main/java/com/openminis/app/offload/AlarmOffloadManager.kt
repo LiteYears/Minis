@@ -58,6 +58,7 @@ class AlarmOffloadManager(private val context: Context) {
         const val CHANNEL_ID = "minis_alarms"
         private const val CHANNEL_NAME = "Minis Alarms & Timers"
 
+        const val ACTION_TRIGGER_ALARM = "com.openminis.app.action.TRIGGER_ALARM"
         const val EXTRA_ALARM_ID = "alarm_id"
         const val EXTRA_ALARM_LABEL = "alarm_label"
     }
@@ -262,24 +263,30 @@ class AlarmOffloadManager(private val context: Context) {
      * Called from [AlarmReceiver] right after an alarm fires. Looks up the
      * entry in prefs and drops it iff it's a ONCE alarm or a timer; for
      * DAILY/WEEKDAYS the OS re-fires on its own and we keep the entry.
+     *
+     * Returns the persisted alarm label when [alarmId] matches a real
+     * scheduled alarm, or null if no matching alarm exists (e.g. an
+     * unauthenticated external broadcast).
      */
-    fun onAlarmFired(alarmId: String) {
+    fun onAlarmFired(alarmId: String): String? {
         val alarms = loadAlarms()
         for (i in 0 until alarms.length()) {
             val a = alarms.getJSONObject(i)
             if (a.optString("id") != alarmId) continue
+            val persistedLabel = a.optString("label", "Alarm").ifBlank { "Alarm" }
             val mode = a.optString("repeatMode", "ONCE")
             val nonRepeating = a.optString("type") == "timer" || mode == "ONCE"
             if (!nonRepeating) {
                 AppLogger.info(TAG, "alarm id=$alarmId mode=$mode fired — keeping entry (repeats)")
-                return
+                return persistedLabel
             }
             alarms.remove(i)
             prefs.edit().putString(KEY_ALARMS, alarms.toString()).apply()
             AppLogger.info(TAG, "alarm id=$alarmId mode=$mode fired — removed from prefs")
-            return
+            return persistedLabel
         }
         AppLogger.warning(TAG, "alarm id=$alarmId fired but no matching prefs entry")
+        return null
     }
 
     fun cancelAlarm(alarmId: String): String {
@@ -333,6 +340,7 @@ class AlarmOffloadManager(private val context: Context) {
 
     private fun buildPendingIntent(id: String, requestCode: Int, label: String): PendingIntent {
         val intent = Intent(context, AlarmReceiver::class.java).apply {
+            action = ACTION_TRIGGER_ALARM
             putExtra(EXTRA_ALARM_ID, id)
             putExtra(EXTRA_ALARM_LABEL, label)
         }
