@@ -38,9 +38,11 @@ import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -75,6 +77,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.openminis.app.browser.BrowserAuthVault
 import com.openminis.app.browser.BrowserHistoryStore
 import com.openminis.app.browser.BrowserTabPool
 import com.openminis.app.browser.UserAgentProfile
@@ -117,9 +120,17 @@ fun BrowserSheet(
     var urlInput by remember(currentURL) { mutableStateOf(currentURL) }
     var showHistory by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var showAuthVault by remember { mutableStateOf(false) }
     // [T-android-browser-download-ux] Downloads panel + badge state.
     var showDownloads by remember { mutableStateOf(false) }
     val downloadEntries by tabPool.downloads.collectAsState()
+    val somActive = selectedTab?.manager?.somOverlayActive?.collectAsState()?.value ?: false
+    val somCount = selectedTab?.manager?.somMarkCount?.collectAsState()?.value ?: 0
+    val savedProfiles by BrowserAuthVault.profiles.collectAsState()
+
+    LaunchedEffect(context) {
+        BrowserAuthVault.ensureLoaded(context)
+    }
 
     val accent = MaterialTheme.colorScheme.primary
     val secondaryBg = MaterialTheme.colorScheme.surfaceContainer
@@ -409,6 +420,41 @@ fun BrowserSheet(
                     enabled = canGoForward && !isAgentBusy,
                     onClick = { selectedTab?.manager?.goForward() },
                 )
+                // Set-of-Marks (SoM) Visual DOM Grounding live preview toggle
+                androidx.compose.material3.BadgedBox(
+                    badge = {
+                        if (somActive && somCount > 0) {
+                            androidx.compose.material3.Badge { Text("$somCount") }
+                        }
+                    },
+                ) {
+                    ToolbarIcon(
+                        icon = Icons.Default.Visibility,
+                        contentDesc = "Set-of-Marks (SoM) Visual DOM Overlay",
+                        enabled = selectedTab != null && currentURL.isNotEmpty() && !isAgentBusy,
+                        tint = if (somActive) accent else null,
+                        onClick = {
+                            val mgr = selectedTab?.manager ?: return@ToolbarIcon
+                            scope.launch { mgr.toggleSomOverlayFromUI() }
+                        },
+                    )
+                }
+                // Authenticated Session Vault (Named Auth Profiles)
+                androidx.compose.material3.BadgedBox(
+                    badge = {
+                        if (savedProfiles.isNotEmpty()) {
+                            androidx.compose.material3.Badge { Text("${savedProfiles.size}") }
+                        }
+                    },
+                ) {
+                    ToolbarIcon(
+                        icon = Icons.Default.Key,
+                        contentDesc = "Authenticated Session Vault",
+                        enabled = !isAgentBusy,
+                        tint = if (savedProfiles.isNotEmpty()) accent else null,
+                        onClick = { showAuthVault = true },
+                    )
+                }
                 // [T-android-browser-download-ux] Downloads entry: shows while
                 // the session has ANY download records, disappears when the
                 // user clears the last one; the badge counts in-flight +
@@ -450,6 +496,13 @@ fun BrowserSheet(
                 }
             }
         }
+    }
+
+    if (showAuthVault) {
+        BrowserAuthVaultSheet(
+            tabPool = tabPool,
+            onDismiss = { showAuthVault = false },
+        )
     }
 
     if (showDownloads) {

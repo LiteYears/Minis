@@ -536,6 +536,450 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             })()
         """.trimIndent()
     }
+
+    // -- Set-of-Marks (SoM) Visual Grounding --
+
+    /**
+     * Injects numbered visual bounding boxes (`[1]`, `[2]`, `[3]`, ...) over interactive
+     * elements currently visible in the viewport, stamping each element with
+     * `data-minis-mark="<N>"` so the agent can act on it via `mark = N`.
+     */
+    fun injectSetOfMarks(filterSelector: String? = null, maxMarks: Int = 100): String {
+        val customSelector = if (!filterSelector.isNullOrBlank()) "'${jsQuote(filterSelector)}'" else "null"
+        val limit = maxMarks.coerceIn(10, 250)
+        return guardedRead("""
+            (function() {
+                var existingOverlay = document.getElementById('__minis_som_overlay__');
+                if (existingOverlay) existingOverlay.remove();
+
+                var prevMarked = document.querySelectorAll('[data-minis-mark]');
+                for (var p = 0; p < prevMarked.length; p++) {
+                    prevMarked[p].removeAttribute('data-minis-mark');
+                }
+
+                var vw = window.innerWidth || document.documentElement.clientWidth || 412;
+                var vh = window.innerHeight || document.documentElement.clientHeight || 915;
+
+                var defaultQuery = [
+                    'a[href]',
+                    'button',
+                    'input:not([type="hidden"])',
+                    'textarea',
+                    'select',
+                    'summary',
+                    'label[for]',
+                    '[role="button"]',
+                    '[role="link"]',
+                    '[role="tab"]',
+                    '[role="menuitem"]',
+                    '[role="checkbox"]',
+                    '[role="switch"]',
+                    '[role="radio"]',
+                    '[role="option"]',
+                    '[role="combobox"]',
+                    '[role="searchbox"]',
+                    '[role="textbox"]',
+                    '[contenteditable="true"]',
+                    '[contenteditable=""]',
+                    '[onclick]',
+                    '[tabindex]:not([tabindex="-1"])'
+                ].join(',');
+
+                var customSel = $customSelector;
+                var rawSet = new Set();
+                try {
+                    var matched = document.querySelectorAll(customSel || defaultQuery);
+                    for (var i = 0; i < matched.length; i++) rawSet.add(matched[i]);
+                } catch (e) {
+                    return JSON.stringify({error: 'Invalid selector for Set-of-Marks: ' + e.message});
+                }
+
+                if (!customSel && document.body) {
+                    var allNodes = document.body.querySelectorAll('*');
+                    var maxScan = Math.min(allNodes.length, 2500);
+                    for (var k = 0; k < maxScan; k++) {
+                        var cand = allNodes[k];
+                        if (rawSet.has(cand)) continue;
+                        var st = window.getComputedStyle(cand);
+                        if (st.cursor === 'pointer' && cand.children.length <= 4) {
+                            rawSet.add(cand);
+                        }
+                    }
+                }
+
+                function isVisibleInViewport(el) {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    var st = window.getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.05) return false;
+                    if (st.pointerEvents === 'none') return false;
+                    var r = el.getBoundingClientRect();
+                    if (r.width < 6 || r.height < 6) return false;
+                    if (r.bottom <= 2 || r.right <= 2 || r.top >= vh - 2 || r.left >= vw - 2) return false;
+                    return true;
+                }
+
+                function buildShortSelector(el) {
+                    if (el.id) return '#' + el.id;
+                    var tag = el.tagName.toLowerCase();
+                    var testId = el.getAttribute('data-testid') || el.getAttribute('data-test');
+                    if (testId) return tag + '[data-testid="' + testId + '"]';
+                    var nameAttr = el.getAttribute('name');
+                    if (nameAttr) return tag + '[name="' + nameAttr + '"]';
+                    return tag;
+                }
+
+                var candidates = [];
+                rawSet.forEach(function(el) {
+                    if (!isVisibleInViewport(el)) return;
+                    var r = el.getBoundingClientRect();
+                    candidates.push({el: el, rect: r, area: r.width * r.height});
+                });
+
+                // Filter out nested children whose parent interactive element has nearly identical bounds
+                var deduped = [];
+                for (var i = 0; i < candidates.length; i++) {
+                    var cur = candidates[i];
+                    var skip = false;
+                    for (var j = 0; j < candidates.length; j++) {
+                        if (i === j) continue;
+                        var other = candidates[j];
+                        if (other.el.contains(cur.el)) {
+                            var sameBox = Math.abs(other.rect.left - cur.rect.left) < 8 &&
+                                          Math.abs(other.rect.top - cur.rect.top) < 8 &&
+                                          Math.abs(other.rect.width - cur.rect.width) < 12 &&
+                                          Math.abs(other.rect.height - cur.rect.height) < 12;
+                            var parentIsPrimary = ['BUTTON', 'A', 'LABEL', 'SUMMARY'].indexOf(other.el.tagName) >= 0 ||
+                                                  other.el.getAttribute('role') === 'button' ||
+                                                  other.el.getAttribute('role') === 'link' ||
+                                                  other.el.getAttribute('role') === 'tab';
+                            if (sameBox || (parentIsPrimary && ['INPUT', 'SELECT', 'TEXTAREA'].indexOf(cur.el.tagName) < 0)) {
+                                skip = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!skip) deduped.push(cur);
+                }
+
+                // Sort top-to-bottom (quantized into 18px vertical bands), then left-to-right
+                deduped.sort(function(a, b) {
+                    var bandA = Math.round(a.rect.top / 18);
+                    var bandB = Math.round(b.rect.top / 18);
+                    if (bandA !== bandB) return bandA - bandB;
+                    return a.rect.left - b.rect.left;
+                });
+
+                var overlay = document.createElement('div');
+                overlay.id = '__minis_som_overlay__';
+                overlay.setAttribute('style', [
+                    'position:fixed',
+                    'top:0',
+                    'left:0',
+                    'width:100vw',
+                    'height:100vh',
+                    'pointer-events:none',
+                    'z-index:2147483647',
+                    'overflow:hidden',
+                    'margin:0',
+                    'padding:0'
+                ].join(';'));
+
+                var palette = [
+                    '#FF2D55', // vivid crimson
+                    '#007AFF', // electric blue
+                    '#00C853', // emerald green
+                    '#FF9500', // amber orange
+                    '#AF52DE', // royal purple
+                    '#00ACC1'  // cyan
+                ];
+
+                var marksOut = [];
+                var count = Math.min(deduped.length, $limit);
+                for (var idx = 0; idx < count; idx++) {
+                    var item = deduped[idx];
+                    var el = item.el;
+                    var r = item.rect;
+                    var markNum = idx + 1;
+                    var color = palette[idx % palette.length];
+
+                    el.setAttribute('data-minis-mark', String(markNum));
+
+                    var x = Math.max(0, Math.round(r.left));
+                    var y = Math.max(0, Math.round(r.top));
+                    var w = Math.max(8, Math.min(vw - x, Math.round(r.width)));
+                    var h = Math.max(8, Math.min(vh - y, Math.round(r.height)));
+
+                    var box = document.createElement('div');
+                    box.setAttribute('style', [
+                        'position:fixed',
+                        'left:' + x + 'px',
+                        'top:' + y + 'px',
+                        'width:' + w + 'px',
+                        'height:' + h + 'px',
+                        'border:2px solid ' + color,
+                        'background-color:' + color + '14',
+                        'border-radius:4px',
+                        'box-sizing:border-box',
+                        'pointer-events:none'
+                    ].join(';'));
+
+                    var badge = document.createElement('div');
+                    var badgeTop = (y >= 16) ? -15 : 0;
+                    badge.textContent = String(markNum);
+                    badge.setAttribute('style', [
+                        'position:absolute',
+                        'left:-2px',
+                        'top:' + badgeTop + 'px',
+                        'background:' + color,
+                        'color:#FFFFFF',
+                        'font-family:monospace,sans-serif',
+                        'font-size:11px',
+                        'font-weight:700',
+                        'line-height:14px',
+                        'padding:0 4px',
+                        'border-radius:3px',
+                        'box-shadow:0 1px 3px rgba(0,0,0,0.45)',
+                        'white-space:nowrap',
+                        'pointer-events:none'
+                    ].join(';'));
+
+                    box.appendChild(badge);
+                    overlay.appendChild(box);
+
+                    var rawText = (el.innerText || el.textContent || el.value || '').replace(/\s+/g, ' ').trim();
+                    if (el.tagName === 'INPUT' && el.type === 'password' && el.value) {
+                        rawText = '[password redacted]';
+                    }
+                    var ariaLabel = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+                    var placeholder = (el.getAttribute('placeholder') || '').trim();
+                    var role = (el.getAttribute('role') || '').trim();
+                    var typeAttr = (el.getAttribute('type') || '').trim();
+                    var href = '';
+                    if (el.tagName === 'A' && el.href && el.href.indexOf('javascript:') !== 0) {
+                        href = el.href.substring(0, 100);
+                    }
+
+                    marksOut.push({
+                        mark: markNum,
+                        tag: el.tagName,
+                        type: typeAttr || null,
+                        role: role || null,
+                        text: rawText.substring(0, 80),
+                        ariaLabel: ariaLabel.substring(0, 60) || null,
+                        placeholder: placeholder.substring(0, 60) || null,
+                        href: href || null,
+                        selector: buildShortSelector(el),
+                        x: Math.round(r.left + r.width / 2),
+                        y: Math.round(r.top + r.height / 2),
+                        w: Math.round(r.width),
+                        h: Math.round(r.height)
+                    });
+                }
+
+                (document.body || document.documentElement).appendChild(overlay);
+
+                return JSON.stringify({
+                    som: true,
+                    count: marksOut.length,
+                    totalCandidates: deduped.length,
+                    viewportWidth: vw,
+                    viewportHeight: vh,
+                    marks: marksOut
+                });
+            })()
+        """.trimIndent(), requiresBody = false)
+    }
+
+    /**
+     * Removes the visual `#__minis_som_overlay__` container while keeping `data-minis-mark`
+     * attributes on DOM elements (unless [clearAttributes] is true) so follow-up
+     * `click(mark = N)` / `type(mark = N, text = ...)` calls continue to work.
+     */
+    fun clearSetOfMarks(clearAttributes: Boolean = false): String = guardedRead("""
+        (function() {
+            var existing = document.getElementById('__minis_som_overlay__');
+            var removedOverlay = false;
+            if (existing) {
+                existing.remove();
+                removedOverlay = true;
+            }
+            if ($clearAttributes) {
+                var marked = document.querySelectorAll('[data-minis-mark]');
+                for (var i = 0; i < marked.length; i++) {
+                    marked[i].removeAttribute('data-minis-mark');
+                }
+            }
+            return JSON.stringify({cleared: true, removedOverlay: removedOverlay});
+        })()
+    """.trimIndent(), requiresBody = false)
+
+    /**
+     * Click an element identified by its Set-of-Marks number `data-minis-mark="<mark>"`.
+     */
+    fun clickMark(mark: Int): String = guardedRead("""
+        (function() {
+            var el = document.querySelector('[data-minis-mark="$mark"]');
+            if (!el) {
+                return JSON.stringify({
+                    error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'
+                });
+            }
+            if (el.disabled) {
+                return JSON.stringify({error: 'Element [$mark] is disabled', tag: el.tagName, mark: $mark});
+            }
+            try {
+                el.scrollIntoView({block: 'nearest', inline: 'nearest'});
+            } catch (e) {}
+            var r = el.getBoundingClientRect();
+            var cx = Math.round(r.left + r.width / 2);
+            var cy = Math.round(r.top + r.height / 2);
+            var bOpts = {bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy};
+            var nbOpts = {bubbles: false, cancelable: true, view: window, clientX: cx, clientY: cy};
+            el.dispatchEvent(new MouseEvent('mouseover', bOpts));
+            el.dispatchEvent(new MouseEvent('mouseenter', nbOpts));
+            el.dispatchEvent(new MouseEvent('mousemove', bOpts));
+            el.dispatchEvent(new MouseEvent('mousedown', bOpts));
+            if (typeof el.focus === 'function') el.focus();
+            el.dispatchEvent(new MouseEvent('mouseup', bOpts));
+            el.click();
+            el.dispatchEvent(new MouseEvent('mouseleave', nbOpts));
+            el.dispatchEvent(new MouseEvent('mouseout', bOpts));
+            return JSON.stringify({
+                clicked: true,
+                mark: $mark,
+                tag: el.tagName,
+                x: cx,
+                y: cy,
+                text: (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().substring(0, 100)
+            });
+        })()
+    """.trimIndent(), requiresBody = false)
+
+    /**
+     * Type text into an element identified by its Set-of-Marks number `data-minis-mark="<mark>"`.
+     */
+    fun typeMark(mark: Int, text: String): String = guardedRead("""
+        (function() {
+            var el = document.querySelector('[data-minis-mark="$mark"]');
+            if (!el) {
+                return JSON.stringify({
+                    error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'
+                });
+            }
+            try {
+                el.scrollIntoView({block: 'nearest', inline: 'nearest'});
+            } catch (e) {}
+            el.focus();
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                var nativeSetter = Object.getOwnPropertyDescriptor(
+                    el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value'
+                );
+                if (nativeSetter && nativeSetter.set) {
+                    nativeSetter.set.call(el, '${jsQuote(text)}');
+                } else {
+                    el.value = '${jsQuote(text)}';
+                }
+            } else {
+                el.innerText = '${jsQuote(text)}';
+            }
+            var chars = '${jsQuote(text)}';
+            for (var i = 0; i < chars.length; i++) {
+                var c = chars[i];
+                el.dispatchEvent(new KeyboardEvent('keydown', {key: c, bubbles: true}));
+                el.dispatchEvent(new KeyboardEvent('keypress', {key: c, bubbles: true}));
+                el.dispatchEvent(new InputEvent('input', {data: c, inputType: 'insertText', bubbles: true}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {key: c, bubbles: true}));
+            }
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable) {
+                el.dispatchEvent(new FocusEvent('blur', {bubbles: true, relatedTarget: null}));
+                el.dispatchEvent(new FocusEvent('focusout', {bubbles: true, relatedTarget: null}));
+            }
+            return JSON.stringify({typed: true, selector: '[mark=$mark] <' + el.tagName + '>', mark: $mark, length: chars.length});
+        })()
+    """.trimIndent(), requiresBody = false)
+
+    /**
+     * Hover over an element identified by its Set-of-Marks number `data-minis-mark="<mark>"`.
+     */
+    fun hoverMark(mark: Int): String = guardedRead("""
+        (function() {
+            var el = document.querySelector('[data-minis-mark="$mark"]');
+            if (!el) {
+                return JSON.stringify({
+                    error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'
+                });
+            }
+            try {
+                el.scrollIntoView({block: 'nearest', inline: 'nearest'});
+            } catch (e) {}
+            el.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
+            el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+            return JSON.stringify({
+                hovered: true,
+                mark: $mark,
+                tag: el.tagName,
+                text: (el.innerText || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().substring(0, 100)
+            });
+        })()
+    """.trimIndent(), requiresBody = false)
+
+    // -- Web Storage Dump & Restore (Authenticated Session Vault) --
+
+    fun dumpWebStorage(): String = guardedRead("""
+        (function() {
+            var localOut = {};
+            var sessionOut = {};
+            try {
+                if (window.localStorage) {
+                    for (var i = 0; i < window.localStorage.length; i++) {
+                        var k = window.localStorage.key(i);
+                        if (k !== null) {
+                            var v = window.localStorage.getItem(k);
+                            if (v !== null && v.length <= 32768) localOut[k] = v;
+                        }
+                    }
+                }
+            } catch (e) {}
+            try {
+                if (window.sessionStorage) {
+                    for (var j = 0; j < window.sessionStorage.length; j++) {
+                        var sk = window.sessionStorage.key(j);
+                        if (sk !== null) {
+                            var sv = window.sessionStorage.getItem(sk);
+                            if (sv !== null && sv.length <= 32768) sessionOut[sk] = sv;
+                        }
+                    }
+                }
+            } catch (e) {}
+            return JSON.stringify({localStorage: localOut, sessionStorage: sessionOut});
+        })()
+    """.trimIndent(), requiresBody = false)
+
+    fun restoreWebStorage(localJson: String, sessionJson: String): String = guardedRead("""
+        (function() {
+            var restored = 0;
+            try {
+                var lMap = JSON.parse('${jsQuote(localJson)}');
+                if (window.localStorage && lMap) {
+                    Object.keys(lMap).forEach(function(k) {
+                        window.localStorage.setItem(k, String(lMap[k]));
+                        restored++;
+                    });
+                }
+            } catch (e) {}
+            try {
+                var sMap = JSON.parse('${jsQuote(sessionJson)}');
+                if (window.sessionStorage && sMap) {
+                    Object.keys(sMap).forEach(function(k) {
+                        window.sessionStorage.setItem(k, String(sMap[k]));
+                        restored++;
+                    });
+                }
+            } catch (e) {}
+            return JSON.stringify({restored: restored});
+        })()
+    """.trimIndent(), requiresBody = false)
 }
 
 // BEGIN BrowserJSResult

@@ -64,7 +64,13 @@ enum class BrowserAction(val value: String) {
     GET_COOKIES("get_cookies"),
     SET_COOKIES("set_cookies"),
     SCROLL_AND_COLLECT("scroll_and_collect"),
-    WAIT_FOR_DOM_STABLE("wait_for_dom_stable");
+    WAIT_FOR_DOM_STABLE("wait_for_dom_stable"),
+    SOM_SNAPSHOT("som_snapshot"),
+    CLICK_ELEMENT("click_element"),
+    SAVE_AUTH_PROFILE("save_auth_profile"),
+    LOAD_AUTH_PROFILE("load_auth_profile"),
+    LIST_AUTH_PROFILES("list_auth_profiles"),
+    DELETE_AUTH_PROFILE("delete_auth_profile");
 
     /**
      * [T-browser-readaction-follow-tab-and-yolo-android] True when this action
@@ -77,11 +83,18 @@ enum class BrowserAction(val value: String) {
 
     companion object {
         private val map = entries.associateBy { it.value }
-        fun fromString(s: String): BrowserAction? = map[s]
+        fun fromString(s: String): BrowserAction? {
+            val normalized = s.trim().lowercase()
+            return map[normalized] ?: when (normalized) {
+                "set_of_marks", "mark_page", "visual_dom" -> SOM_SNAPSHOT
+                "switch_auth_profile", "restore_auth_profile" -> LOAD_AUTH_PROFILE
+                else -> null
+            }
+        }
 
         /** Actions that visually change the page and warrant an auto-snapshot. */
         val visualChangeActions: Set<BrowserAction> = setOf(
-            NAVIGATE, CLICK, SCROLL, HOVER, TYPE
+            NAVIGATE, CLICK, CLICK_ELEMENT, SCROLL, HOVER, TYPE, LOAD_AUTH_PROFILE
         )
 
         /**
@@ -309,6 +322,14 @@ data class BrowserActionInput(
      * (Unix seconds). Values are loosely typed (String / Boolean / Number).
      */
     val cookies: List<Map<String, Any?>>? = null,
+    /** Set-of-Marks element number `[1]..[N]` for `click`, `click_element`, `type`, or `hover`. */
+    val mark: Int? = null,
+    /** When true on `screenshot`, overlay Set-of-Marks numbered bounding boxes before capturing. */
+    val som: Boolean = false,
+    /** When true on `som_snapshot` or `screenshot(som=true)`, keep the visual `#__minis_som_overlay__` on page after capture. */
+    val keepOverlay: Boolean = false,
+    /** Named Auth Profile identifier for `save_auth_profile`, `load_auth_profile`, `delete_auth_profile`. */
+    val profileName: String? = null,
 ) {
     companion object {
         fun parse(json: String): BrowserActionInput? {
@@ -316,6 +337,15 @@ data class BrowserActionInput(
                 val obj = JSONObject(json)
                 val actionStr = obj.optString("action", "")
                 val action = BrowserAction.fromString(actionStr) ?: return null
+
+                val parsedMark: Int? = when {
+                    obj.has("mark") -> obj.optInt("mark").takeIf { it > 0 }
+                    obj.has("mark_id") -> obj.optInt("mark_id").takeIf { it > 0 }
+                    else -> null
+                }
+                val parsedProfileName: String? = obj.optString("profile_name").ifEmpty {
+                    obj.optString("profile").ifEmpty { null }
+                }
 
                 BrowserActionInput(
                     action = action,
@@ -344,6 +374,10 @@ data class BrowserActionInput(
                     timeoutMs = if (obj.has("timeout")) obj.optInt("timeout") else null,
                     fullPage = obj.optBoolean("full_page", false),
                     cookies = parseCookies(obj),
+                    mark = parsedMark,
+                    som = obj.optBoolean("som", action == BrowserAction.SOM_SNAPSHOT),
+                    keepOverlay = obj.optBoolean("keep_overlay", false),
+                    profileName = parsedProfileName,
                 )
             } catch (_: Exception) {
                 null

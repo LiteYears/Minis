@@ -251,11 +251,13 @@ object AgentTools {
             "The browser supports both web URLs and minis:// resource URLs. Use minis:// URLs to preview session files (e.g. navigate to minis://workspace/index.html). " +
             "Sub-resources (JS, CSS, images, fonts) referenced via minis:// absolute paths or relative paths within HTML pages resolve correctly. " +
             "Use navigate to open URLs, screenshot to see the page (returns an image), " +
-            "click/type to interact with elements, get_text/get_readable to extract content, " +
+            "som_snapshot (or screenshot with som=true) for Set-of-Marks (SoM) visual grounding — overlays numbered bounding boxes [1], [2], [3] on all interactive DOM elements, returns the marked screenshot for vision inspection plus a structured mark index table, and lets you act directly by mark number via click/click_element/type/hover with mark=14 (works on modern SPAs, canvas dashboards, and complex layouts where CSS selectors fail), " +
+            "click/click_element/type to interact with elements (by mark, selector, or coordinates), get_text/get_readable to extract content, " +
             "scroll to navigate long pages, scroll_and_collect to scroll through infinite-scroll/virtual-rendered pages (like Twitter/X timelines) and accumulate unique content items across scroll positions in a single call, " +
             "find_elements to discover interactive elements, " +
             "get_page_info for page metadata, get_backbone to get a structural overview of the page DOM as a simplified tree, " +
             "fetch to download files/resources using the page's session (returns metadata and a minis:// URL), " +
+            "save_auth_profile / load_auth_profile / list_auth_profiles / delete_auth_profile to manage persistent Named Auth Profiles in the Authenticated Session Vault (persists cookies including HttpOnly + localStorage + sessionStorage across sessions so once the user logs into a site in the Browser Sheet, you can load their real authenticated session by profile_name), " +
             "new_tab to open an additional tab, close_tab to close a tab, and list_tabs to see all open tabs. " +
             "Use set_viewport with viewport_width + viewport_height to override the viewport for the current session (e.g. before screenshotting a 1920×1080 HTML composition that would otherwise be cropped to the phone viewport); pass reset=true to drop the session override and fall back to the global browser setting. " +
             "Use get_cookies to retrieve cookies for the current page URL / current site root domain only (including HttpOnly cookies). get_cookies supports optional 'keywords' (filter by cookie name) and 'fuzzy' (true=contains match, false=exact match, default true). It returns only a summary and an offload env file path — raw cookie values are NOT included in the tool response. To reuse cookies in shell commands: `. /var/minis/offloads/env_cookies_xxx.sh && command`. You may define alias variables when needed. " +
@@ -263,14 +265,18 @@ object AgentTools {
             "Use wait_for_dom_stable to wait until the page DOM stops changing (useful after navigation or interactions that trigger async data loading — polls every 0.5s, resolves when mutation rate gradient is stable for 3+ intervals, default timeout 10s). " +
             "Use tab_id to target a specific tab (defaults to the most recently used tab).",
         parameters = mapOf(
-            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Open Wikipedia homepage', 'Take screenshot of current page'). Use the same language as the user."),
+            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Open Wikipedia homepage', 'Take Set-of-Marks visual snapshot'). Use the same language as the user."),
             "action" to AgentToolParam("string", "The browser action to perform",
                 enumValues = BrowserAction.allValues),
             "url" to AgentToolParam("string", "URL to navigate to (for navigate action) or resource to download (for fetch action)"),
-            "selector" to AgentToolParam("string", "CSS selector for targeting elements (click, type, get_text, scroll, hover, find_elements). For scroll: specify a scrollable container to scroll (e.g. 'div.timeline'); if omitted, auto-detects the best scrollable element."),
+            "mark" to AgentToolParam("integer", "Set-of-Marks (SoM) element number [1]..[N] from som_snapshot / screenshot(som=true) to target in click, click_element, type, or hover."),
+            "som" to AgentToolParam("boolean", "When true on screenshot, overlay Set-of-Marks numbered bounding boxes [1], [2], [3] on interactive DOM elements before capturing and include the mark index table."),
+            "keep_overlay" to AgentToolParam("boolean", "When true on som_snapshot or screenshot(som=true), keep the visual Set-of-Marks boxes rendered on the live page after capture (default false removes the visual overlay after capture while keeping mark IDs active)."),
+            "profile_name" to AgentToolParam("string", "Named Auth Profile identifier in the Authenticated Session Vault (for save_auth_profile, load_auth_profile, delete_auth_profile), e.g. 'github', 'work-aws', 'banking'."),
+            "selector" to AgentToolParam("string", "CSS selector for targeting elements (click, type, get_text, scroll, hover, find_elements, som_snapshot). For scroll: specify a scrollable container to scroll (e.g. 'div.timeline'); if omitted, auto-detects the best scrollable element."),
             "text" to AgentToolParam("string", "Text to type (for type action)"),
-            "coordinate_x" to AgentToolParam("integer", "X coordinate for click (alternative to selector)"),
-            "coordinate_y" to AgentToolParam("integer", "Y coordinate for click (alternative to selector)"),
+            "coordinate_x" to AgentToolParam("integer", "X coordinate for click (alternative to mark or selector)"),
+            "coordinate_y" to AgentToolParam("integer", "Y coordinate for click (alternative to mark or selector)"),
             "direction" to AgentToolParam("string", "Scroll direction", enumValues = listOf("up", "down")),
             "amount" to AgentToolParam("integer", "Scroll amount in pixels (default: 500)"),
             "script" to AgentToolParam("string", "JavaScript code to execute (for execute_js action). The script runs inside an async function wrapper — `await` and top-level `return` are both supported (e.g. `var r = await fetch(url); return await r.json()`)."),
@@ -297,7 +303,7 @@ object AgentTools {
             "full_page" to AgentToolParam("boolean", "For screenshot: capture the entire scrollable page by temporarily stretching the browser viewport to document.documentElement.scrollHeight. Default false captures the visible viewport only. Capped at 32768px tall; when capped, the result text includes 'Truncated: true' and the original height, so you can scroll and capture the remainder separately."),
         ),
         required = listOf("tool_title", "action"),
-        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page"),
+        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "mark", "som", "keep_overlay", "profile_name", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page"),
     )
 
     // Aligned with iOS AIChatViewModel.swift:5059-5067
@@ -448,6 +454,28 @@ object BrowserUseTool {
             put("type", "boolean")
             put("default", false)
             put("description", "When true on screenshot, capture the entire scrollable page by temporarily stretching the viewport to document.scrollHeight (height-capped at 32768 px). Default false captures only the current viewport.")
+        })
+
+        properties.put("mark", JSONObject().apply {
+            put("type", "integer")
+            put("description", "Set-of-Marks (SoM) element number [1]..[N] from som_snapshot or screenshot(som=true) to target in click, click_element, type, or hover.")
+        })
+
+        properties.put("som", JSONObject().apply {
+            put("type", "boolean")
+            put("default", false)
+            put("description", "When true on screenshot, overlay Set-of-Marks numbered bounding boxes [1], [2], [3] on interactive DOM elements before capturing.")
+        })
+
+        properties.put("keep_overlay", JSONObject().apply {
+            put("type", "boolean")
+            put("default", false)
+            put("description", "When true on som_snapshot or screenshot(som=true), keep the visual Set-of-Marks overlay rendered on the live page after capture.")
+        })
+
+        properties.put("profile_name", JSONObject().apply {
+            put("type", "string")
+            put("description", "Named Auth Profile identifier in the Authenticated Session Vault (for save_auth_profile, load_auth_profile, delete_auth_profile).")
         })
 
         val inputSchema = JSONObject()

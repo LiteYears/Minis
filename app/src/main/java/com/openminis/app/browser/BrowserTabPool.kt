@@ -708,6 +708,8 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
             // Already scoped to the caller's own tabs by listTabs(owner).
             BrowserAction.LIST_TABS -> listTabs(owner)
             BrowserAction.SET_VIEWPORT -> handleSetViewport(input)
+            BrowserAction.LIST_AUTH_PROFILES -> BrowserAuthVault.listProfilesResult(context)
+            BrowserAction.DELETE_AUTH_PROFILE -> BrowserAuthVault.deleteProfileResult(context, input.profileName)
             else -> {
                 ownershipViolation(input.tabId)?.let { return it }
                 // [T-browser-use-per-tab-serial-android] Serialize per explicit

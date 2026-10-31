@@ -176,9 +176,16 @@ class BrowserUseManager(
     // selected tab's mode, which set_user_agent can make differ from the default.
     private val _profile = MutableStateFlow(profile)
     val profileFlow: StateFlow<UserAgentProfile> = _profile.asStateFlow()
-    private var currentProfile: UserAgentProfile
+    internal var currentProfile: UserAgentProfile
         get() = _profile.value
         set(value) { _profile.value = value }
+
+    /** Live Set-of-Marks (SoM) visual overlay state for the BrowserSheet toolbar toggle. */
+    private val _somOverlayActive = MutableStateFlow(false)
+    val somOverlayActive: StateFlow<Boolean> = _somOverlayActive.asStateFlow()
+
+    private val _somMarkCount = MutableStateFlow(0)
+    val somMarkCount: StateFlow<Int> = _somMarkCount.asStateFlow()
 
     /**
      * [ISS-033] Session / global custom viewport, or null for the profile's
@@ -485,6 +492,8 @@ class BrowserUseManager(
                 _pageTitle.value = view.title ?: ""
                 _canGoBack.value = view.canGoBack()
                 _canGoForward.value = view.canGoForward()
+                _somOverlayActive.value = false
+                _somMarkCount.value = 0
                 navigationDeferred?.complete(Unit)
                 navigationDeferred = null
                 // Record in browser history
@@ -767,15 +776,24 @@ class BrowserUseManager(
         val prevUrl = withContext(Dispatchers.Main) { webView.url }
         var result: BrowserActionResult = when (input.action) {
             BrowserAction.NAVIGATE -> navigate(input.url)
-            BrowserAction.SCREENSHOT -> return screenshot(fullPage = input.fullPage)
-            BrowserAction.CLICK -> click(input.selector, input.coordinateX, input.coordinateY)
-            BrowserAction.TYPE -> type(input.selector, input.text)
+            BrowserAction.SCREENSHOT -> {
+                return if (input.som) {
+                    somSnapshot(selector = input.selector, keepOverlay = input.keepOverlay)
+                } else {
+                    screenshot(fullPage = input.fullPage)
+                }
+            }
+            BrowserAction.SOM_SNAPSHOT ->
+                return somSnapshot(selector = input.selector, keepOverlay = input.keepOverlay)
+            BrowserAction.CLICK, BrowserAction.CLICK_ELEMENT ->
+                click(input.selector, input.coordinateX, input.coordinateY, input.mark)
+            BrowserAction.TYPE -> type(input.selector, input.text, input.mark)
             BrowserAction.GET_TEXT -> return getText(input.selector)
             BrowserAction.SCROLL -> scroll(input.selector, input.direction, input.amount)
             BrowserAction.GET_PAGE_INFO -> return getPageInfo()
             BrowserAction.EXECUTE_JS -> return executeJS(input.script)
             BrowserAction.FIND_ELEMENTS -> return findElements(input.selector)
-            BrowserAction.HOVER -> hover(input.selector)
+            BrowserAction.HOVER -> hover(input.selector, input.mark)
             BrowserAction.GET_READABLE -> return getReadable()
             BrowserAction.SET_USER_AGENT -> return setUserAgent(input.userAgent, input.userAgentRaw)
             BrowserAction.SET_VIEWPORT ->
@@ -788,6 +806,14 @@ class BrowserUseManager(
                 input.scrollCount, input.itemSelector, input.keywords,
             )
             BrowserAction.WAIT_FOR_DOM_STABLE -> return waitForDomStable(input.timeoutMs)
+            BrowserAction.SAVE_AUTH_PROFILE ->
+                return BrowserAuthVault.saveFromManager(webView.context, this, input.profileName)
+            BrowserAction.LOAD_AUTH_PROFILE ->
+                BrowserAuthVault.loadIntoManager(webView.context, this, input.profileName, navigateToSavedUrl = true)
+            BrowserAction.LIST_AUTH_PROFILES ->
+                return BrowserAuthVault.listProfilesResult(webView.context)
+            BrowserAction.DELETE_AUTH_PROFILE ->
+                return BrowserAuthVault.deleteProfileResult(webView.context, input.profileName)
             BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS ->
                 return BrowserActionResult.error("Tab management actions must be routed through BrowserTabPool")
         }
@@ -1203,21 +1229,28 @@ class BrowserUseManager(
 
     // -- Click --
 
-    private suspend fun click(selector: String?, x: Int?, y: Int?): BrowserActionResult {
+    private suspend fun click(selector: String?, x: Int?, y: Int?, mark: Int? = null): BrowserActionResult {
         val js = when {
+            mark != null -> BrowserUseJS.clickMark(mark)
             selector != null -> BrowserUseJS.click(selector)
             x != null && y != null -> BrowserUseJS.clickCoordinate(x, y)
-            else -> return BrowserActionResult.error("click requires 'selector' or 'coordinate_x'/'coordinate_y'")
+            else -> return BrowserActionResult.error(
+                "click requires 'mark' (Set-of-Marks ID), 'selector', or 'coordinate_x'/'coordinate_y'",
+            )
         }
         return evaluateAndReturn(js)
     }
 
     // -- Type --
 
-    private suspend fun type(selector: String?, text: String?): BrowserActionResult {
-        if (selector == null) return BrowserActionResult.error("type requires 'selector'")
+    private suspend fun type(selector: String?, text: String?, mark: Int? = null): BrowserActionResult {
         if (text == null) return BrowserActionResult.error("type requires 'text'")
-        return evaluateAndReturn(BrowserUseJS.type(selector, text))
+        val js = when {
+            mark != null -> BrowserUseJS.typeMark(mark, text)
+            selector != null -> BrowserUseJS.type(selector, text)
+            else -> return BrowserActionResult.error("type requires 'mark' (Set-of-Marks ID) or 'selector'")
+        }
+        return evaluateAndReturn(js)
     }
 
     // -- Get Text --
@@ -1323,9 +1356,13 @@ class BrowserUseManager(
 
     // -- Hover --
 
-    private suspend fun hover(selector: String?): BrowserActionResult {
-        if (selector == null) return BrowserActionResult.error("hover requires 'selector'")
-        return evaluateAndReturn(BrowserUseJS.hover(selector))
+    private suspend fun hover(selector: String?, mark: Int? = null): BrowserActionResult {
+        val js = when {
+            mark != null -> BrowserUseJS.hoverMark(mark)
+            selector != null -> BrowserUseJS.hover(selector)
+            else -> return BrowserActionResult.error("hover requires 'mark' (Set-of-Marks ID) or 'selector'")
+        }
+        return evaluateAndReturn(js)
     }
 
     // -- Get Backbone --
@@ -1693,7 +1730,8 @@ class BrowserUseManager(
         when {
             json.optBoolean("clicked") -> {
                 val tag = json.optString("tag", "?")
-                appendLine("Clicked <$tag>")
+                val markId = if (json.has("mark")) " [mark=${json.optInt("mark")}]" else ""
+                appendLine("Clicked <$tag>$markId")
                 if (json.has("x") && json.has("y")) appendLine("  Position: (${json.optInt("x")}, ${json.optInt("y")})")
                 val text = json.optString("text", "")
                 if (text.isNotEmpty()) append("  Text: ${text.take(200)}")
@@ -2130,6 +2168,166 @@ class BrowserUseManager(
             }
         }.trimEnd()
         return BrowserActionResult(text = text)
+    }
+
+    // -- Set-of-Marks (SoM) Visual Grounding --
+
+    /**
+     * Overlays numbered `[1]`, `[2]`, `[3]` bounding boxes on interactive DOM elements,
+     * captures a screenshot for vision-capable models, and returns both the marked image
+     * (`base64Image` + `imageFilePath`) and a structured index table of every mark.
+     *
+     * Unless [keepOverlay] is true (or the user toggled the live SoM overlay on in BrowserSheet),
+     * the visual `#__minis_som_overlay__` container is removed after the screenshot is captured
+     * while preserving `data-minis-mark="<N>"` attributes on the DOM elements so subsequent
+     * `click(mark = 14)` / `type(mark = 14, text = "...")` calls resolve cleanly.
+     */
+    private suspend fun somSnapshot(
+        selector: String? = null,
+        keepOverlay: Boolean = false,
+    ): BrowserActionResult {
+        val raw = try {
+            evaluateJavascriptValue(BrowserUseJS.injectSetOfMarks(filterSelector = selector, maxMarks = 100))
+        } catch (e: Exception) {
+            return BrowserActionResult.error("som_snapshot failed: ${e.message}")
+        }
+        val outcome = BrowserJSResult.classify(raw)
+        if (outcome is BrowserJSResult.Outcome.ScriptError) {
+            return BrowserActionResult.error(outcome.message)
+        }
+        val somJson = (outcome as? BrowserJSResult.Outcome.Json)?.json
+            ?: return BrowserActionResult.error("som_snapshot produced no valid DOM mark metadata")
+
+        val markCount = somJson.optInt("count", 0)
+        val totalCandidates = somJson.optInt("totalCandidates", markCount)
+        _somMarkCount.value = markCount
+        _somOverlayActive.value = true
+
+        // Allow one frame for the fixed overlay boxes to paint before GPU/Canvas capture
+        delay(80)
+
+        val shotResult = screenshot(fullPage = false)
+
+        if (!keepOverlay) {
+            runCatching {
+                evaluateJavascriptValue(BrowserUseJS.clearSetOfMarks(clearAttributes = false))
+            }
+            _somOverlayActive.value = false
+        }
+
+        val marksArray = somJson.optJSONArray("marks")
+        val marksTable = buildString {
+            appendLine(shotResult.text)
+            appendLine()
+            appendLine("Set-of-Marks (SoM) Visual Grounding: $markCount interactive element(s) marked (of $totalCandidates visible candidates).")
+            appendLine("Interact by mark ID using action='click' (or 'click_element'), 'type', or 'hover' with mark=<number>:")
+            if (marksArray != null && marksArray.length() > 0) {
+                for (i in 0 until marksArray.length()) {
+                    val m = marksArray.optJSONObject(i) ?: continue
+                    val id = m.optInt("mark", i + 1)
+                    val tag = m.optString("tag", "?")
+                    val typeAttr = m.optString("type", "")
+                    val role = m.optString("role", "")
+                    val text = m.optString("text", "")
+                    val aria = m.optString("ariaLabel", "")
+                    val ph = m.optString("placeholder", "")
+                    val href = m.optString("href", "")
+                    val x = m.optInt("x", 0)
+                    val y = m.optInt("y", 0)
+
+                    val line = buildString {
+                        append("  [$id] <$tag")
+                        if (typeAttr.isNotEmpty()) append(" type=\"$typeAttr\"")
+                        if (role.isNotEmpty()) append(" role=\"$role\"")
+                        append(">")
+                        val label = when {
+                            text.isNotEmpty() -> text
+                            aria.isNotEmpty() -> aria
+                            ph.isNotEmpty() -> "placeholder: $ph"
+                            else -> ""
+                        }
+                        if (label.isNotEmpty()) append(" \"$label\"")
+                        if (href.isNotEmpty()) append(" -> $href")
+                        append(" @($x,$y)")
+                    }
+                    appendLine(line)
+                }
+            } else {
+                appendLine("  (No interactive elements detected in current viewport)")
+            }
+        }.trimEnd()
+
+        return shotResult.copy(text = marksTable)
+    }
+
+    /**
+     * Toggle the live Set-of-Marks (SoM) visual grounding overlay from the BrowserSheet UI.
+     * Returns the number of marked elements when enabled, or 0 when cleared.
+     */
+    suspend fun toggleSomOverlayFromUI(): Int {
+        return if (_somOverlayActive.value) {
+            runCatching { evaluateJavascriptValue(BrowserUseJS.clearSetOfMarks(clearAttributes = false)) }
+            _somOverlayActive.value = false
+            0
+        } else {
+            val raw = runCatching { evaluateJavascriptValue(BrowserUseJS.injectSetOfMarks(null, 100)) }.getOrNull()
+            val count = runCatching { JSONObject(raw ?: "{}").optInt("count", 0) }.getOrDefault(0)
+            _somMarkCount.value = count
+            _somOverlayActive.value = true
+            count
+        }
+    }
+
+    // -- Authenticated Session Vault Helpers --
+
+    internal suspend fun dumpCurrentWebStorage(): Pair<Map<String, String>, Map<String, String>> {
+        val raw = runCatching { evaluateJavascriptValue(BrowserUseJS.dumpWebStorage()) }.getOrNull()
+            ?: return emptyMap<String, String>() to emptyMap()
+        return try {
+            val json = JSONObject(raw)
+            val lObj = json.optJSONObject("localStorage")
+            val sObj = json.optJSONObject("sessionStorage")
+            val lMap = LinkedHashMap<String, String>()
+            val sMap = LinkedHashMap<String, String>()
+            if (lObj != null) {
+                val keys = lObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    lMap[k] = lObj.optString(k, "")
+                }
+            }
+            if (sObj != null) {
+                val keys = sObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    sMap[k] = sObj.optString(k, "")
+                }
+            }
+            lMap to sMap
+        } catch (_: Exception) {
+            emptyMap<String, String>() to emptyMap()
+        }
+    }
+
+    internal suspend fun restoreCurrentWebStorage(
+        localStorage: Map<String, String>,
+        sessionStorage: Map<String, String>,
+    ): Int {
+        if (localStorage.isEmpty() && sessionStorage.isEmpty()) return 0
+        val lJson = JSONObject().apply {
+            for ((k, v) in localStorage) put(k, v)
+        }.toString()
+        val sJson = JSONObject().apply {
+            for ((k, v) in sessionStorage) put(k, v)
+        }.toString()
+        val raw = runCatching {
+            evaluateJavascriptValue(BrowserUseJS.restoreWebStorage(lJson, sJson))
+        }.getOrNull() ?: return 0
+        return runCatching { JSONObject(raw).optInt("restored", 0) }.getOrDefault(0)
+    }
+
+    internal suspend fun loadURLAndWaitForVault(url: String) {
+        navigate(url)
     }
 
 }
