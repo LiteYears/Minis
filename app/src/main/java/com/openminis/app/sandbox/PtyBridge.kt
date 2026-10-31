@@ -14,7 +14,8 @@ object PtyBridge {
     @Volatile
     private var isLoaded = false
 
-    private val nextFallbackFd = AtomicInteger(10_000)
+    private const val FALLBACK_ID_BASE = 100_000
+    private val nextFallbackFd = AtomicInteger(FALLBACK_ID_BASE)
     private val fallbackProcesses = ConcurrentHashMap<Int, Process>()
 
     init {
@@ -78,19 +79,19 @@ object PtyBridge {
     /** Read from PTY master. Returns bytes read, 0 on EOF, or -errno. */
     @JvmStatic
     fun readBytes(fd: Int, buf: ByteArray, off: Int, len: Int): Int {
-        val fallbackProc = fallbackProcesses[fd]
-        if (fallbackProc != null) {
+        if (fd >= FALLBACK_ID_BASE) {
+            val fallbackProc = fallbackProcesses[fd] ?: return 0
             return try {
                 val n = fallbackProc.inputStream.read(buf, off, len)
                 if (n < 0) 0 else n
-            } catch (t: Throwable) {
+            } catch (_: Throwable) {
                 0
             }
         }
         if (!isLoaded) return -1
         return try {
             nativeReadBytes(fd, buf, off, len)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             -1
         }
     }
@@ -98,8 +99,8 @@ object PtyBridge {
     /** Write to PTY master. Returns bytes written, or -errno. Blocks until all len bytes are written. */
     @JvmStatic
     fun writeBytes(fd: Int, buf: ByteArray, off: Int, len: Int): Int {
-        val fallbackProc = fallbackProcesses[fd]
-        if (fallbackProc != null) {
+        if (fd >= FALLBACK_ID_BASE) {
+            val fallbackProc = fallbackProcesses[fd] ?: return -1
             return try {
                 // Non-PTY ProcessBuilder stdin expects LF ('\n') instead of CR ('\r')
                 val translated = ByteArray(len)
@@ -111,14 +112,14 @@ object PtyBridge {
                 out.write(translated, 0, len)
                 out.flush()
                 len
-            } catch (t: Throwable) {
+            } catch (_: Throwable) {
                 -1
             }
         }
         if (!isLoaded) return -1
         return try {
             nativeWriteBytes(fd, buf, off, len)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             -1
         }
     }
@@ -126,11 +127,11 @@ object PtyBridge {
     /** ioctl(TIOCSWINSZ). Returns 0 or -errno. */
     @JvmStatic
     fun setWindowSize(fd: Int, cols: Int, rows: Int): Int {
-        if (fallbackProcesses.containsKey(fd)) return 0
+        if (fd >= FALLBACK_ID_BASE) return 0
         if (!isLoaded) return 0
         return try {
             nativeSetWindowSize(fd, cols, rows)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             0
         }
     }
@@ -138,17 +139,19 @@ object PtyBridge {
     /** Close the PTY master fd. Returns 0 or -errno. */
     @JvmStatic
     fun closeFd(fd: Int): Int {
-        val fallbackProc = fallbackProcesses.remove(fd)
-        if (fallbackProc != null) {
+        if (fd >= FALLBACK_ID_BASE) {
+            val fallbackProc = fallbackProcesses[fd] ?: return 0
             runCatching { fallbackProc.inputStream.close() }
             runCatching { fallbackProc.outputStream.close() }
-            runCatching { fallbackProc.destroy() }
+            if (!fallbackProc.isAlive) {
+                fallbackProcesses.remove(fd)
+            }
             return 0
         }
         if (!isLoaded) return 0
         return try {
             nativeCloseFd(fd)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             -1
         }
     }
@@ -156,17 +159,20 @@ object PtyBridge {
     /** kill(pid, sig). Returns 0 or -errno. */
     @JvmStatic
     fun sendSignal(pid: Int, sig: Int): Int {
-        val fallbackProc = fallbackProcesses[pid]
-        if (fallbackProc != null) {
+        if (pid >= FALLBACK_ID_BASE) {
+            val fallbackProc = fallbackProcesses[pid] ?: return 0
             runCatching {
                 if (sig == 9) fallbackProc.destroyForcibly() else fallbackProc.destroy()
+            }
+            if (!fallbackProc.isAlive) {
+                fallbackProcesses.remove(pid)
             }
             return 0
         }
         if (!isLoaded) return 0
         return try {
             nativeSendSignal(pid, sig)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             -1
         }
     }
@@ -177,21 +183,20 @@ object PtyBridge {
      */
     @JvmStatic
     fun waitFor(pid: Int): Int {
-        val fallbackProc = fallbackProcesses[pid]
-        if (fallbackProc != null) {
+        if (pid >= FALLBACK_ID_BASE) {
+            val fallbackProc = fallbackProcesses[pid] ?: return 0
             return try {
-                val rc = fallbackProc.waitFor()
-                fallbackProcesses.remove(pid)
-                rc
-            } catch (t: Throwable) {
-                fallbackProcesses.remove(pid)
+                fallbackProc.waitFor()
+            } catch (_: Throwable) {
                 0
+            } finally {
+                fallbackProcesses.remove(pid)
             }
         }
         if (!isLoaded) return -1
         return try {
             nativeWaitFor(pid)
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             -1
         }
     }

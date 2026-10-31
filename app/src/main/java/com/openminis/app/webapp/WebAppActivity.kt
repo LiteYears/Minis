@@ -98,7 +98,7 @@ class WebAppActivity : ComponentActivity() {
     private val logTag = "WebAppActivity"
     private var webViewRef: WebView? = null
     private var resolvedFile: File? = null
-    private var isFullscreen: Boolean = false
+    private var isFullscreen by mutableStateOf(false)
 
     // T-n01-andmenu-l10n: pre-Tiramisu locale override (see MainActivity).
     override fun attachBaseContext(newBase: android.content.Context) {
@@ -124,16 +124,20 @@ class WebAppActivity : ComponentActivity() {
         }
         applySystemBars(fullscreen = false)
 
-        // T-pwa-3: back press — exit fullscreen if active, else finish.
+        // T-pwa-3: back press — exit fullscreen if active, navigate back in WebView if possible, else finish.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (isFullscreen) {
-                    isFullscreen = false
-                    applySystemBars(fullscreen = false)
-                    // Re-render Compose host so toolbar icon updates.
-                    renderHost()
-                } else {
-                    finish()
+                when {
+                    isFullscreen -> {
+                        isFullscreen = false
+                        applySystemBars(fullscreen = false)
+                    }
+                    webViewRef?.canGoBack() == true -> {
+                        webViewRef?.goBack()
+                    }
+                    else -> {
+                        finish()
+                    }
                 }
             }
         })
@@ -191,7 +195,7 @@ class WebAppActivity : ComponentActivity() {
             MaterialTheme {
                 WebAppHost(
                     file = file,
-                    initialFullscreen = isFullscreen,
+                    fullscreen = isFullscreen,
                     onFullscreenChange = { fs ->
                         isFullscreen = fs
                         applySystemBars(fullscreen = fs)
@@ -265,13 +269,12 @@ class WebAppActivity : ComponentActivity() {
     @Composable
     private fun WebAppHost(
         file: File,
-        initialFullscreen: Boolean,
+        fullscreen: Boolean,
         onFullscreenChange: (Boolean) -> Unit,
         onClose: () -> Unit,
         onWebViewReady: (WebView) -> Unit,
     ) {
         val context = LocalContext.current
-        var fullscreen by remember { mutableStateOf(initialFullscreen) }
         var toolbarVisible by remember { mutableStateOf(true) }
         // Bumped on each user interaction; LaunchedEffect uses it as a key
         // so the auto-hide timer restarts on every tap.
@@ -326,8 +329,7 @@ class WebAppActivity : ComponentActivity() {
                     fullscreen = fullscreen,
                     onClose = onClose,
                     onToggleFullscreen = {
-                        fullscreen = !fullscreen
-                        onFullscreenChange(fullscreen)
+                        onFullscreenChange(!fullscreen)
                         toolbarVisible = true
                         interactionTick += 1
                     },

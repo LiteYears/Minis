@@ -13,10 +13,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.io.RandomAccessFile
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -231,7 +233,7 @@ object SandboxServerManager {
                         val localAddr = parts[1]
                         val portHex = localAddr.substringAfterLast(':', "")
                         val port = portHex.toIntOrNull(16) ?: continue
-                        if (port in 1024..49151 && port !in IGNORED_PORTS) {
+                        if (port in 1024..65535 && port !in IGNORED_PORTS) {
                             result.add(port)
                         }
                     }
@@ -415,40 +417,43 @@ object SandboxServerManager {
         autoOpen: Boolean = false,
     ): SandboxServerInstance {
         val normalizedUrl = normalizeLocalUrl(url)
-        val current = _servers.value.toMutableList()
-        val idx = current.indexOfFirst { it.port == port }
         val now = System.currentTimeMillis()
-        val instance = if (idx >= 0) {
-            val prev = current[idx]
-            prev.copy(
-                url = normalizedUrl.ifBlank { prev.url },
-                title = title.ifBlank { prev.title },
-                command = command.ifBlank { prev.command },
-                workdir = workdir.ifBlank { prev.workdir },
-                sessionId = sessionId.ifBlank { prev.sessionId },
-                pid = if (pid > 0) pid else prev.pid,
-                status = status,
-                lastCheckedAtMs = now,
-            ).also { current[idx] = it }
-        } else {
-            SandboxServerInstance(
-                port = port,
-                url = normalizedUrl,
-                title = title.ifBlank { "Sandbox App (:$port)" },
-                command = command,
-                workdir = workdir,
-                sessionId = sessionId,
-                pid = pid,
-                status = status,
-                startedAtMs = now,
-                lastCheckedAtMs = now,
-            ).also { current.add(0, it) }
+        lateinit var resolvedInstance: SandboxServerInstance
+        _servers.update { list ->
+            val current = list.toMutableList()
+            val idx = current.indexOfFirst { it.port == port }
+            resolvedInstance = if (idx >= 0) {
+                val prev = current[idx]
+                prev.copy(
+                    url = normalizedUrl.ifBlank { prev.url },
+                    title = title.ifBlank { prev.title },
+                    command = command.ifBlank { prev.command },
+                    workdir = workdir.ifBlank { prev.workdir },
+                    sessionId = sessionId.ifBlank { prev.sessionId },
+                    pid = if (pid > 0) pid else prev.pid,
+                    status = status,
+                    lastCheckedAtMs = now,
+                ).also { current[idx] = it }
+            } else {
+                SandboxServerInstance(
+                    port = port,
+                    url = normalizedUrl,
+                    title = title.ifBlank { "Sandbox App (:$port)" },
+                    command = command,
+                    workdir = workdir,
+                    sessionId = sessionId,
+                    pid = pid,
+                    status = status,
+                    startedAtMs = now,
+                    lastCheckedAtMs = now,
+                ).also { current.add(0, it) }
+            }
+            current
         }
-        _servers.value = current
         if (autoOpen && status != SandboxServerStatus.STOPPED) {
-            _pendingAutoOpenServer.value = instance
+            _pendingAutoOpenServer.value = resolvedInstance
         }
-        return instance
+        return resolvedInstance
     }
 
     /**
@@ -459,15 +464,22 @@ object SandboxServerManager {
         val cleanTitle = pageTitle.trim()
         if (cleanTitle.isEmpty() || cleanTitle.startsWith("http://") || cleanTitle.startsWith("127.0.0.1")) return
         val port = extractPort(url) ?: return
-        val current = _servers.value.toMutableList()
-        val idx = current.indexOfFirst { it.port == port }
-        if (idx >= 0) {
-            val prev = current[idx]
-            if (prev.title != cleanTitle) {
-                current[idx] = prev.copy(title = cleanTitle)
-                _servers.value = current
+        var found = false
+        _servers.update { list ->
+            val idx = list.indexOfFirst { it.port == port }
+            if (idx >= 0) {
+                found = true
+                val prev = list[idx]
+                if (prev.title != cleanTitle) {
+                    list.toMutableList().also { it[idx] = prev.copy(title = cleanTitle) }
+                } else {
+                    list
+                }
+            } else {
+                list
             }
-        } else if (isLocalSandboxUrl(url)) {
+        }
+        if (!found && isLocalSandboxUrl(url)) {
             registerOrUpdateServer(
                 port = port,
                 url = url,
@@ -479,19 +491,24 @@ object SandboxServerManager {
     }
 
     fun markServerStopped(port: Int) {
-        val current = _servers.value.toMutableList()
-        val idx = current.indexOfFirst { it.port == port }
-        if (idx >= 0) {
-            current[idx] = current[idx].copy(
-                status = SandboxServerStatus.STOPPED,
-                lastCheckedAtMs = System.currentTimeMillis(),
-            )
-            _servers.value = current
+        val now = System.currentTimeMillis()
+        _servers.update { list ->
+            val idx = list.indexOfFirst { it.port == port }
+            if (idx >= 0) {
+                list.toMutableList().also {
+                    it[idx] = it[idx].copy(
+                        status = SandboxServerStatus.STOPPED,
+                        lastCheckedAtMs = now,
+                    )
+                }
+            } else {
+                list
+            }
         }
     }
 
     fun removeServer(port: Int) {
-        _servers.value = _servers.value.filterNot { it.port == port }
+        _servers.update { list -> list.filterNot { it.port == port } }
     }
 
     /**
@@ -500,22 +517,24 @@ object SandboxServerManager {
     fun refreshStatuses(context: Context? = null) {
         scope.launch {
             context?.let { syncRootfsServerMeta(it) }
-            val current = _servers.value
-            if (current.isEmpty()) return@launch
+            val snapshot = _servers.value
+            if (snapshot.isEmpty()) return@launch
             val now = System.currentTimeMillis()
-            val updated = current.map { srv ->
-                val alive = probePort(srv.port, 200)
-                srv.copy(
-                    status = if (alive) SandboxServerStatus.LIVE else SandboxServerStatus.STOPPED,
-                    lastCheckedAtMs = now,
-                )
+            val statusByPort = snapshot.associate { srv ->
+                srv.port to if (probePort(srv.port, 200)) SandboxServerStatus.LIVE else SandboxServerStatus.STOPPED
             }
-            _servers.value = updated
+            _servers.update { list ->
+                list.map { srv ->
+                    val newStatus = statusByPort[srv.port] ?: srv.status
+                    srv.copy(status = newStatus, lastCheckedAtMs = now)
+                }
+            }
         }
     }
 
     /**
-     * Read stdout/stderr logs for the sandbox server on [port].
+     * Read stdout/stderr logs for the sandbox server on [port] using a bounded
+     * tail read (at most 128 KB) so huge log files never cause OutOfMemoryError.
      */
     suspend fun readServerLogs(context: Context, port: Int, maxLines: Int = 120): String =
         withContext(Dispatchers.IO) {
@@ -532,8 +551,22 @@ object SandboxServerManager {
                 return@withContext ""
             }
             runCatching {
-                val lines = logFile.readLines()
-                lines.takeLast(maxLines).joinToString("\n")
+                val maxTailBytes = 128 * 1024L
+                val length = logFile.length()
+                val text = if (length <= maxTailBytes) {
+                    logFile.readText(Charsets.UTF_8)
+                } else {
+                    RandomAccessFile(logFile, "r").use { raf ->
+                        val startOffset = length - maxTailBytes
+                        raf.seek(startOffset)
+                        val buf = ByteArray(maxTailBytes.toInt())
+                        val n = raf.read(buf)
+                        val decoded = if (n > 0) String(buf, 0, n, Charsets.UTF_8) else ""
+                        val firstNl = decoded.indexOf('\n')
+                        if (firstNl in 0 until decoded.length - 1) decoded.substring(firstNl + 1) else decoded
+                    }
+                }
+                text.lines().takeLast(maxLines).joinToString("\n")
             }.getOrDefault("")
         }
 
@@ -605,9 +638,9 @@ object SandboxServerManager {
             val launchCmd = if (cmd.contains("minis-serve")) {
                 cmd
             } else {
-                val safeTitle = srv.title.replace("\"", "\\\"")
-                val safeWorkdir = srv.workdir.ifBlank { "/var/minis/workspace" }
-                "/usr/local/bin/minis-serve start --port $port --title \"$safeTitle\" --workdir \"$safeWorkdir\" -- $cmd"
+                val safeTitle = srv.title.replace("'", "'\\''")
+                val safeWorkdir = srv.workdir.ifBlank { "/var/minis/workspace" }.replace("'", "'\\''")
+                "/usr/local/bin/minis-serve start --port $port --title '$safeTitle' --workdir '$safeWorkdir' -- $cmd"
             }
             runCatching {
                 ExecutionCoordinator.execute(

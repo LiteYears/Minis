@@ -25,11 +25,26 @@ object WebAppPathResolver {
     fun resolve(context: Context, shortcut: WebAppShortcutEntity): File? {
         val file = when (shortcut.pathScope) {
             WebAppShortcutRepository.SCOPE_SESSION_ATTACHMENT -> resolveSession(context, shortcut)
-            WebAppShortcutRepository.SCOPE_SHARED -> PRootKernel.resolveHostPath(shortcut.htmlPath)
-            WebAppShortcutRepository.SCOPE_MOUNT -> PRootKernel.resolveHostPath(shortcut.htmlPath)
+            WebAppShortcutRepository.SCOPE_SHARED -> resolveScopedGlobal(
+                rawLinuxPath = shortcut.htmlPath,
+                expectedPrefix = "/var/minis/shared",
+            )
+            WebAppShortcutRepository.SCOPE_MOUNT -> {
+                val mountName = shortcut.scopeContext?.takeIf { it.isNotBlank() && !it.contains('/') && it != "." && it != ".." }
+                val prefix = if (mountName != null) "/var/minis/mounts/$mountName" else "/var/minis/mounts"
+                resolveScopedGlobal(rawLinuxPath = shortcut.htmlPath, expectedPrefix = prefix)
+            }
             else -> null
         }
         return file?.takeIf { it.exists() && it.isFile }
+    }
+
+    private fun resolveScopedGlobal(rawLinuxPath: String, expectedPrefix: String): File? {
+        val clean = rawLinuxPath.trim()
+        if (clean != expectedPrefix && !clean.startsWith("$expectedPrefix/")) return null
+        val target = PRootKernel.resolveHostPath(clean) ?: return null
+        val rootDir = PRootKernel.resolveHostPath(expectedPrefix) ?: return null
+        return verifyCanonicalContainment(rootDir, target)
     }
 
     /**
@@ -37,21 +52,23 @@ object WebAppPathResolver {
      * scopeContext, linuxPath)` triple suitable for
      * [WebAppShortcutRepository.create]. Walks the
      * [PRootKernel.bindMounts] map looking for an entry whose host
-     * directory is a prefix of [hostFile]; returns null if none matches
-     * (caller should hide the "Add to Home Screen" menu item).
+     * directory is a prefix of [hostFile], and also checks per-session
+     * `minis-sessions/<sessionId>/<subdir>` directories; returns null if
+     * none matches (caller should hide the "Add to Home Screen" menu item).
      *
      * Mapping rules:
      *  - `/var/minis/shared` bind  → `pathScope = "shared"`,  `scopeContext = null`
      *  - `/var/minis/mounts/<n>`   → `pathScope = "mount"`,   `scopeContext = "<n>"`
-     *  - everything else (incl. memory/skills, per-session subdirs, rootfs) → null
+     *  - `minis-sessions/<sid>/<subdir>/...` → `pathScope = "session_attachment"`, `scopeContext = "<sid>"`
+     *  - everything else (incl. memory/skills, rootfs) → null
      */
     fun inferScope(hostFile: File): Triple<String, String?, String>? {
-        val hostAbs = hostFile.absolutePath
+        val hostAbs = runCatching { hostFile.canonicalPath }.getOrDefault(hostFile.absolutePath)
         // Longest host-prefix wins, mirroring resolveHostPath's longest-key match.
         val sorted = com.openminis.app.sandbox.PRootKernel
             .bindMounts.entries.sortedByDescending { it.value.length }
         for ((linuxPrefix, hostBase) in sorted) {
-            val baseNorm = hostBase.trimEnd('/')
+            val baseNorm = runCatching { File(hostBase).canonicalPath }.getOrDefault(hostBase).trimEnd('/')
             if (hostAbs == baseNorm || hostAbs.startsWith("$baseNorm/")) {
                 val tail = hostAbs.removePrefix(baseNorm).removePrefix("/")
                 val linuxPath = if (tail.isEmpty()) linuxPrefix else "$linuxPrefix/$tail"
@@ -67,18 +84,64 @@ object WebAppPathResolver {
                 }
             }
         }
+
+        // Check per-session directories: .../minis-sessions/<sid>/<subdir>/<rel>
+        val minisSessionsMarker = "/minis-sessions/"
+        val markerIdx = hostAbs.indexOf(minisSessionsMarker)
+        if (markerIdx >= 0) {
+            val afterMarker = hostAbs.substring(markerIdx + minisSessionsMarker.length)
+            val parts = afterMarker.split('/', limit = 3)
+            if (parts.size == 3) {
+                val sid = parts[0]
+                val subdir = parts[1]
+                val rel = parts[2]
+                if (sid.isNotBlank() && subdir in setOf("workspace", "attachments", "offloads", "browser") && rel.isNotBlank()) {
+                    return Triple(
+                        WebAppShortcutRepository.SCOPE_SESSION_ATTACHMENT,
+                        sid,
+                        "/var/minis/$subdir/$rel",
+                    )
+                }
+            }
+        }
         return null
     }
 
     private fun resolveSession(context: Context, shortcut: WebAppShortcutEntity): File? {
-        val sessionId = shortcut.scopeContext ?: return null
+        val sessionId = shortcut.scopeContext
+            ?.takeIf { it.isNotBlank() && !it.contains('/') && !it.contains('\\') && it != "." && it != ".." }
+            ?: return null
+
         // Absolute /var/minis/<perSession>/... — go through PRootKernel which
         // knows how to map per-session subdirs to <filesDir>/minis-sessions/<id>/<sub>.
         if (shortcut.htmlPath.startsWith("/var/minis/")) {
-            return PRootKernel.resolveSessionHostPath(sessionId, shortcut.htmlPath, context)
+            val sessionRoot = File(context.filesDir, "minis-sessions/$sessionId")
+            val resolved = PRootKernel.resolveSessionHostPath(sessionId, shortcut.htmlPath, context) ?: return null
+            return verifyCanonicalContainment(sessionRoot, resolved)
         }
-        // Relative path — under the session's attachments dir.
-        val attachmentsDir = File(context.filesDir, "sessions/$sessionId/attachments")
-        return File(attachmentsDir, shortcut.htmlPath)
+
+        // Relative path — check current minis-sessions/<id>/attachments first,
+        // then fall back to legacy sessions/<id>/attachments.
+        val primaryDir = File(context.filesDir, "minis-sessions/$sessionId/attachments")
+        val primaryCandidate = verifyCanonicalContainment(primaryDir, File(primaryDir, shortcut.htmlPath))
+        if (primaryCandidate != null && primaryCandidate.exists()) {
+            return primaryCandidate
+        }
+        val legacyDir = File(context.filesDir, "sessions/$sessionId/attachments")
+        return verifyCanonicalContainment(legacyDir, File(legacyDir, shortcut.htmlPath))
+    }
+
+    private fun verifyCanonicalContainment(rootDir: File, target: File): File? {
+        return try {
+            val rootCanonical = rootDir.canonicalPath
+            val targetCanonical = target.canonicalPath
+            if (targetCanonical == rootCanonical || targetCanonical.startsWith("$rootCanonical/")) {
+                target
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
     }
 }

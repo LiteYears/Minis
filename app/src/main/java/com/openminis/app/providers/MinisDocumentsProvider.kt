@@ -147,6 +147,9 @@ class MinisDocumentsProvider : DocumentsProvider() {
     override fun queryDocument(documentId: String, projection: Array<String>?): Cursor {
         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
         val file = resolveDoc(documentId)
+        if (!file.exists()) {
+            throw FileNotFoundException("Document not found: $documentId")
+        }
         val displayName = if (documentId.isEmpty()) "Minis" else file.name
         cursor.newRow()
             .add(Document.COLUMN_DOCUMENT_ID, documentId)
@@ -166,6 +169,9 @@ class MinisDocumentsProvider : DocumentsProvider() {
         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
         val cleanParent = parentDocumentId.trim().trim('/')
         val parent = resolveDoc(cleanParent)
+        if (!parent.exists() || !parent.isDirectory) {
+            throw FileNotFoundException("Directory not found: $parentDocumentId")
+        }
         val isRoot = cleanParent.isEmpty()
         val children = parent.listFiles()?.toList() ?: emptyList()
         for (child in children) {
@@ -192,6 +198,9 @@ class MinisDocumentsProvider : DocumentsProvider() {
     ): ParcelFileDescriptor {
         val clean = documentId.trim().trim('/')
         val file = resolveDoc(clean)
+        if (!file.exists()) {
+            throw FileNotFoundException("Document not found: $documentId")
+        }
         val parcelMode = ParcelFileDescriptor.parseMode(mode)
         // Reject writes against the read-only subtrees even if the client
         // ignored the flags cursor — belt + suspenders for AI skills.
@@ -216,13 +225,15 @@ class MinisDocumentsProvider : DocumentsProvider() {
             throw UnsupportedOperationException("Root directory is read-only")
         }
         val parent = resolveDoc(cleanParent)
+        if (!parent.exists() || !parent.isDirectory) {
+            throw FileNotFoundException("Parent directory not found: $parentDocumentId")
+        }
         val top = cleanParent.substringBefore('/')
         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
-        val safeName = displayName.replace("/", "_").replace("\\", "_").trim()
-            .let { if (it.isEmpty() || it == "." || it == "..") "_" else it }
-        val created = File(parent, safeName)
+        val safeName = sanitizeDisplayName(displayName)
+        val created = allocateUniqueTarget(parent, safeName, isDir = mimeType == Document.MIME_TYPE_DIR)
         val ok = if (mimeType == Document.MIME_TYPE_DIR) created.mkdirs() else created.createNewFile()
-        if (!ok && !created.exists()) throw FileNotFoundException("Failed to create $safeName")
+        if (!ok && !created.exists()) throw FileNotFoundException("Failed to create ${created.name}")
         return documentIdFor(created)
     }
 
@@ -234,7 +245,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
         val file = resolveDoc(clean)
         val top = clean.substringBefore('/')
         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
-        if (!file.deleteRecursively()) throw FileNotFoundException("Failed to delete $documentId")
+        if (!file.exists() || !file.deleteRecursively()) throw FileNotFoundException("Failed to delete $documentId")
     }
 
     override fun renameDocument(documentId: String, displayName: String): String {
@@ -243,12 +254,35 @@ class MinisDocumentsProvider : DocumentsProvider() {
             throw UnsupportedOperationException("Top-level directory cannot be renamed")
         }
         val file = resolveDoc(clean)
+        if (!file.exists()) throw FileNotFoundException("Document not found: $documentId")
         val top = clean.substringBefore('/')
         if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
-        val safe = displayName.replace("/", "_").replace("\\", "_").trim()
-            .let { if (it.isEmpty() || it == "." || it == "..") "_" else it }
-        val target = File(file.parentFile, safe)
+        val safe = sanitizeDisplayName(displayName)
+        val parentDir = file.parentFile ?: throw FileNotFoundException("No parent directory for $documentId")
+        val target = if (safe == file.name) {
+            return documentIdFor(file)
+        } else {
+            allocateUniqueTarget(parentDir, safe, isDir = file.isDirectory)
+        }
         if (!file.renameTo(target)) throw FileNotFoundException("Failed to rename $documentId")
         return documentIdFor(target)
+    }
+
+    private fun sanitizeDisplayName(raw: String): String {
+        val cleaned = raw.replace("/", "_").replace("\\", "_").replace("\u0000", "").trim()
+        return if (cleaned.isEmpty() || cleaned == "." || cleaned == "..") "_" else cleaned
+    }
+
+    private fun allocateUniqueTarget(parent: File, baseName: String, isDir: Boolean): File {
+        var candidate = File(parent, baseName)
+        if (!candidate.exists()) return candidate
+        val dotIdx = if (!isDir) baseName.lastIndexOf('.') else -1
+        val stem = if (dotIdx > 0) baseName.substring(0, dotIdx) else baseName
+        val ext = if (dotIdx > 0) baseName.substring(dotIdx) else ""
+        for (i in 1..999) {
+            candidate = File(parent, "$stem ($i)$ext")
+            if (!candidate.exists()) return candidate
+        }
+        return File(parent, "${stem}_${System.currentTimeMillis()}$ext")
     }
 }
