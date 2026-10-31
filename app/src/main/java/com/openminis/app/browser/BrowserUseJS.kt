@@ -95,7 +95,34 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
 
     fun click(selector: String): String = guardedRead("""
         (function() {
-            var el = document.querySelector('${jsQuote(selector)}');
+            var rawSel = '${jsQuote(selector)}';
+            var el = null;
+            try {
+                el = document.querySelector(rawSel);
+            } catch (e) {
+                el = null;
+            }
+            if (!el && rawSel) {
+                var needle = rawSel.replace(/^.*has-text\(['"]?(.*?)['"]?\).*$/i, '$1').trim().toLowerCase();
+                if (needle.length >= 2) {
+                    var candidates = document.querySelectorAll('button, a, [role="button"], input[type="submit"], input[type="button"], summary, label');
+                    var exactMatch = null;
+                    var partialMatches = [];
+                    for (var i = 0; i < candidates.length; i++) {
+                        var c = candidates[i];
+                        var label = ((c.innerText || c.value || c.getAttribute('aria-label') || '') + '').trim().toLowerCase();
+                        if (!label) continue;
+                        if (label === needle) {
+                            exactMatch = c;
+                            break;
+                        } else if (label.indexOf(needle) !== -1 && label.length <= needle.length + 40) {
+                            partialMatches.push(c);
+                        }
+                    }
+                    if (exactMatch) el = exactMatch;
+                    else if (partialMatches.length === 1) el = partialMatches[0];
+                }
+            }
             if (!el) return JSON.stringify({error: 'Element not found: ${jsQuote(selector)}'});
             if (el.disabled) return JSON.stringify({error: 'Element is disabled', tag: el.tagName});
             var bOpts = {bubbles: true, cancelable: true, view: window};

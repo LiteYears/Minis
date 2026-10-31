@@ -572,7 +572,8 @@ object FileEditTool {
                 ?: return ToolExecutionResult("Error: Cannot resolve path: $path", false, toolTitle = toolTitle)
 
             if (!file.exists()) {
-                return ToolExecutionResult("Error: File not found: $path", false, toolTitle = toolTitle)
+                val hint = FileReadTool.suggestNearbyFilesHint(file, path)
+                return ToolExecutionResult("Error: File not found: $path$hint", false, toolTitle = toolTitle)
             }
 
             // [T-port-filetool-size-guard] Read, replace and write back off
@@ -633,7 +634,20 @@ object FileEditTool {
         }
 
         if (count == 0) {
-            return ToolExecutionResult("Error: old_string not found in $path", false, toolTitle = toolTitle)
+            // Fallback 1 & 2: try line-based trailing-whitespace / CRLF normalization
+            // or unique indentation-insensitive matching for weaker models.
+            val fuzzyEdited = tryFuzzyLineEdit(content, oldString, newString, replaceAll)
+            if (fuzzyEdited != null) {
+                file.writeText(fuzzyEdited.newContent)
+                val syntaxWarn = validateJsonSyntaxWarning(path, fuzzyEdited.newContent)
+                return ToolExecutionResult(
+                    "Edited $path (${fuzzyEdited.replacements} replacement(s), ${fuzzyEdited.newContent.length} bytes, ${fuzzyEdited.note})$syntaxWarn",
+                    true, toolTitle = toolTitle
+                )
+            }
+
+            val closestHint = buildClosestMatchHint(content, oldString, path)
+            return ToolExecutionResult("Error: old_string not found in $path$closestHint", false, toolTitle = toolTitle)
         }
 
         if (count > 1 && !replaceAll) {
@@ -652,10 +666,223 @@ object FileEditTool {
 
         file.writeText(newContent)
         val replacements = if (replaceAll) count else 1
+        val syntaxWarn = validateJsonSyntaxWarning(path, newContent)
         return ToolExecutionResult(
-            "Edited $path ($replacements replacement(s), ${newContent.length} bytes)",
+            "Edited $path ($replacements replacement(s), ${newContent.length} bytes)$syntaxWarn",
             true, toolTitle = toolTitle
         )
+    }
+
+    private data class FuzzyEditOutcome(
+        val newContent: String,
+        val replacements: Int,
+        val note: String,
+    )
+
+    private fun tryFuzzyLineEdit(
+        content: String,
+        oldString: String,
+        newString: String,
+        replaceAll: Boolean,
+    ): FuzzyEditOutcome? {
+        if (content.isEmpty() || oldString.isBlank()) return null
+        val lineSep = if (content.contains("\r\n")) "\r\n" else "\n"
+        val contentLines = content.split(Regex("\r?\n"))
+        val oldLines = oldString.split(Regex("\r?\n"))
+        val newLines = newString.split(Regex("\r?\n"))
+        if (oldLines.isEmpty() || oldLines.size > contentLines.size) return null
+
+        // Pass A: Trailing-whitespace & CRLF tolerant match (preserves leading indent)
+        val oldTrimEnd = oldLines.map { it.trimEnd(' ', '\t', '\r') }
+        if (oldTrimEnd.any { it.isNotEmpty() }) {
+            val matches = mutableListOf<Int>()
+            var i = 0
+            val maxStart = contentLines.size - oldLines.size
+            while (i <= maxStart) {
+                var matched = true
+                for (j in oldLines.indices) {
+                    if (contentLines[i + j].trimEnd(' ', '\t', '\r') != oldTrimEnd[j]) {
+                        matched = false
+                        break
+                    }
+                }
+                if (matched) {
+                    matches.add(i)
+                    i += oldLines.size
+                } else {
+                    i++
+                }
+            }
+            if (matches.size == 1 || (replaceAll && matches.isNotEmpty())) {
+                val updated = applyLineMatches(contentLines, matches, oldLines.size, newLines, adjustIndent = false, oldLines = oldLines)
+                return FuzzyEditOutcome(
+                    newContent = updated.joinToString(lineSep),
+                    replacements = if (replaceAll) matches.size else 1,
+                    note = "normalized trailing whitespace",
+                )
+            }
+        }
+
+        // Pass B: Indentation-insensitive unique match (only when oldString has >=2 lines
+        // or a single line with >=12 non-whitespace characters, and matches EXACTLY once).
+        val nonBlankOld = oldLines.filter { it.isNotBlank() }
+        val totalNonWsChars = nonBlankOld.sumOf { it.trim().length }
+        if (nonBlankOld.isEmpty() || (oldLines.size == 1 && totalNonWsChars < 12)) return null
+
+        val oldTrimBoth = oldLines.map { it.trim() }
+        val indentMatches = mutableListOf<Int>()
+        for (start in 0..(contentLines.size - oldLines.size)) {
+            var matched = true
+            for (j in oldLines.indices) {
+                if (contentLines[start + j].trim() != oldTrimBoth[j]) {
+                    matched = false
+                    break
+                }
+            }
+            if (matched) indentMatches.add(start)
+        }
+
+        if (indentMatches.size == 1) {
+            val updated = applyLineMatches(
+                contentLines = contentLines,
+                matches = indentMatches,
+                spanLength = oldLines.size,
+                newLines = newLines,
+                adjustIndent = true,
+                oldLines = oldLines,
+            )
+            return FuzzyEditOutcome(
+                newContent = updated.joinToString(lineSep),
+                replacements = 1,
+                note = "matched with normalized indentation",
+            )
+        }
+        return null
+    }
+
+    private fun applyLineMatches(
+        contentLines: List<String>,
+        matches: List<Int>,
+        spanLength: Int,
+        newLines: List<String>,
+        adjustIndent: Boolean,
+        oldLines: List<String>,
+    ): List<String> {
+        val result = ArrayList<String>(contentLines.size + newLines.size)
+        var cursor = 0
+        for (matchStart in matches) {
+            while (cursor < matchStart) {
+                result.add(contentLines[cursor])
+                cursor++
+            }
+            val replacementLines = if (adjustIndent) {
+                reindentReplacement(
+                    matchedFileLines = contentLines.subList(matchStart, matchStart + spanLength),
+                    oldLines = oldLines,
+                    newLines = newLines,
+                )
+            } else {
+                newLines
+            }
+            result.addAll(replacementLines)
+            cursor = matchStart + spanLength
+        }
+        while (cursor < contentLines.size) {
+            result.add(contentLines[cursor])
+            cursor++
+        }
+        return result
+    }
+
+    private fun reindentReplacement(
+        matchedFileLines: List<String>,
+        oldLines: List<String>,
+        newLines: List<String>,
+    ): List<String> {
+        val firstNonBlankIdx = oldLines.indexOfFirst { it.isNotBlank() }
+        if (firstNonBlankIdx < 0 || firstNonBlankIdx >= matchedFileLines.size) return newLines
+        val fileIndent = matchedFileLines[firstNonBlankIdx].takeWhile { it == ' ' || it == '\t' }
+        val oldIndent = oldLines[firstNonBlankIdx].takeWhile { it == ' ' || it == '\t' }
+        if (fileIndent == oldIndent) return newLines
+        return newLines.map { line ->
+            if (line.isBlank()) {
+                line
+            } else if (oldIndent.isNotEmpty() && line.startsWith(oldIndent)) {
+                fileIndent + line.substring(oldIndent.length)
+            } else if (oldIndent.isEmpty()) {
+                fileIndent + line
+            } else {
+                line
+            }
+        }
+    }
+
+    /**
+     * Finds the closest window of lines in [content] to [oldString] so a model
+     * that got a line or indentation slightly wrong sees the exact surrounding
+     * lines directly in the tool error without an extra `file_read` round-trip.
+     */
+    private fun buildClosestMatchHint(content: String, oldString: String, path: String): String {
+        return try {
+            val contentLines = content.split(Regex("\r?\n"))
+            if (contentLines.isEmpty() || contentLines.size > 5000) return ""
+            val oldNonBlank = oldString.split(Regex("\r?\n")).map { it.trim() }.filter { it.isNotEmpty() }
+            if (oldNonBlank.isEmpty()) return ""
+            val anchor = oldNonBlank.maxByOrNull { it.length } ?: return ""
+            if (anchor.length < 4) return ""
+
+            var bestLineIdx = -1
+            var bestScore = 0.0
+            val anchorTokens = anchor.lowercase().split(Regex("[^a-z0-9_]+")).filter { it.length >= 2 }.toSet()
+
+            for (i in contentLines.indices) {
+                val cand = contentLines[i].trim()
+                if (cand.isEmpty()) continue
+                val score = when {
+                    cand.equals(anchor, ignoreCase = true) -> 1.0
+                    cand.contains(anchor, ignoreCase = true) || anchor.contains(cand, ignoreCase = true) ->
+                        0.85 * (minOf(cand.length, anchor.length).toDouble() / maxOf(cand.length, anchor.length).coerceAtLeast(1))
+                    anchorTokens.isNotEmpty() -> {
+                        val candTokens = cand.lowercase().split(Regex("[^a-z0-9_]+")).filter { it.length >= 2 }.toSet()
+                        val overlap = anchorTokens.intersect(candTokens).size
+                        overlap.toDouble() / maxOf(anchorTokens.size, candTokens.size).coerceAtLeast(1)
+                    }
+                    else -> 0.0
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    bestLineIdx = i
+                }
+            }
+
+            if (bestLineIdx < 0 || bestScore < 0.35) return ""
+            val pad = (oldNonBlank.size.coerceAtMost(8) / 2) + 2
+            val fromIdx = (bestLineIdx - pad).coerceAtLeast(0)
+            val toIdx = (bestLineIdx + pad).coerceAtMost(contentLines.lastIndex)
+            val snippet = (fromIdx..toIdx).joinToString("\n") { idx ->
+                val lineText = contentLines[idx].take(160)
+                "${idx + 1}: $lineText"
+            }
+            "\nClosest match in $path (lines ${fromIdx + 1}-${toIdx + 1}, copy exact text/indentation for old_string):\n$snippet"
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    internal fun validateJsonSyntaxWarning(path: String, text: String): String {
+        if (!path.endsWith(".json", ignoreCase = true) || text.length > 262_144) return ""
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return "\n[Syntax Warning: $path is empty and not valid JSON.]"
+        return try {
+            if (trimmed.startsWith("[")) {
+                JSONArray(trimmed)
+            } else {
+                JSONObject(trimmed)
+            }
+            ""
+        } catch (e: Exception) {
+            "\n[Syntax Warning: $path has invalid JSON (${e.message?.take(120)}). Fix it with file_edit before using this file.]"
+        }
     }
 }
 
@@ -791,7 +1018,8 @@ object FileWriteTool {
                     )
                 }
             }
-            ToolExecutionResult("Wrote to $path ($bytes bytes)", true, toolTitle = toolTitle)
+            val syntaxWarn = if (!append) FileEditTool.validateJsonSyntaxWarning(path, content) else ""
+            ToolExecutionResult("Wrote to $path ($bytes bytes)$syntaxWarn", true, toolTitle = toolTitle)
         } catch (e: Exception) {
             ToolExecutionResult("Error writing file: ${e.message}", false)
         }

@@ -66,11 +66,13 @@ object FileReadTool {
                 ?: return ToolExecutionResult("Error: Cannot resolve path: $path", false, toolTitle = toolTitle)
 
             if (!file.exists()) {
-                return ToolExecutionResult("Error: File not found: $path", false, toolTitle = toolTitle)
+                val hint = suggestNearbyFilesHint(file, path)
+                return ToolExecutionResult("Error: File not found: $path$hint", false, toolTitle = toolTitle)
             }
 
             if (file.isDirectory) {
-                return ToolExecutionResult("Error: Path is a directory: $path", false, toolTitle = toolTitle)
+                val hint = directoryEntriesHint(file, path)
+                return ToolExecutionResult("Error: Path is a directory: $path$hint", false, toolTitle = toolTitle)
             }
 
             val requestedLines = if (args.has("lines")) args.optInt("lines") else null
@@ -95,6 +97,61 @@ object FileReadTool {
             }
         } catch (e: Exception) {
             ToolExecutionResult("Error reading file: ${e.message}", false)
+        }
+    }
+
+    /**
+     * Builds a short, actionable hint when [file] does not exist so weak models
+     * immediately see case-insensitive matches or sibling files in the parent
+     * directory without burning an extra `shell_execute("ls ...")` turn.
+     */
+    internal fun suggestNearbyFilesHint(file: File, requestedPath: String): String {
+        return try {
+            val targetName = file.name.lowercase()
+            val parent = file.parentFile
+            if (parent != null && parent.exists() && parent.isDirectory) {
+                val entries = parent.listFiles()?.toList().orEmpty()
+                if (entries.isEmpty()) {
+                    return "\n(Parent directory '${requestedPath.substringBeforeLast('/').ifEmpty { "/" }}' exists but is empty.)"
+                }
+                val similar = entries.filter { entry ->
+                    val n = entry.name.lowercase()
+                    n == targetName || n.contains(targetName) || targetName.contains(n)
+                }.sortedBy { it.name }.take(8)
+                val parentLinuxPath = requestedPath.substringBeforeLast('/').ifEmpty { "/" }
+                return if (similar.isNotEmpty()) {
+                    val formatted = similar.joinToString(", ") {
+                        if (it.isDirectory) "$parentLinuxPath/${it.name}/" else "$parentLinuxPath/${it.name}"
+                    }
+                    "\nDid you mean: $formatted"
+                } else {
+                    val sample = entries.sortedBy { it.name }.take(15).joinToString(", ") {
+                        if (it.isDirectory) "${it.name}/" else it.name
+                    }
+                    val more = if (entries.size > 15) " (+${entries.size - 15} more)" else ""
+                    "\nEntries in $parentLinuxPath: $sample$more"
+                }
+            }
+            ""
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun directoryEntriesHint(dir: File, requestedPath: String): String {
+        return try {
+            val entries = dir.listFiles()?.sortedBy { it.name }.orEmpty()
+            if (entries.isEmpty()) {
+                "\n(Directory is empty.)"
+            } else {
+                val preview = entries.take(30).joinToString(", ") {
+                    if (it.isDirectory) "${it.name}/" else it.name
+                }
+                val more = if (entries.size > 30) " (+${entries.size - 30} more)" else ""
+                "\nDirectory contents ($requestedPath): $preview$more\nPass a file path inside this directory to file_read."
+            }
+        } catch (_: Throwable) {
+            ""
         }
     }
 

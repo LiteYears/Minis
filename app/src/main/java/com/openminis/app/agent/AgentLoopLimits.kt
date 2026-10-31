@@ -564,6 +564,7 @@ data class ToolCallRecord(
     val unknownToolName: String? = null,
     val toolCallId: String? = null,
     val timestamp: Long = System.currentTimeMillis(),
+    val isError: Boolean = false,
 )
 
 enum class Level { NONE, WARNING, CRITICAL }
@@ -819,6 +820,7 @@ class ToolLoopDetector(private val config: ToolLoopConfig = ToolLoopConfig()) {
             resultHash = resultHash,
             unknownToolName = unknownToolName,
             toolCallId = toolCallId,
+            isError = errorMessage != null,
         ))
         while (history.size > config.historySize) history.removeFirst()
 
@@ -849,10 +851,46 @@ class ToolLoopDetector(private val config: ToolLoopConfig = ToolLoopConfig()) {
             }
         }
 
+        // 5. consecutive_tool_errors — catches weak models that slightly tweak
+        //    arguments on every turn (so argsHash changes) while failing 3+
+        //    times in a row on the same tool.
+        if (errorMessage != null && unknownToolName == null) {
+            val errorStreak = countConsecutiveToolErrorStreak(toolName)
+            if (errorStreak >= 3) {
+                val key = "error_streak:$toolName"
+                if (shouldEmitEvery(key, errorStreak - 2, 3)) {
+                    val hint = recoveryHintForTool(toolName)
+                    val msg = "[RECOVERY HINT] $toolName has failed $errorStreak times in a row. $hint"
+                    AppLogger.debug("ToolLoopDetector",
+                        "WARNING consecutive_tool_errors tool=$toolName streak=$errorStreak")
+                    return LoopCheckResult(Level.WARNING, msg, key)
+                }
+            }
+        } else if (errorMessage == null) {
+            warningBuckets.remove("error_streak:$toolName")
+        }
+
         return LoopCheckResult.NONE
     }
 
     // ─── strategy helpers ────────────────────────────────────────────────────
+
+    private fun countConsecutiveToolErrorStreak(toolName: String): Int {
+        var streak = 0
+        for (rec in history.reversed()) {
+            if (rec.toolName != toolName) break
+            if (rec.isError) streak++ else break
+        }
+        return streak
+    }
+
+    private fun recoveryHintForTool(toolName: String): String = when (toolName) {
+        "file_edit" -> "Stop guessing old_string. Either copy the exact lines from the Closest match snippet above, call file_read on the target line range, or use file_write to rewrite the file."
+        "file_read" -> "Check the 'Did you mean' / directory listing hint in the error above, or verify the path before retrying."
+        "shell_execute" -> "Inspect the stderr/exit status above and test a simpler command or check paths/installed packages first."
+        "browser_use" -> "Call browser_use with action='som_snapshot' or action='get_text' to inspect the current page elements before retrying."
+        else -> "Change your approach or inspect the state with a read/status tool instead of repeating the same failing operation."
+    }
 
     /**
      * Walk the window from newest to oldest and count how many *consecutive*

@@ -1935,24 +1935,46 @@ object ToolJsonRepair {
 
         val repairs = mutableListOf<String>()
 
-        // Strategy 1: truncation repair. Only fires when the dict is empty
-        // (or otherwise unusable) but the raw stream tail looks like a JSON
-        // object that just got cut. Try appending closure suffixes; the
-        // first one that parses wins, and we copy fields back into [args].
+        // Strategy 1: truncation & formatting repair. Only fires when the dict
+        // is empty (or otherwise unusable) but the raw stream tail looks like a
+        // JSON object that got wrapped in markdown fences, has trailing commas,
+        // or got cut mid-stream.
         if (args.length() == 0 && !rawTail.isNullOrBlank()) {
-            val tail = rawTail.trim()
-            val suffixes = listOf("", "\"", "\"}", "\"]}", "}", "}}", "]}", "]}}", "]", "]]")
-            for (suffix in suffixes) {
-                val candidate = tail + suffix
-                val parsed = tryParseObject(candidate) ?: continue
-                val keys = parsed.keys().asSequence().toList()
-                for (k in keys) args.put(k, parsed.opt(k))
-                repairs.add("truncation+" + if (suffix.isEmpty()) "noop" else suffix)
-                break
+            val cleanedTail = stripFencesAndTrailingCommas(rawTail.trim())
+            val directParsed = if (cleanedTail != rawTail.trim()) tryParseObject(cleanedTail) else null
+            if (directParsed != null) {
+                val keys = directParsed.keys().asSequence().toList()
+                for (k in keys) args.put(k, directParsed.opt(k))
+                repairs.add("json-cleanup")
+            } else {
+                val suffixes = listOf("", "\"", "\"}", "\"]}", "}", "}}", "]}", "]}}", "]", "]]")
+                for (suffix in suffixes) {
+                    val candidate = cleanedTail + suffix
+                    val parsed = tryParseObject(candidate) ?: continue
+                    val keys = parsed.keys().asSequence().toList()
+                    for (k in keys) args.put(k, parsed.opt(k))
+                    repairs.add("truncation+" + if (suffix.isEmpty()) "noop" else suffix)
+                    break
+                }
             }
         }
 
-        // Strategy 2: type coercion on required fields.
+        val schemaFields = toolDef.parameters.keys
+
+        // Strategy 2a: semantic alias normalization for weak models that emit
+        // e.g. `file_path` instead of `path` or `cmd` instead of `command`.
+        for (field in schemaFields) {
+            if (args.has(field)) continue
+            val aliases = PARAM_ALIASES[field] ?: continue
+            val matchedAlias = aliases.firstOrNull { alias ->
+                alias !in schemaFields && args.has(alias) && !args.isNull(alias)
+            } ?: continue
+            args.put(field, args.opt(matchedAlias))
+            args.remove(matchedAlias)
+            repairs.add("alias:$matchedAlias->$field")
+        }
+
+        // Strategy 2b: type coercion on required fields.
         for (field in toolDef.required) {
             if (!args.has(field)) continue
             val raw = args.opt(field) ?: continue
@@ -1968,7 +1990,6 @@ object ToolJsonRepair {
         // Strategy 3: fuzzy field-name match for missing required fields. Skip
         // sibling keys that are themselves a recognized schema field — don't
         // steal a sibling that the tool helper would have read directly.
-        val schemaFields = toolDef.parameters.keys
         for (field in toolDef.required) {
             if (args.has(field)) continue
             val keys = args.keys().asSequence().toList()
@@ -1980,7 +2001,72 @@ object ToolJsonRepair {
             repairs.add("fuzzy:$candidate->$field")
         }
 
+        // Strategy 4: auto-synthesize missing `tool_title` when all other
+        // required parameters are present, so smaller models that forget the
+        // UI summary field don't fail preflight or show blank tool cards.
+        if ("tool_title" in toolDef.required) {
+            val existingTitle = args.optString("tool_title", "").trim()
+            val otherRequiredPresent = toolDef.required.all { req ->
+                req == "tool_title" || (args.has(req) && !args.isNull(req) && args.optString(req, "").isNotEmpty())
+            }
+            if (existingTitle.isEmpty() && otherRequiredPresent && args.length() > 0) {
+                val synthesized = synthesizeToolTitle(toolName, args)
+                args.put("tool_title", synthesized)
+                repairs.add("auto-title")
+            }
+        }
+
         return repairs
+    }
+
+    private val PARAM_ALIASES: Map<String, List<String>> = mapOf(
+        "path" to listOf("file_path", "filepath", "file", "filename", "target_file", "target_path"),
+        "command" to listOf("cmd", "script", "bash", "sh", "shell_command", "command_line"),
+        "old_string" to listOf("old_text", "old_str", "search", "target", "find", "original", "old"),
+        "new_string" to listOf("new_text", "new_str", "replace", "replacement", "new"),
+        "content" to listOf("text", "body", "data", "file_content", "code", "contents"),
+        "keywords" to listOf("query", "search", "keyword", "q"),
+        "selector" to listOf("css_selector", "element", "target", "xpath"),
+    )
+
+    private val TRAILING_COMMA_REGEX = Regex(""",(\s*[}\]])""")
+
+    private fun stripFencesAndTrailingCommas(raw: String): String {
+        var s = raw
+        if (s.startsWith("```")) {
+            val firstNewline = s.indexOf('\n')
+            if (firstNewline > 0) {
+                s = s.substring(firstNewline + 1)
+            } else {
+                s = s.removePrefix("```json").removePrefix("```")
+            }
+            if (s.endsWith("```")) {
+                s = s.removeSuffix("```")
+            }
+            s = s.trim()
+        }
+        return TRAILING_COMMA_REGEX.replace(s, "$1")
+    }
+
+    private fun synthesizeToolTitle(toolName: String, args: JSONObject): String {
+        val path = args.optString("path", "").trim()
+        val shortName = path.substringAfterLast('/').ifEmpty { path }.take(32)
+        return when (toolName) {
+            "file_read" -> if (shortName.isNotEmpty()) "Read $shortName" else "Read file"
+            "file_write" -> if (shortName.isNotEmpty()) "Write $shortName" else "Write file"
+            "file_edit" -> if (shortName.isNotEmpty()) "Edit $shortName" else "Edit file"
+            "shell_execute" -> {
+                val cmd = args.optString("command", "").lineSequence().firstOrNull()?.trim().orEmpty()
+                if (cmd.isNotEmpty()) "Run ${cmd.take(36)}" else "Execute shell command"
+            }
+            "browser_use" -> {
+                val action = args.optString("action", "").trim()
+                if (action.isNotEmpty()) "Browser $action" else "Browser action"
+            }
+            "memory_write" -> "Save memory note"
+            "memory_get" -> "Search memory notes"
+            else -> toolName.replace('_', ' ').replaceFirstChar { it.uppercase() }
+        }
     }
 
     private fun tryParseObject(s: String): JSONObject? = try {
