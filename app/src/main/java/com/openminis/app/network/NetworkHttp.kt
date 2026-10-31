@@ -111,10 +111,11 @@ object NetworkHttp {
 
         private fun entryAlive(): Boolean {
             val now = System.nanoTime()
-            if (now - checkedAt < 2_000_000_000L) return alive
+            val ttlNs = if (alive) 10_000_000_000L else 1_500_000_000L
+            if (now - checkedAt < ttlNs) return alive
             checkedAt = now
             alive = runCatching {
-                java.net.Socket().use { it.connect(InetSocketAddress("127.0.0.1", httpPort), 300) }
+                java.net.Socket().use { it.connect(InetSocketAddress("127.0.0.1", httpPort), 100) }
             }.isSuccess
             if (!alive) {
                 AppLogger.warning(TAG, "[Net][Session] local entry 127.0.0.1:$httpPort is gone -> " +

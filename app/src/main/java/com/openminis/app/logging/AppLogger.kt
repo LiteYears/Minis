@@ -3,6 +3,7 @@ package com.openminis.app.logging
 import android.content.Context
 import android.util.Log
 import java.io.BufferedReader
+import java.io.BufferedWriter
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileWriter
@@ -10,8 +11,8 @@ import java.io.InputStreamReader
 import java.io.OutputStream
 import java.io.PrintStream
 import java.io.PrintWriter
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 /**
@@ -27,8 +28,8 @@ object AppLogger {
     // (d83bc894). The previous 14 came from the March parity-scaffolding
     // batch with no recorded rationale — plain historical drift, not intent.
     private const val MAX_AGE_DAYS = 15
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-    private val timestampFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    private val dateFormat: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US)
+    private val timestampFormat: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS", Locale.US)
 
     private const val PREF_NAME = "logging_prefs"
     private const val KEY_ENABLED = "logging_enabled"
@@ -250,7 +251,7 @@ object AppLogger {
             }
         }
         try {
-            appendLine(dateFormat.format(Date()), "[LOGCAT] $rawLine")
+            appendLine(LocalDateTime.now().format(dateFormat), "[LOGCAT] $rawLine")
         } catch (_: Exception) {
             // Swallow — must not feed back into logcat or we loop forever.
         }
@@ -319,8 +320,8 @@ object AppLogger {
     private fun writeFileLine(channel: String, line: String) {
         if (!enabled) return
         try {
-            val now = Date()
-            appendLine(dateFormat.format(now), "[${timestampFormat.format(now)}] [$channel] $line")
+            val now = LocalDateTime.now()
+            appendLine(now.format(dateFormat), "[${now.format(timestampFormat)}] [$channel] $line")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to write captured line: ${e.message}")
         }
@@ -421,9 +422,9 @@ object AppLogger {
         // logcat-only call (all DEBUG lines at the default level, and every
         // line with file logging off) paid a Date plus two SimpleDateFormat
         // formats for nothing.
-        val now = Date()
+        val now = LocalDateTime.now()
         try {
-            appendLine(dateFormat.format(now), "[${timestampFormat.format(now)}] [$level] [$category] $message")
+            appendLine(now.format(dateFormat), "[${now.format(timestampFormat)}] [$level] [$category] $message")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to write log: ${e.message}")
         }
@@ -508,7 +509,7 @@ object AppLogger {
             writer?.close()
             val dir = logDir ?: throw IllegalStateException("AppLogger not initialized")
             val file = File(dir, "minis-$date.log")
-            writer = PrintWriter(FileWriter(file, true))
+            writer = PrintWriter(BufferedWriter(FileWriter(file, true), 16 * 1024))
             currentDate = date
         }
         return writer!!

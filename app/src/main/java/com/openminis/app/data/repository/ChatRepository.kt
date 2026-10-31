@@ -254,7 +254,9 @@ class ChatRepository(internal val dao: ChatDao) {
      */
     suspend fun setFolderForSessions(folderId: String?, sessionIds: List<String>) {
         if (sessionIds.isEmpty()) return
-        for (sid in sessionIds) dao.setSessionFolder(sid, folderId)
+        for (chunk in sessionIds.chunked(500)) {
+            dao.setSessionsFolder(chunk, folderId)
+        }
     }
 
     /**
@@ -1019,6 +1021,18 @@ class ChatRepository(internal val dao: ChatDao) {
         internal fun isEmptyAssistantCarrier(role: String, partsJson: String): Boolean =
             role == "assistant" && partsJson.trim() == ERROR_CARRIER_PARTS_JSON
 
+        private val PREVIEW_NEWLINES_REGEX = Regex("[\r\n]+")
+        private val PREVIEW_HEADING_REGEX = Regex("#{1,6}\\s")
+        private val PREVIEW_EMPHASIS_REGEX = Regex("\\*{1,3}|_{1,3}")
+        private val PREVIEW_STRIKE_REGEX = Regex("~~")
+        private val PREVIEW_CODE_REGEX = Regex("`{1,3}")
+        private val PREVIEW_BULLET_REGEX = Regex("^\\s*[-*+]\\s", RegexOption.MULTILINE)
+        private val PREVIEW_NUMBERED_REGEX = Regex("^\\s*\\d+\\.\\s", RegexOption.MULTILINE)
+        private val PREVIEW_QUOTE_REGEX = Regex("^>\\s?", RegexOption.MULTILINE)
+        private val PREVIEW_LINK_REGEX = Regex("\\[([^]]+)]\\([^)]+\\)")
+        private val PREVIEW_IMAGE_REGEX = Regex("!\\[([^]]*)]\\([^)]+\\)")
+        private val PREVIEW_WHITESPACE_REGEX = Regex("\\s{2,}")
+
         private fun cleanPreview(raw: String): String {
             // [T-preview-scheduled-tag-leak] Every internal envelope out, not
             // only the reminders (InternalTags): an attached-file listing and
@@ -1026,17 +1040,17 @@ class ChatRepository(internal val dao: ChatDao) {
             // [T-md-inline-html] <br> → space, whitelisted style tags out, before
             // the regexes below and code-aware (code keeps its `<br>`).
             return com.openminis.app.ui.markdown.InlineHtmlTags.stripForPreview(InternalTags.stripForPreview(raw))
-                .replace(Regex("[\r\n]+"), " ")      // newlines → space
-                .replace(Regex("#{1,6}\\s"), "")      // headings: ## Title → Title
-                .replace(Regex("\\*{1,3}|_{1,3}"), "")// bold/italic markers
-                .replace(Regex("~~"), "")              // strikethrough
-                .replace(Regex("`{1,3}"), "")          // inline/fenced code markers
-                .replace(Regex("^\\s*[-*+]\\s", RegexOption.MULTILINE), "") // list bullets
-                .replace(Regex("^\\s*\\d+\\.\\s", RegexOption.MULTILINE), "") // ordered list
-                .replace(Regex("^>\\s?", RegexOption.MULTILINE), "")       // blockquote
-                .replace(Regex("\\[([^]]+)]\\([^)]+\\)"), "$1") // [text](url) → text
-                .replace(Regex("!\\[([^]]*)]\\([^)]+\\)"), "$1") // ![alt](url) → alt
-                .replace(Regex("\\s{2,}"), " ")        // collapse whitespace
+                .replace(PREVIEW_NEWLINES_REGEX, " ")      // newlines → space
+                .replace(PREVIEW_HEADING_REGEX, "")        // headings: ## Title → Title
+                .replace(PREVIEW_EMPHASIS_REGEX, "")       // bold/italic markers
+                .replace(PREVIEW_STRIKE_REGEX, "")         // strikethrough
+                .replace(PREVIEW_CODE_REGEX, "")           // inline/fenced code markers
+                .replace(PREVIEW_BULLET_REGEX, "")         // list bullets
+                .replace(PREVIEW_NUMBERED_REGEX, "")       // ordered list
+                .replace(PREVIEW_QUOTE_REGEX, "")          // blockquote
+                .replace(PREVIEW_LINK_REGEX, "$1")         // [text](url) → text
+                .replace(PREVIEW_IMAGE_REGEX, "$1")        // ![alt](url) → alt
+                .replace(PREVIEW_WHITESPACE_REGEX, " ")    // collapse whitespace
                 .trim()
                 .take(100)
         }

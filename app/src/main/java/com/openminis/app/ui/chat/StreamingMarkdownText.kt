@@ -1709,6 +1709,7 @@ private fun isBlockquoteLine(trimmed: String): Boolean {
  * `[alt]` link — no preview card, no tap-to-play.
  */
 private fun splitParagraphOnInlineMedia(text: String): List<MdBlock> {
+    if (!text.contains("![")) return listOf(MdBlock.Paragraph(text))
     val matches = inlineMediaRegex.findAll(text).toList()
     if (matches.isEmpty()) return listOf(MdBlock.Paragraph(text))
 
@@ -2128,7 +2129,7 @@ internal fun isSealedBoundary(content: String, end: Int): Boolean {
             // A single-line `$$ … $$` opens and closes on the same line.
             maths += if (content.indexOf("$$", p + 2).let { it in 0 until lineEnd }) 0 else 1
         }
-        if (p < lineEnd && content.substring(p, lineEnd).isNotBlank()) {
+        if (p < lineEnd && (p + 1 < lineEnd || content[p] != '\r')) {
             lastNonBlankStart = lineStart
             lastNonBlankEnd = lineEnd
         }
@@ -2159,11 +2160,36 @@ internal fun isSealedBoundary(content: String, end: Int): Boolean {
  * loops in [parseMarkdownBlocks] would keep consuming after a blank line: a
  * list item, or any indented line (continuation / nested content).
  */
+private fun matchesThematicBreak(trimmed: String): Boolean {
+    if (trimmed.length < 3) return false
+    val c = trimmed[0]
+    return (c == '-' || c == '*' || c == '_') && trimmed.matches(thematicBreakRegex)
+}
+
+private fun matchesStandaloneImage(trimmed: String): Boolean =
+    trimmed.startsWith("![") && trimmed.matches(standaloneImageLineRegex)
+
+private fun matchesTaskListItem(trimmed: String): Boolean {
+    if (trimmed.length < 5) return false
+    val c = trimmed[0]
+    return (c == '-' || c == '*' || c == '+') && trimmed.matches(taskListItemRegex)
+}
+
+private fun matchesBulletListItem(trimmed: String): Boolean {
+    if (trimmed.length < 2) return false
+    val c = trimmed[0]
+    return (c == '-' || c == '*' || c == '+') && (trimmed[1] == ' ' || trimmed[1] == '\t') &&
+        trimmed.matches(bulletListItemRegex)
+}
+
+private fun matchesNumberedListItem(trimmed: String): Boolean =
+    trimmed.isNotEmpty() && trimmed[0].isDigit() && trimmed.matches(numberedListItemRegex)
+
 private fun isListContinuationLine(line: String): Boolean {
     if (line.isEmpty()) return false
     if (line[0] == ' ' || line[0] == '\t') return true
-    return line.matches(bulletListItemRegex) || line.matches(numberedListItemRegex) ||
-        line.matches(taskListItemRegex)
+    return matchesBulletListItem(line) || matchesNumberedListItem(line) ||
+        matchesTaskListItem(line)
 }
 
 /**
@@ -2337,19 +2363,18 @@ private suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
             }
 
             // Horizontal rule
-            trimmed.matches(thematicBreakRegex) -> {
+            matchesThematicBreak(trimmed) -> {
                 blocks.add(MdBlock.HorizontalRule(line))
                 i++
             }
 
             // Image / Video / Audio: ![alt](url) on its own line — routed by file extension.
-            trimmed.matches(standaloneImageLineRegex) -> {
+            matchesStandaloneImage(trimmed) -> {
                 val match = imageMatchRegex.find(trimmed)
                 if (match != null) {
                     val alt = match.groupValues[1]
                     val url = match.groupValues[2]
                     val blk = mediaBlockFrom(line, alt, url)
-                    android.util.Log.d("MdStream", "media match: alt=\"$alt\" url=$url -> ${blk::class.simpleName}")
                     blocks.add(blk)
                 }
                 i++
@@ -2386,10 +2411,10 @@ private suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
             }
 
             // Task list: - [x] or - [ ]
-            trimmed.matches(taskListItemRegex) -> {
+            matchesTaskListItem(trimmed) -> {
                 val items = mutableListOf<TaskItem>()
                 val rawLines = mutableListOf<String>()
-                while (i < lines.size && lines[i].trimStart().matches(taskListItemRegex)) {
+                while (i < lines.size && matchesTaskListItem(lines[i].trimStart())) {
                     rawLines.add(lines[i])
                     val t = lines[i].trimStart()
                     val checked = t.contains("[x]", ignoreCase = true)
@@ -2401,7 +2426,7 @@ private suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
             }
 
             // Unordered list
-            trimmed.matches(bulletListItemRegex) -> {
+            matchesBulletListItem(trimmed) -> {
                 val items = mutableListOf<ListItem>()
                 val rawLines = mutableListOf<String>()
                 val baseIndent = line.length - trimmed.length
@@ -2410,7 +2435,7 @@ private suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                     val t = l.trimStart()
                     val indent = l.length - t.length
                     if (t.isEmpty()) { i++; continue }
-                    if (!t.matches(bulletListItemRegex) && indent <= baseIndent) break
+                    if (!matchesBulletListItem(t) && indent <= baseIndent) break
                     if (indent > baseIndent) {
                         // Continuation or nested — append to last item
                         if (items.isNotEmpty()) {
@@ -2427,7 +2452,7 @@ private suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
             }
 
             // Ordered list
-            trimmed.matches(numberedListItemRegex) -> {
+            matchesNumberedListItem(trimmed) -> {
                 val items = mutableListOf<ListItem>()
                 val rawLines = mutableListOf<String>()
                 val startMatch = numberedListStartRegex.find(trimmed)
@@ -2438,7 +2463,7 @@ private suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                     val t = l.trimStart()
                     val indent = l.length - t.length
                     if (t.isEmpty()) { i++; continue }
-                    if (!t.matches(numberedListItemRegex) && indent <= baseIndent) break
+                    if (!matchesNumberedListItem(t) && indent <= baseIndent) break
                     if (indent > baseIndent) {
                         if (items.isNotEmpty()) {
                             val last = items.last()
@@ -2463,9 +2488,9 @@ private suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                     val l = lines[i]
                     val t = l.trimStart()
                     if (t.isEmpty() || t.startsWith("#") || t.startsWith("```") ||
-                        isBlockquoteLine(t) || t.matches(thematicBreakRegex) ||
-                        t.matches(bulletListItemRegex) || t.matches(numberedListItemRegex) ||
-                        t.matches(standaloneImageLineRegex) ||
+                        isBlockquoteLine(t) || matchesThematicBreak(t) ||
+                        matchesBulletListItem(t) || matchesNumberedListItem(t) ||
+                        matchesStandaloneImage(t) ||
                         (t.contains('|') && i + 1 < lines.size &&
                             lines[i + 1].trim().matches(tableSeparatorRegex))
                     ) break

@@ -659,7 +659,9 @@ internal val stepTimestampFormatter: java.text.SimpleDateFormat =
     java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
 
 internal fun formatStepTimestamp(epochMs: Long): String =
-    stepTimestampFormatter.format(java.util.Date(epochMs))
+    synchronized(stepTimestampFormatter) {
+        stepTimestampFormatter.format(java.util.Date(epochMs))
+    }
 
 // [T-step-timestamp v2 aa8b1128] Short "elapsed-or-final duration"
 // label for the tool detail header. Cross-platform format contract:

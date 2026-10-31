@@ -280,6 +280,9 @@ interface ChatDao {
     @Query("UPDATE sessions SET folder_id = :folderId WHERE id = :sessionId")
     suspend fun setSessionFolder(sessionId: String, folderId: String?)
 
+    @Query("UPDATE sessions SET folder_id = :folderId WHERE id IN (:sessionIds)")
+    suspend fun setSessionsFolder(sessionIds: List<String>, folderId: String?)
+
     /**
      * Conditional variant for any future automatic-grouping path: the
      * `AND folder_id IS NULL` lives in the STATEMENT rather than a caller-side
@@ -420,9 +423,11 @@ interface ChatDao {
     @Query("""
         SELECT m.session_id AS session_id, m.role AS role, m.parts_json AS parts_json
         FROM messages m
-        WHERE m.sort_order = (
-            SELECT MAX(m2.sort_order) FROM messages m2 WHERE m2.session_id = m.session_id
-        )
+        INNER JOIN (
+            SELECT session_id, MAX(sort_order) AS max_sort
+            FROM messages
+            GROUP BY session_id
+        ) tail ON m.session_id = tail.session_id AND m.sort_order = tail.max_sort
     """)
     suspend fun lastMessageTailPerSession(): List<SessionTailRow>
 

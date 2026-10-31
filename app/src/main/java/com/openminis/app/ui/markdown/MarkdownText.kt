@@ -100,6 +100,8 @@ fun MarkdownText(
     }
 }
 
+private val MATH_PLACEHOLDER_REGEX = Regex("\\uFFFCMATH(\\d+)\\uFFFC")
+
 @Composable
 private fun BlockContent(
     block: MarkdownParser.Block,
@@ -107,7 +109,6 @@ private fun BlockContent(
     baseStyle: TextStyle,
     mathSpans: List<MarkdownParser.MathSpan> = emptyList(),
 ) {
-    android.util.Log.d("MdRender", "BlockContent: ${block::class.simpleName}")
     when (block) {
         is MarkdownParser.Block.Heading -> HeadingBlock(block, color)
         is MarkdownParser.Block.Paragraph -> ParagraphBlock(block.content, color, baseStyle, mathSpans)
@@ -173,10 +174,9 @@ private fun ParagraphBlock(
     // for now we stay with the row-split shape but keep the math visually
     // small.
     val byPlaceholder = remember(mathSpans) { mathSpans.associateBy { it.placeholder } }
-    val regex = remember { Regex("\\uFFFC" + "MATH(\\d+)" + "\\uFFFC") }
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         var cursor = 0
-        for (match in regex.findAll(content)) {
+        for (match in MATH_PLACEHOLDER_REGEX.findAll(content)) {
             val span = byPlaceholder[match.value] ?: continue
             if (match.range.first > cursor) {
                 val segment = content.substring(cursor, match.range.first)
@@ -468,10 +468,9 @@ private fun TableCellContent(
         return
     }
     val byPlaceholder = remember(mathSpans) { mathSpans.associateBy { it.placeholder } }
-    val regex = remember { Regex("\\uFFFC" + "MATH(\\d+)" + "\\uFFFC") }
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         var cursor = 0
-        for (match in regex.findAll(text)) {
+        for (match in MATH_PLACEHOLDER_REGEX.findAll(text)) {
             val span = byPlaceholder[match.value] ?: continue
             if (match.range.first > cursor) {
                 val segment = text.substring(cursor, match.range.first)
@@ -511,7 +510,7 @@ private fun InlineContent(
     // sentinel from leaking into the rendered glyph stream.
     val cleaned = remember(text) {
         if (text.contains('￼')) {
-            text.replace(Regex("\\uFFFCMATH\\d+\\uFFFC"), "")
+            text.replace(MATH_PLACEHOLDER_REGEX, "")
         } else {
             text
         }
@@ -621,7 +620,7 @@ private fun parseInline(
         }
 
         // Bold + Italic ***text***
-        if (i + 2 < len && text.substring(i, i + 3) == "***") {
+        if (text.startsWith("***", i)) {
             val end = text.indexOf("***", i + 3)
             if (end > i) {
                 withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) {
@@ -633,8 +632,8 @@ private fun parseInline(
         }
 
         // Bold **text** or __text__
-        if (i + 1 < len && (text.substring(i, i + 2) == "**" || text.substring(i, i + 2) == "__")) {
-            val marker = text.substring(i, i + 2)
+        if (text.startsWith("**", i) || text.startsWith("__", i)) {
+            val marker = if (text[i] == '*') "**" else "__"
             val end = text.indexOf(marker, i + 2)
             if (end > i) {
                 withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
@@ -646,7 +645,7 @@ private fun parseInline(
         }
 
         // Strikethrough ~~text~~
-        if (i + 1 < len && text.substring(i, i + 2) == "~~") {
+        if (text.startsWith("~~", i)) {
             val end = text.indexOf("~~", i + 2)
             if (end > i) {
                 withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) {
@@ -941,19 +940,17 @@ private fun MinisAudioBlock(block: MarkdownParser.Block.Audio) {
     val file = remember(block.url) { resolveMediaFile(block.url) }
     val filename = remember(block.url) { filenameFromUrl(block.url) }
 
-    // Dedicated MediaPlayer per card. Released on DisposableEffect dispose.
-    val player = remember(file?.absolutePath) {
-        if (file == null) null else try {
-            MediaPlayer().apply { setDataSource(file.absolutePath); prepare() }
-        } catch (_: Throwable) { null }
-    }
-    DisposableEffect(player) {
-        onDispose { try { player?.release() } catch (_: Throwable) {} }
-    }
-
     var isPlaying by remember { mutableStateOf(false) }
     var positionMs by remember { mutableStateOf(0) }
-    val durationMs = player?.duration ?: 0
+    var durationMs by remember(file?.absolutePath) { mutableStateOf(0) }
+    var isPrepared by remember(file?.absolutePath) { mutableStateOf(false) }
+
+    // Dedicated MediaPlayer per card, prepared asynchronously off the UI thread.
+    val player = remember(file?.absolutePath) {
+        if (file == null) null else try {
+            MediaPlayer().apply { setDataSource(file.absolutePath) }
+        } catch (_: Throwable) { null }
+    }
 
     // Poll position while playing to drive the progress bar.
     LaunchedEffect(isPlaying) {
@@ -964,13 +961,25 @@ private fun MinisAudioBlock(block: MarkdownParser.Block.Audio) {
         }
     }
     DisposableEffect(player) {
-        val listener = MediaPlayer.OnCompletionListener {
-            isPlaying = false
-            positionMs = 0
-            try { player?.seekTo(0) } catch (_: Throwable) {}
+        if (player != null) {
+            player.setOnPreparedListener { mp ->
+                isPrepared = true
+                durationMs = try { mp.duration.coerceAtLeast(0) } catch (_: Throwable) { 0 }
+            }
+            player.setOnCompletionListener {
+                isPlaying = false
+                positionMs = 0
+                try { player.seekTo(0) } catch (_: Throwable) {}
+            }
+            try { player.prepareAsync() } catch (_: Throwable) {}
         }
-        player?.setOnCompletionListener(listener)
-        onDispose { try { player?.setOnCompletionListener(null) } catch (_: Throwable) {} }
+        onDispose {
+            try {
+                player?.setOnPreparedListener(null)
+                player?.setOnCompletionListener(null)
+                player?.release()
+            } catch (_: Throwable) {}
+        }
     }
 
     val tint = MaterialTheme.colorScheme.primary
@@ -987,7 +996,7 @@ private fun MinisAudioBlock(block: MarkdownParser.Block.Audio) {
             .background(cardBg)
             .border(0.5.dp, borderColor, RoundedCornerShape(10.dp))
             .clickable(enabled = file != null) {
-                if (player == null) {
+                if (player == null || !isPrepared) {
                     file?.let { openMediaExternally(context, it, "audio/*") }
                 } else {
                     if (isPlaying) { try { player.pause() } catch (_: Throwable) {} ; isPlaying = false }
