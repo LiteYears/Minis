@@ -1,3 +1,2 @@
-APK Path: /apk/app-debug.apk
-Source: app/build/outputs/apk/debug/app-debug.apk
-Status: Ready for download from AI Studio workspace file explorer (includes Visual DOM Set-of-Marks + Authenticated Session Vault)
+862d0f7170f51b5db0599737df36606a0301e874c70a1b5570369cdb4cc9613c  apk/app-debug.apk
+Built at: 2026-10-31T12:19:18Z
