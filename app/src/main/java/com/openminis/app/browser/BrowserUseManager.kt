@@ -187,6 +187,10 @@ class BrowserUseManager(
     private val _somMarkCount = MutableStateFlow(0)
     val somMarkCount: StateFlow<Int> = _somMarkCount.asStateFlow()
 
+    /** Number of enabled Tampermonkey userscripts matching the current page URL. */
+    private val _activeUserscriptsCount = MutableStateFlow(0)
+    val activeUserscriptsCount: StateFlow<Int> = _activeUserscriptsCount.asStateFlow()
+
     /**
      * [ISS-033] Session / global custom viewport, or null for the profile's
      * own size. Set by [BrowserTabPool] so set_user_agent keeps the usual
@@ -270,6 +274,27 @@ class BrowserUseManager(
         @JavascriptInterface
         fun blobDownloadError(error: String) {
             Log.w(TAG, "blob download failed in page JS: $error")
+        }
+
+        @JavascriptInterface
+        fun gmSetValue(scriptId: String, key: String, valueJson: String) {
+            BrowserUserscriptManager.setScriptValue(webView.context, scriptId, key, valueJson)
+        }
+
+        @JavascriptInterface
+        fun gmDeleteValue(scriptId: String, key: String) {
+            BrowserUserscriptManager.deleteScriptValue(webView.context, scriptId, key)
+        }
+
+        @JavascriptInterface
+        fun gmSetClipboard(text: String) {
+            Handler(Looper.getMainLooper()).post {
+                runCatching {
+                    val cm = webView.context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                        as? android.content.ClipboardManager
+                    cm?.setPrimaryClip(android.content.ClipData.newPlainText("Userscript", text))
+                }
+            }
         }
     }
 
@@ -486,6 +511,26 @@ class BrowserUseManager(
                     )
             }
 
+            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                val pageUrl = url ?: ""
+                view.evaluateJavascript(BrowserUseJS.stealthAndCompatibilityShim(), null)
+                if (pageUrl.isNotEmpty() && pageUrl != "about:blank") {
+                    val startBundles = BrowserUserscriptManager.buildAutoInjectionBundle(
+                        context = view.context,
+                        url = pageUrl,
+                        timing = BrowserUserscriptManager.RunAt.DOCUMENT_START,
+                    )
+                    for ((_, js) in startBundles) {
+                        view.evaluateJavascript(js, null)
+                    }
+                    _activeUserscriptsCount.value = BrowserUserscriptManager
+                        .matchingScriptsForUrl(view.context, pageUrl).size
+                } else {
+                    _activeUserscriptsCount.value = 0
+                }
+            }
+
             override fun onPageFinished(view: WebView, url: String?) {
                 _isLoading.value = false
                 _currentURL.value = url ?: ""
@@ -501,6 +546,34 @@ class BrowserUseManager(
                 val histTitle = view.title ?: ""
                 if (histUrl.isNotEmpty() && histUrl != "about:blank") {
                     BrowserHistoryStore.getInstance(view.context).record(histUrl, histTitle)
+                }
+                // Inject stealth shim + matching Tampermonkey Userscripts (document-end & document-idle)
+                view.evaluateJavascript(BrowserUseJS.stealthAndCompatibilityShim(), null)
+                if (histUrl.isNotEmpty() && histUrl != "about:blank") {
+                    val endBundles = BrowserUserscriptManager.buildAutoInjectionBundle(
+                        context = view.context,
+                        url = histUrl,
+                        timing = BrowserUserscriptManager.RunAt.DOCUMENT_END,
+                    )
+                    for ((_, js) in endBundles) {
+                        view.evaluateJavascript(js, null)
+                    }
+                    val idleBundles = BrowserUserscriptManager.buildAutoInjectionBundle(
+                        context = view.context,
+                        url = histUrl,
+                        timing = BrowserUserscriptManager.RunAt.DOCUMENT_IDLE,
+                    )
+                    if (idleBundles.isNotEmpty()) {
+                        view.postDelayed({
+                            for ((_, js) in idleBundles) {
+                                view.evaluateJavascript(js, null)
+                            }
+                        }, 180)
+                    }
+                    _activeUserscriptsCount.value = BrowserUserscriptManager
+                        .matchingScriptsForUrl(view.context, histUrl).size
+                } else {
+                    _activeUserscriptsCount.value = 0
                 }
                 // T-webview-popup-d3c6e10f (Issue 1): after the pool WebView's
                 // setInitialScale settles, force a JS `resize` event so
@@ -814,6 +887,34 @@ class BrowserUseManager(
                 return BrowserAuthVault.listProfilesResult(webView.context)
             BrowserAction.DELETE_AUTH_PROFILE ->
                 return BrowserAuthVault.deleteProfileResult(webView.context, input.profileName)
+            BrowserAction.INSTALL_USERSCRIPT ->
+                return BrowserUserscriptManager.installFromTool(
+                    context = webView.context,
+                    manager = this,
+                    scriptName = input.scriptName,
+                    code = input.script,
+                    matchPatterns = input.matchPatterns,
+                    runAt = input.runAt,
+                    enabled = input.enabled,
+                )
+            BrowserAction.LIST_USERSCRIPTS ->
+                return BrowserUserscriptManager.listUserscriptsResult(
+                    context = webView.context,
+                    currentUrl = _currentURL.value,
+                )
+            BrowserAction.TOGGLE_USERSCRIPT ->
+                return BrowserUserscriptManager.toggleUserscriptResult(
+                    context = webView.context,
+                    manager = this,
+                    nameOrId = input.scriptName ?: input.text,
+                    enabled = input.enabled,
+                )
+            BrowserAction.REMOVE_USERSCRIPT ->
+                return BrowserUserscriptManager.removeUserscriptResult(
+                    context = webView.context,
+                    manager = this,
+                    nameOrId = input.scriptName ?: input.text,
+                )
             BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS ->
                 return BrowserActionResult.error("Tab management actions must be routed through BrowserTabPool")
         }
@@ -2349,6 +2450,52 @@ class BrowserUseManager(
             }
             val (vw, vh) = viewportOverride() ?: target.viewportSize
             applyViewport(vw, vh)
+        }
+    }
+
+    // -- Tampermonkey / Userscript Engine Helpers --
+
+    /**
+     * Immediately wraps and evaluates a single [BrowserUserscriptManager.Userscript] on the
+     * active page, updates [activeUserscriptsCount], and returns a status summary string.
+     */
+    suspend fun runSingleUserscriptNow(script: BrowserUserscriptManager.Userscript): String {
+        val wrapped = BrowserUserscriptManager.wrapWithGMRuntime(webView.context, script)
+        val raw = runCatching { evaluateJavascriptValue(wrapped) }.getOrNull()
+        _activeUserscriptsCount.value = BrowserUserscriptManager
+            .matchingScriptsForUrl(webView.context, _currentURL.value).size
+        if (raw == null) return "injected"
+        val json = runCatching { JSONObject(raw) }.getOrNull() ?: return raw
+        if (!json.optBoolean("ok", true)) {
+            return "error: ${json.optString("error", "unknown")}"
+        }
+        val logs = json.optJSONArray("logs")
+        return if (logs != null && logs.length() > 0) {
+            val firstLog = logs.optString(0, "")
+            "ok (${logs.length()} log(s): ${firstLog.take(120)})"
+        } else {
+            "ok"
+        }
+    }
+
+    /**
+     * Removes any `<style data-minis-userscript="id">` elements injected by `GM_addStyle`
+     * when a userscript is disabled or uninstalled, and refreshes [activeUserscriptsCount].
+     */
+    fun removeUserscriptStyles(scriptId: String) {
+        val escaped = BrowserUseJS.jsQuote(scriptId)
+        val js = """
+            (function() {
+                try {
+                    var styles = document.querySelectorAll('style[data-minis-userscript="$escaped"]');
+                    for (var i = 0; i < styles.length; i++) styles[i].remove();
+                } catch (e) {}
+            })();
+        """.trimIndent()
+        webView.post {
+            webView.evaluateJavascript(js, null)
+            _activeUserscriptsCount.value = BrowserUserscriptManager
+                .matchingScriptsForUrl(webView.context, _currentURL.value).size
         }
     }
 

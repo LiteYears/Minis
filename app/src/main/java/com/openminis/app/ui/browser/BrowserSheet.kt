@@ -34,6 +34,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
@@ -80,6 +81,7 @@ import androidx.compose.ui.unit.sp
 import com.openminis.app.browser.BrowserAuthVault
 import com.openminis.app.browser.BrowserHistoryStore
 import com.openminis.app.browser.BrowserTabPool
+import com.openminis.app.browser.BrowserUserscriptManager
 import com.openminis.app.browser.UserAgentProfile
 import com.openminis.app.ui.chat.StandardChatSheet
 import kotlinx.coroutines.launch
@@ -121,15 +123,19 @@ fun BrowserSheet(
     var showHistory by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showAuthVault by remember { mutableStateOf(false) }
+    var showUserscripts by remember { mutableStateOf(false) }
     // [T-android-browser-download-ux] Downloads panel + badge state.
     var showDownloads by remember { mutableStateOf(false) }
     val downloadEntries by tabPool.downloads.collectAsState()
     val somActive = selectedTab?.manager?.somOverlayActive?.collectAsState()?.value ?: false
     val somCount = selectedTab?.manager?.somMarkCount?.collectAsState()?.value ?: 0
+    val activeUserscriptCount = selectedTab?.manager?.activeUserscriptsCount?.collectAsState()?.value ?: 0
+    val installedUserscripts by BrowserUserscriptManager.scriptsFlow.collectAsState()
     val savedProfiles by BrowserAuthVault.profiles.collectAsState()
 
     LaunchedEffect(context) {
         BrowserAuthVault.ensureLoaded(context)
+        BrowserUserscriptManager.ensureLoaded(context)
     }
 
     val accent = MaterialTheme.colorScheme.primary
@@ -455,6 +461,23 @@ fun BrowserSheet(
                         onClick = { showAuthVault = true },
                     )
                 }
+                // Tampermonkey Userscripts Manager
+                val userscriptBadge = if (activeUserscriptCount > 0) activeUserscriptCount else installedUserscripts.count { it.enabled }
+                androidx.compose.material3.BadgedBox(
+                    badge = {
+                        if (userscriptBadge > 0) {
+                            androidx.compose.material3.Badge { Text("$userscriptBadge") }
+                        }
+                    },
+                ) {
+                    ToolbarIcon(
+                        icon = Icons.Default.Code,
+                        contentDesc = "Tampermonkey Userscripts",
+                        enabled = !isAgentBusy,
+                        tint = if (activeUserscriptCount > 0) accent else null,
+                        onClick = { showUserscripts = true },
+                    )
+                }
                 // [T-android-browser-download-ux] Downloads entry: shows while
                 // the session has ANY download records, disappears when the
                 // user clears the last one; the badge counts in-flight +
@@ -502,6 +525,14 @@ fun BrowserSheet(
         BrowserAuthVaultSheet(
             tabPool = tabPool,
             onDismiss = { showAuthVault = false },
+        )
+    }
+
+    if (showUserscripts) {
+        BrowserUserscriptSheet(
+            manager = selectedTab?.manager,
+            currentURL = currentURL,
+            onDismiss = { showUserscripts = false },
         )
     }
 

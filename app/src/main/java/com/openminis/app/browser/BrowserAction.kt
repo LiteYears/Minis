@@ -70,7 +70,11 @@ enum class BrowserAction(val value: String) {
     SAVE_AUTH_PROFILE("save_auth_profile"),
     LOAD_AUTH_PROFILE("load_auth_profile"),
     LIST_AUTH_PROFILES("list_auth_profiles"),
-    DELETE_AUTH_PROFILE("delete_auth_profile");
+    DELETE_AUTH_PROFILE("delete_auth_profile"),
+    INSTALL_USERSCRIPT("install_userscript"),
+    LIST_USERSCRIPTS("list_userscripts"),
+    TOGGLE_USERSCRIPT("toggle_userscript"),
+    REMOVE_USERSCRIPT("remove_userscript");
 
     /**
      * [T-browser-readaction-follow-tab-and-yolo-android] True when this action
@@ -88,13 +92,17 @@ enum class BrowserAction(val value: String) {
             return map[normalized] ?: when (normalized) {
                 "set_of_marks", "mark_page", "visual_dom" -> SOM_SNAPSHOT
                 "switch_auth_profile", "restore_auth_profile" -> LOAD_AUTH_PROFILE
+                "save_userscript", "add_userscript", "create_userscript", "tampermonkey_install", "tampermonkey" -> INSTALL_USERSCRIPT
+                "get_userscripts", "tampermonkey_list", "userscripts" -> LIST_USERSCRIPTS
+                "enable_userscript", "disable_userscript", "tampermonkey_toggle" -> TOGGLE_USERSCRIPT
+                "delete_userscript", "uninstall_userscript", "tampermonkey_remove" -> REMOVE_USERSCRIPT
                 else -> null
             }
         }
 
         /** Actions that visually change the page and warrant an auto-snapshot. */
         val visualChangeActions: Set<BrowserAction> = setOf(
-            NAVIGATE, CLICK, CLICK_ELEMENT, SCROLL, HOVER, TYPE, LOAD_AUTH_PROFILE
+            NAVIGATE, CLICK, CLICK_ELEMENT, SCROLL, HOVER, TYPE, LOAD_AUTH_PROFILE, INSTALL_USERSCRIPT
         )
 
         /**
@@ -330,6 +338,14 @@ data class BrowserActionInput(
     val keepOverlay: Boolean = false,
     /** Named Auth Profile identifier for `save_auth_profile`, `load_auth_profile`, `delete_auth_profile`. */
     val profileName: String? = null,
+    /** Tampermonkey Userscript name or ID for `install_userscript`, `toggle_userscript`, `remove_userscript`. */
+    val scriptName: String? = null,
+    // URL @match glob patterns for install_userscript (e.g. "<all_urls>").
+    val matchPatterns: List<String>? = null,
+    /** Injection timing for `install_userscript`: `"document-start"`, `"document-end"`, or `"document-idle"`. */
+    val runAt: String? = null,
+    /** Explicit enable/disable boolean for `toggle_userscript` or `install_userscript`. */
+    val enabled: Boolean? = null,
 ) {
     companion object {
         fun parse(json: String): BrowserActionInput? {
@@ -346,6 +362,32 @@ data class BrowserActionInput(
                 val parsedProfileName: String? = obj.optString("profile_name").ifEmpty {
                     obj.optString("profile").ifEmpty { null }
                 }
+                val parsedScriptName: String? = obj.optString("script_name").ifEmpty {
+                    obj.optString("script_id").ifEmpty {
+                        obj.optString("name").ifEmpty { null }
+                    }
+                }
+                val parsedMatchPatterns: List<String>? = obj.optJSONArray("match")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf(String::isNotBlank) }
+                        .takeIf { it.isNotEmpty() }
+                } ?: obj.optString("match").takeIf { it.isNotBlank() }?.let { raw ->
+                    if (raw.trim().startsWith("[")) {
+                        runCatching {
+                            val arr = JSONArray(raw)
+                            (0 until arr.length()).mapNotNull { arr.optString(it).takeIf(String::isNotBlank) }
+                        }.getOrNull()
+                    } else {
+                        raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                    }
+                }?.takeIf { it.isNotEmpty() }
+
+                val normalizedActionLower = actionStr.trim().lowercase()
+                val parsedEnabled: Boolean? = when {
+                    obj.has("enabled") -> obj.optBoolean("enabled")
+                    normalizedActionLower == "enable_userscript" -> true
+                    normalizedActionLower == "disable_userscript" -> false
+                    else -> null
+                }
 
                 BrowserActionInput(
                     action = action,
@@ -356,7 +398,9 @@ data class BrowserActionInput(
                     coordinateY = if (obj.has("coordinate_y")) obj.optInt("coordinate_y") else null,
                     direction = obj.optString("direction").ifEmpty { null }?.let { ScrollDirection.fromString(it) },
                     amount = if (obj.has("amount")) obj.optInt("amount") else null,
-                    script = obj.optString("script").ifEmpty { null },
+                    script = obj.optString("script").ifEmpty {
+                        obj.optString("code").ifEmpty { null }
+                    },
                     userAgent = UserAgentProfile.parse(obj.optString("user_agent").ifEmpty { null }),
                     userAgentRaw = obj.optString("user_agent").ifEmpty { null },
                     maxDepth = if (obj.has("max_depth")) obj.optInt("max_depth") else null,
@@ -378,6 +422,10 @@ data class BrowserActionInput(
                     som = obj.optBoolean("som", action == BrowserAction.SOM_SNAPSHOT),
                     keepOverlay = obj.optBoolean("keep_overlay", false),
                     profileName = parsedProfileName,
+                    scriptName = parsedScriptName,
+                    matchPatterns = parsedMatchPatterns,
+                    runAt = obj.optString("run_at").ifEmpty { null },
+                    enabled = parsedEnabled,
                 )
             } catch (_: Exception) {
                 null

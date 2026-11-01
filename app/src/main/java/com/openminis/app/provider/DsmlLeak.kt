@@ -2027,6 +2027,8 @@ object ToolJsonRepair {
         "content" to listOf("text", "body", "data", "file_content", "code", "contents"),
         "keywords" to listOf("query", "search", "keyword", "q"),
         "selector" to listOf("css_selector", "element", "target", "xpath"),
+        "script" to listOf("userscript", "code", "js", "javascript", "user_script"),
+        "script_name" to listOf("name", "script_id", "preset", "userscript_name"),
     )
 
     private val TRAILING_COMMA_REGEX = Regex(""",(\s*[}\]])""")

@@ -96,21 +96,32 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
     fun click(selector: String): String = guardedRead("""
         (function() {
             var rawSel = '${jsQuote(selector)}';
-            var el = null;
-            try {
-                el = document.querySelector(rawSel);
-            } catch (e) {
-                el = null;
+            function queryDeep(root, sel) {
+                try {
+                    var found = root.querySelector(sel);
+                    if (found) return found;
+                } catch (e) {}
+                var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].shadowRoot) {
+                        var sub = queryDeep(all[i].shadowRoot, sel);
+                        if (sub) return sub;
+                    }
+                }
+                return null;
             }
+            var el = queryDeep(document, rawSel);
             if (!el && rawSel) {
-                var needle = rawSel.replace(/^.*has-text\(['"]?(.*?)['"]?\).*$/i, '$1').trim().toLowerCase();
+                var needle = rawSel.replace(/^.*has-text\(['"]?(.*?)['"]?\).*$/i, '$1')
+                    .replace(/^[#.\[\]"']+|[#.\[\]"']+$/g, '')
+                    .trim().toLowerCase();
                 if (needle.length >= 2) {
-                    var candidates = document.querySelectorAll('button, a, [role="button"], input[type="submit"], input[type="button"], summary, label');
+                    var candidates = document.querySelectorAll('button, a, [role="button"], [role="link"], [role="tab"], [role="menuitem"], input[type="submit"], input[type="button"], summary, label');
                     var exactMatch = null;
                     var partialMatches = [];
                     for (var i = 0; i < candidates.length; i++) {
                         var c = candidates[i];
-                        var label = ((c.innerText || c.value || c.getAttribute('aria-label') || '') + '').trim().toLowerCase();
+                        var label = ((c.innerText || c.value || c.getAttribute('aria-label') || c.getAttribute('title') || '') + '').trim().toLowerCase();
                         if (!label) continue;
                         if (label === needle) {
                             exactMatch = c;
@@ -125,8 +136,15 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             }
             if (!el) return JSON.stringify({error: 'Element not found: ${jsQuote(selector)}'});
             if (el.disabled) return JSON.stringify({error: 'Element is disabled', tag: el.tagName});
+            try { el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'}); } catch(e) {}
             var bOpts = {bubbles: true, cancelable: true, view: window};
             var nbOpts = {bubbles: false, cancelable: true, view: window};
+            try {
+                el.dispatchEvent(new PointerEvent('pointerover', bOpts));
+                el.dispatchEvent(new PointerEvent('pointerenter', nbOpts));
+                el.dispatchEvent(new PointerEvent('pointerdown', bOpts));
+                el.dispatchEvent(new PointerEvent('pointerup', bOpts));
+            } catch (e) {}
             el.dispatchEvent(new MouseEvent('mouseover', bOpts));
             el.dispatchEvent(new MouseEvent('mouseenter', nbOpts));
             el.dispatchEvent(new MouseEvent('mousemove', bOpts));
@@ -135,7 +153,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             el.click();
             el.dispatchEvent(new MouseEvent('mouseleave', nbOpts));
             el.dispatchEvent(new MouseEvent('mouseout', bOpts));
-            return JSON.stringify({clicked: true, tag: el.tagName, text: (el.innerText || '').substring(0, 100)});
+            return JSON.stringify({clicked: true, tag: el.tagName, text: (el.innerText || el.value || el.getAttribute('aria-label') || '').substring(0, 100)});
         })()
     """.trimIndent(), requiresBody = false)
 
@@ -162,8 +180,40 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
 
     fun type(selector: String, text: String): String = guardedRead("""
         (function() {
-            var el = document.querySelector('${jsQuote(selector)}');
+            var rawSel = '${jsQuote(selector)}';
+            function queryDeep(root, sel) {
+                try {
+                    var found = root.querySelector(sel);
+                    if (found) return found;
+                } catch (e) {}
+                var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].shadowRoot) {
+                        var sub = queryDeep(all[i].shadowRoot, sel);
+                        if (sub) return sub;
+                    }
+                }
+                return null;
+            }
+            var el = queryDeep(document, rawSel);
+            if (!el && rawSel) {
+                var needle = rawSel.replace(/^[#.\[\]"']+|[#.\[\]"']+$/g, '').trim().toLowerCase();
+                var inputs = document.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"], [role="searchbox"], [role="combobox"]');
+                for (var i = 0; i < inputs.length; i++) {
+                    var inp = inputs[i];
+                    var ph = (inp.getAttribute('placeholder') || '').toLowerCase();
+                    var al = (inp.getAttribute('aria-label') || '').toLowerCase();
+                    var nm = (inp.getAttribute('name') || '').toLowerCase();
+                    var id = (inp.id || '').toLowerCase();
+                    if (ph === needle || al === needle || nm === needle || id === needle ||
+                        (needle.length >= 3 && (ph.indexOf(needle) !== -1 || al.indexOf(needle) !== -1 || nm.indexOf(needle) !== -1))) {
+                        el = inp;
+                        break;
+                    }
+                }
+            }
             if (!el) return JSON.stringify({error: 'Element not found: ${jsQuote(selector)}'});
+            try { el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'}); } catch(e) {}
             el.focus();
             var valToSet = '${jsQuote(text)}';
             if (el.tagName === 'SELECT') {
@@ -229,11 +279,21 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             val sel = jsQuote(selector)
             return guardedRead("""
                 (function() {
-                    var el = document.querySelector('$sel');
+                    function queryDeep(root, s) {
+                        try { var f = root.querySelector(s); if (f) return f; } catch(e) {}
+                        var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                        for (var i = 0; i < all.length; i++) {
+                            if (all[i].shadowRoot) {
+                                var sub = queryDeep(all[i].shadowRoot, s);
+                                if (sub) return sub;
+                            }
+                        }
+                        return null;
+                    }
+                    var el = queryDeep(document, '$sel');
                     if (!el) return JSON.stringify({error: 'Element not found: $sel'});
-                    var innerTextVal = el.innerText || '';
-                    var textContentVal = el.textContent || '';
-                    var text = innerTextVal.substring(0, 10000);
+                    var innerTextVal = el.innerText || el.textContent || '';
+                    var text = innerTextVal.substring(0, 15000);
                     return JSON.stringify({text: text, length: text.length});
                 })()
             """.trimIndent())
@@ -241,7 +301,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
         return guardedRead("""
             (function() {
                 var innerTextVal = document.body.innerText || '';
-                var text = innerTextVal.substring(0, 10000);
+                var text = innerTextVal.substring(0, 15000);
                 return JSON.stringify({text: text, length: text.length, url: location.href, title: document.title});
             })()
         """.trimIndent())
@@ -252,22 +312,126 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
     fun getReadable(): String = guardedRead("""
         (function() {
             var candidateSelectors = [
-                'article', '[role="main"]', 'main', '.post-content',
-                '.article-body', '.entry-content', '#content', '.content'
+                'article', '[role="main"]', 'main', '.markdown-body', '#readme',
+                '.post-content', '.article-body', '.entry-content', '#article-body',
+                '.story-body', '#main-content', '#content', '.content'
             ];
             var el = null;
             var matchedSelector = null;
+            var bestLen = 0;
             for (var i = 0; i < candidateSelectors.length; i++) {
-                var found = document.querySelector(candidateSelectors[i]);
-                if (found && window.getComputedStyle(found).display !== 'none' && (found.innerText || '').length > 0) {
-                    el = found; matchedSelector = candidateSelectors[i]; break;
+                var matches = document.querySelectorAll(candidateSelectors[i]);
+                for (var j = 0; j < matches.length; j++) {
+                    var found = matches[j];
+                    var st = window.getComputedStyle(found);
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    var len = (found.innerText || '').trim().length;
+                    if (len > 160 && len > bestLen) {
+                        el = found;
+                        matchedSelector = candidateSelectors[i];
+                        bestLen = len;
+                    }
                 }
+                if (el && bestLen > 400) break;
             }
             if (!el) { el = document.body; matchedSelector = 'document.body (fallback)'; }
-            var title = document.title || '';
-            var innerTextVal = el.innerText || '';
-            var text = innerTextVal.replace(/\s+/g, ' ').trim().substring(0, 15000);
-            return JSON.stringify({title: title, text: text, length: text.length, source: matchedSelector});
+
+            function getMeta(names) {
+                for (var k = 0; k < names.length; k++) {
+                    var m = document.querySelector('meta[name="' + names[k] + '"], meta[property="' + names[k] + '"]');
+                    if (m && m.content) return m.content.trim();
+                }
+                return null;
+            }
+            var meta = {};
+            var desc = getMeta(['description', 'og:description', 'twitter:description']);
+            if (desc) meta.description = desc;
+            var author = getMeta(['author', 'article:author', 'og:site_name']);
+            if (author) meta.author = author;
+            var published = getMeta(['article:published_time', 'datePublished', 'pubdate']);
+            if (published) meta.publishedTime = published;
+            var canon = document.querySelector('link[rel="canonical"]');
+            if (canon && canon.href) meta.canonical = canon.href;
+
+            var IGNORE_TAGS = {
+                'SCRIPT': 1, 'STYLE': 1, 'NOSCRIPT': 1, 'SVG': 1, 'PATH': 1,
+                'NAV': 1, 'FOOTER': 1, 'ASIDE': 1, 'TEMPLATE': 1, 'IFRAME': 1
+            };
+            var NOISE_ROLES = {'navigation': 1, 'banner': 1, 'contentinfo': 1, 'complementary': 1, 'dialog': 1};
+
+            function extractStructured(root) {
+                var out = [];
+                function walk(node) {
+                    if (!node) return;
+                    if (node.nodeType === 3) {
+                        var t = (node.nodeValue || '').replace(/\s+/g, ' ');
+                        if (t.trim()) out.push(t);
+                        return;
+                    }
+                    if (node.nodeType !== 1) return;
+                    var tag = node.tagName;
+                    if (IGNORE_TAGS[tag] && node !== el) return;
+                    var role = (node.getAttribute && node.getAttribute('role')) || '';
+                    if (NOISE_ROLES[role] && node !== el) return;
+                    try {
+                        var st = window.getComputedStyle(node);
+                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return;
+                    } catch (e) {}
+
+                    if (tag === 'H1' || tag === 'H2' || tag === 'H3' || tag === 'H4') {
+                        var hTxt = (node.innerText || '').replace(/\s+/g, ' ').trim();
+                        if (hTxt) {
+                            var prefix = tag === 'H1' ? '\n\n# ' : (tag === 'H2' ? '\n\n## ' : (tag === 'H3' ? '\n\n### ' : '\n\n#### '));
+                            out.push(prefix + hTxt + '\n');
+                        }
+                        return;
+                    }
+                    if (tag === 'PRE') {
+                        var codeTxt = (node.innerText || '').trim();
+                        if (codeTxt) out.push('\n```\n' + codeTxt.substring(0, 4000) + '\n```\n');
+                        return;
+                    }
+                    if (tag === 'LI') {
+                        out.push('\n- ');
+                    } else if (tag === 'P' || tag === 'DIV' || tag === 'SECTION' || tag === 'ARTICLE' || tag === 'BLOCKQUOTE' || tag === 'TR') {
+                        out.push('\n');
+                    } else if (tag === 'TD' || tag === 'TH') {
+                        out.push(' | ');
+                    } else if (tag === 'BR') {
+                        out.push('\n');
+                    }
+
+                    var children = node.childNodes;
+                    for (var c = 0; c < children.length; c++) {
+                        walk(children[c]);
+                    }
+                    if (node.shadowRoot) {
+                        walk(node.shadowRoot);
+                    }
+                }
+                walk(root);
+                return out.join('').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+            }
+
+            var structuredText = '';
+            try {
+                structuredText = extractStructured(el);
+            } catch (e) {}
+            if (!structuredText || structuredText.length < 80) {
+                var rawInner = (el.innerText || document.body.innerText || '');
+                structuredText = rawInner.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+            }
+
+            var title = document.title || getMeta(['og:title', 'twitter:title']) || '';
+            var text = structuredText.substring(0, 25000);
+            return JSON.stringify({
+                title: title,
+                url: location.href,
+                meta: meta,
+                text: text,
+                length: text.length,
+                source: matchedSelector
+            });
         })()
     """.trimIndent())
 
@@ -340,9 +504,24 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
 
     fun findElements(selector: String): String = guardedRead("""
         (function() {
-            var els = document.querySelectorAll('${jsQuote(selector)}');
+            var rawSel = '${jsQuote(selector)}';
+            var els = [];
+            try {
+                els = Array.prototype.slice.call(document.querySelectorAll(rawSel));
+            } catch (e) {}
+            if (els.length === 0) {
+                var all = document.querySelectorAll('*');
+                for (var s = 0; s < all.length; s++) {
+                    if (all[s].shadowRoot) {
+                        try {
+                            var sub = all[s].shadowRoot.querySelectorAll(rawSel);
+                            for (var k = 0; k < sub.length; k++) els.push(sub[k]);
+                        } catch (e) {}
+                    }
+                }
+            }
             var results = [];
-            var limit = Math.min(els.length, 20);
+            var limit = Math.min(els.length, 25);
             var scrollX = window.scrollX || window.pageXOffset || 0;
             var scrollY = window.scrollY || window.pageYOffset || 0;
             for (var i = 0; i < limit; i++) {
@@ -350,8 +529,8 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                 var rect = el.getBoundingClientRect();
                 results.push({
                     index: i, tag: el.tagName, id: el.id || null,
-                    className: el.className || null,
-                    text: (el.innerText || '').substring(0, 80),
+                    className: typeof el.className === 'string' ? (el.className || null) : null,
+                    text: (el.innerText || el.value || el.getAttribute('aria-label') || '').substring(0, 80),
                     href: el.href || null,
                     rect: {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height), pageX: Math.round(rect.x + scrollX), pageY: Math.round(rect.y + scrollY), visible: rect.width > 0 && rect.height > 0 && rect.top < window.innerHeight && rect.bottom > 0}
                 });
@@ -1069,6 +1248,40 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             return JSON.stringify({restored: restored});
         })()
     """.trimIndent(), requiresBody = false)
+
+    /**
+     * Injected at page-start / page-finish to improve website compatibility:
+     * - Masks `navigator.webdriver` so standard bot-detection scripts do not block rendering
+     * - Ensures `window.chrome` and `navigator.languages` are populated
+     * - Neutralizes blocking `window.onbeforeunload` dialogs that could stall navigation
+     */
+    fun stealthAndCompatibilityShim(): String = """
+        (function() {
+            if (window.__minis_stealth_applied__) return;
+            window.__minis_stealth_applied__ = true;
+            try {
+                Object.defineProperty(navigator, 'webdriver', { get: function() { return false; }, configurable: true });
+            } catch (e) {}
+            try {
+                if (!window.chrome) {
+                    window.chrome = { runtime: {}, app: { isInstalled: false } };
+                }
+            } catch (e) {}
+            try {
+                if (!navigator.languages || navigator.languages.length === 0) {
+                    Object.defineProperty(navigator, 'languages', { get: function() { return ['en-US', 'en']; }, configurable: true });
+                }
+            } catch (e) {}
+            try {
+                window.onbeforeunload = null;
+                Object.defineProperty(window, 'onbeforeunload', {
+                    get: function() { return null; },
+                    set: function() {},
+                    configurable: true
+                });
+            } catch (e) {}
+        })();
+    """.trimIndent()
 }
 
 // BEGIN BrowserJSResult

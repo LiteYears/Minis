@@ -258,6 +258,7 @@ object AgentTools {
             "get_page_info for page metadata, get_backbone to get a structural overview of the page DOM as a simplified tree, " +
             "fetch to download files/resources using the page's session (returns metadata and a minis:// URL), " +
             "save_auth_profile / load_auth_profile / list_auth_profiles / delete_auth_profile to manage persistent Named Auth Profiles in the Authenticated Session Vault (persists cookies including HttpOnly + localStorage + sessionStorage across sessions so once the user logs into a site in the Browser Sheet, you can load their real authenticated session by profile_name), " +
+            "install_userscript / list_userscripts / toggle_userscript / remove_userscript to install and manage persistent Tampermonkey Userscripts (`// ==UserScript==` headers, `@match` URL globs, `@run-at document-start|document-end|document-idle`, and full `GM_*` APIs: `GM_addStyle`, `GM_addElement`, `GM_getValue`, `GM_setValue`, `GM_deleteValue`, `GM_listValues`, `GM_setClipboard`, `GM_log`, `GM_waitForElement`, `GM_xmlhttpRequest`, `unsafeWindow`). Installed userscripts automatically inject on every matching page navigation and run immediately on the active page if it matches. You can also one-call activate built-in presets by passing `script_name`: `'anti-annoyance-shield'` (removes cookie banners, paywall overlays, and unlocks scroll), `'unlock-copy-selection'` (enables text selection/copy), `'auto-expand-articles'` (clicks Read More/Show More and uncollapses truncated articles), or `'spa-api-interceptor'` (captures fetch/XHR JSON responses into `window.__minis_captured_apis__`), " +
             "new_tab to open an additional tab, close_tab to close a tab, and list_tabs to see all open tabs. " +
             "Use set_viewport with viewport_width + viewport_height to override the viewport for the current session (e.g. before screenshotting a 1920×1080 HTML composition that would otherwise be cropped to the phone viewport); pass reset=true to drop the session override and fall back to the global browser setting. " +
             "Use get_cookies to retrieve cookies for the current page URL / current site root domain only (including HttpOnly cookies). get_cookies supports optional 'keywords' (filter by cookie name) and 'fuzzy' (true=contains match, false=exact match, default true). It returns only a summary and an offload env file path — raw cookie values are NOT included in the tool response. To reuse cookies in shell commands: `. /var/minis/offloads/env_cookies_xxx.sh && command`. You may define alias variables when needed. " +
@@ -265,7 +266,7 @@ object AgentTools {
             "Use wait_for_dom_stable to wait until the page DOM stops changing (useful after navigation or interactions that trigger async data loading — polls every 0.5s, resolves when mutation rate gradient is stable for 3+ intervals, default timeout 10s). " +
             "Use tab_id to target a specific tab (defaults to the most recently used tab).",
         parameters = mapOf(
-            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Open Wikipedia homepage', 'Take Set-of-Marks visual snapshot'). Use the same language as the user."),
+            "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Open Wikipedia homepage', 'Install Tampermonkey userscript'). Use the same language as the user."),
             "action" to AgentToolParam("string", "The browser action to perform",
                 enumValues = BrowserAction.allValues),
             "url" to AgentToolParam("string", "URL to navigate to (for navigate action) or resource to download (for fetch action)"),
@@ -273,13 +274,17 @@ object AgentTools {
             "som" to AgentToolParam("boolean", "When true on screenshot, overlay Set-of-Marks numbered bounding boxes [1], [2], [3] on interactive DOM elements before capturing and include the mark index table."),
             "keep_overlay" to AgentToolParam("boolean", "When true on som_snapshot or screenshot(som=true), keep the visual Set-of-Marks boxes rendered on the live page after capture (default false removes the visual overlay after capture while keeping mark IDs active)."),
             "profile_name" to AgentToolParam("string", "Named Auth Profile identifier in the Authenticated Session Vault (for save_auth_profile, load_auth_profile, delete_auth_profile), e.g. 'github', 'work-aws', 'banking'."),
-            "selector" to AgentToolParam("string", "CSS selector for targeting elements (click, type, get_text, scroll, hover, find_elements, som_snapshot). For scroll: specify a scrollable container to scroll (e.g. 'div.timeline'); if omitted, auto-detects the best scrollable element."),
+            "script_name" to AgentToolParam("string", "Tampermonkey Userscript name or ID (for install_userscript, toggle_userscript, remove_userscript), or a built-in preset ID for install_userscript ('anti-annoyance-shield', 'unlock-copy-selection', 'auto-expand-articles', 'spa-api-interceptor')."),
+            "match" to AgentToolParam("string", "URL @match glob pattern(s) for install_userscript (e.g. '*://*.example.com/*' or '<all_urls>'). Comma-separated or JSON array; defaults to current page host or <all_urls> if omitted and not in // ==UserScript== header."),
+            "run_at" to AgentToolParam("string", "Injection timing for install_userscript: 'document-start', 'document-end' (default), or 'document-idle'.", enumValues = listOf("document-start", "document-end", "document-idle")),
+            "enabled" to AgentToolParam("boolean", "Explicit enable/disable flag for toggle_userscript or install_userscript (omit on toggle_userscript to flip current state)."),
+            "selector" to AgentToolParam("string", "CSS selector for targeting elements (click, type, get_text, scroll, hover, find_elements, som_snapshot). Supports open Shadow DOM traversal and fuzzy button/input fallback."),
             "text" to AgentToolParam("string", "Text to type (for type action)"),
             "coordinate_x" to AgentToolParam("integer", "X coordinate for click (alternative to mark or selector)"),
             "coordinate_y" to AgentToolParam("integer", "Y coordinate for click (alternative to mark or selector)"),
             "direction" to AgentToolParam("string", "Scroll direction", enumValues = listOf("up", "down")),
             "amount" to AgentToolParam("integer", "Scroll amount in pixels (default: 500)"),
-            "script" to AgentToolParam("string", "JavaScript code to execute (for execute_js action). The script runs inside an async function wrapper — `await` and top-level `return` are both supported (e.g. `var r = await fetch(url); return await r.json()`)."),
+            "script" to AgentToolParam("string", "JavaScript code to execute (for execute_js) or Tampermonkey userscript source code (for install_userscript, optionally with // ==UserScript== header and GM_* APIs)."),
             "user_agent" to AgentToolParam("string", "User agent profile to switch to", enumValues = listOf("desktop_chrome", "mobile_chrome")),
             "max_depth" to AgentToolParam("integer", "Maximum tree depth for get_backbone (default: 5)"),
             "scroll_count" to AgentToolParam("integer", "Number of scroll steps for scroll_and_collect (default: 10, max: 20). Each step scrolls by 'amount' pixels and waits for new content."),
@@ -292,18 +297,10 @@ object AgentTools {
             "viewport_width" to AgentToolParam("integer", "Viewport width in CSS pixels for set_viewport (e.g. 1920). Required together with viewport_height unless reset=true."),
             "viewport_height" to AgentToolParam("integer", "Viewport height in CSS pixels for set_viewport (e.g. 1080). Required together with viewport_width unless reset=true."),
             "reset" to AgentToolParam("boolean", "For set_viewport: when true, clear the session-level viewport override and fall back to the global browser setting."),
-            // [T-android-browser-full-page-schema] The capability was already
-            // implemented end to end (BrowserActionInput parses `full_page`,
-            // BrowserUseManager.screenshot stretches the WebView and caps at
-            // MAX_FULL_PAGE_HEIGHT_PX) — it was simply never declared, so the
-            // model had no way to ask for it. Wording adapted from iOS: the
-            // mechanism differs (Android stretches the WebView's viewport
-            // rather than resizing a WKWebView), the cap and the truncation
-            // reporting are identical.
             "full_page" to AgentToolParam("boolean", "For screenshot: capture the entire scrollable page by temporarily stretching the browser viewport to document.documentElement.scrollHeight. Default false captures the visible viewport only. Capped at 32768px tall; when capped, the result text includes 'Truncated: true' and the original height, so you can scroll and capture the remainder separately."),
         ),
         required = listOf("tool_title", "action"),
-        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "mark", "som", "keep_overlay", "profile_name", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page"),
+        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "mark", "som", "keep_overlay", "profile_name", "script_name", "match", "run_at", "enabled", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page"),
     )
 
     // Aligned with iOS AIChatViewModel.swift:5059-5067
@@ -476,6 +473,27 @@ object BrowserUseTool {
         properties.put("profile_name", JSONObject().apply {
             put("type", "string")
             put("description", "Named Auth Profile identifier in the Authenticated Session Vault (for save_auth_profile, load_auth_profile, delete_auth_profile).")
+        })
+
+        properties.put("script_name", JSONObject().apply {
+            put("type", "string")
+            put("description", "Tampermonkey Userscript name/ID or built-in preset ('anti-annoyance-shield', 'unlock-copy-selection', 'auto-expand-articles', 'spa-api-interceptor') for install_userscript, toggle_userscript, remove_userscript.")
+        })
+
+        properties.put("match", JSONObject().apply {
+            put("type", "string")
+            put("description", "URL @match glob pattern(s) for install_userscript (e.g. '*://*.example.com/*' or '<all_urls>').")
+        })
+
+        properties.put("run_at", JSONObject().apply {
+            put("type", "string")
+            put("description", "Injection timing for install_userscript: document-start, document-end, or document-idle.")
+            put("enum", JSONArray(listOf("document-start", "document-end", "document-idle")))
+        })
+
+        properties.put("enabled", JSONObject().apply {
+            put("type", "boolean")
+            put("description", "Explicit enable/disable boolean for toggle_userscript or install_userscript.")
         })
 
         val inputSchema = JSONObject()

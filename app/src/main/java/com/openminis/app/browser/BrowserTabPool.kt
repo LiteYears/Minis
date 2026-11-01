@@ -710,6 +710,47 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
             BrowserAction.SET_VIEWPORT -> handleSetViewport(input)
             BrowserAction.LIST_AUTH_PROFILES -> BrowserAuthVault.listProfilesResult(context)
             BrowserAction.DELETE_AUTH_PROFILE -> BrowserAuthVault.deleteProfileResult(context, input.profileName)
+            BrowserAction.LIST_USERSCRIPTS -> BrowserUserscriptManager.listUserscriptsResult(
+                context = context,
+                currentUrl = activeManager?.currentURL?.value,
+            )
+            BrowserAction.INSTALL_USERSCRIPT, BrowserAction.TOGGLE_USERSCRIPT, BrowserAction.REMOVE_USERSCRIPT -> {
+                if (_tabs.value.isEmpty()) {
+                    when (input.action) {
+                        BrowserAction.INSTALL_USERSCRIPT -> BrowserUserscriptManager.installFromTool(
+                            context = context,
+                            manager = null,
+                            scriptName = input.scriptName,
+                            code = input.script,
+                            matchPatterns = input.matchPatterns,
+                            runAt = input.runAt,
+                            enabled = input.enabled,
+                        )
+                        BrowserAction.TOGGLE_USERSCRIPT -> BrowserUserscriptManager.toggleUserscriptResult(
+                            context = context,
+                            manager = null,
+                            nameOrId = input.scriptName ?: input.text,
+                            enabled = input.enabled,
+                        )
+                        BrowserAction.REMOVE_USERSCRIPT -> BrowserUserscriptManager.removeUserscriptResult(
+                            context = context,
+                            manager = null,
+                            nameOrId = input.scriptName ?: input.text,
+                        )
+                        else -> BrowserActionResult.error("Unexpected action")
+                    }
+                } else {
+                    ownershipViolation(input.tabId)?.let { return it }
+                    val targetId = input.tabId?.takeIf { reqId -> _tabs.value.any { it.id == reqId } }
+                        ?: _selectedTabId.value
+                        ?: _tabs.value.lastOrNull()?.id
+                    if (targetId != null) {
+                        executeSerialized(targetId, input)
+                    } else {
+                        BrowserUserscriptManager.listUserscriptsResult(context, null)
+                    }
+                }
+            }
             else -> {
                 ownershipViolation(input.tabId)?.let { return it }
                 // [T-browser-use-per-tab-serial-android] Serialize per explicit
