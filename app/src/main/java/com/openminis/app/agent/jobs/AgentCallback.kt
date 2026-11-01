@@ -385,7 +385,7 @@ object AgentJobRegistry {
      * same pool would deadlock every parent behind its own children (§4.4).
      * Worst case is therefore 6 parents × 3 children + 6 = 24 loops.
      */
-    const val MAX_CONCURRENT_CHILD_JOBS_PER_PARENT = 3
+    const val MAX_CONCURRENT_CHILD_JOBS_PER_PARENT = 5
 
     /**
      * [T-loadtest-limits] The per-parent cap admission uses:

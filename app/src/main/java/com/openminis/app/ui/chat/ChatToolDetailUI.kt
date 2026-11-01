@@ -499,8 +499,10 @@ internal fun ToolDetailSheet(
                     .fillMaxWidth(),
             ) {
                 when (block.toolName) {
-                    // ── Agent: stacked cards (header · current tool · screenshot · result) ──
-                    com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME -> HelperDetailContent(block)
+                    // ── Agent / Swarm: stacked cards (header · swarm workers · current tool · screenshot · result) ──
+                    com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME,
+                    com.openminis.app.agent.jobs.HelperRunner.SWARM_TOOL_NAME ->
+                        HelperDetailContent(block, onOpenAgentTranscript = onOpenAgentTranscript)
 
                     // ── Shell: black rounded terminal card (mirrors iOS ToolLiveSheet) ──
                     "shell_execute" -> {

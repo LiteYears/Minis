@@ -70,6 +70,17 @@ data class HelperConfig(
      * to the child's system prompt. Empty = nothing appended.
      */
     val agentInstructions: String = "",
+    /**
+     * Dedicated sandbox working directory for a parallel swarm worker
+     * (e.g. `/var/minis/workspace/swarm_<id>/<worker_slug>`). When set, all
+     * `shell_execute` commands start here and relative file paths resolve here.
+     */
+    val workingDirectory: String? = null,
+    /**
+     * Pre-allocated isolated browser tab ID from `BrowserTabPool` for a parallel
+     * swarm worker. Released automatically when the worker job finishes.
+     */
+    val assignedTabId: Int? = null,
 )
 
 data class DelegateTaskArgs(
@@ -123,10 +134,11 @@ object HelperRunner {
      */
     const val LEGACY_TOOL_NAME = "delegate_task"
     const val LEGACY_STATUS_TOOL_NAME = "agent_status"
+    const val SWARM_TOOL_NAME = SubAgentSwarm.TOOL_NAME
 
-    /** True for the current name or either name a shipped build wrote. */
+    /** True for the current name, swarm tool, or either name a shipped build wrote. */
     fun isSubAgentToolName(name: String?): Boolean =
-        name == TOOL_NAME || name == LEGACY_TOOL_NAME || name == LEGACY_STATUS_TOOL_NAME
+        name == TOOL_NAME || name == SWARM_TOOL_NAME || name == LEGACY_TOOL_NAME || name == LEGACY_STATUS_TOOL_NAME
 
     // Limits (design §4.3) — enforced in code, not prompt.
     /**
@@ -351,6 +363,12 @@ object HelperRunner {
     fun identitySection(cfg: HelperConfig, browserEnabled: Boolean = true): String =
         "You are running as a helper (sub-agent) inside an app called Minis, on an Android device with a fully functional Linux shell (Alpine Linux, aarch64). This is the calling environment, not your identity — keep your own model identity unchanged.\n" +
             "A parent agent delegated ONE focused task to you: \"${cfg.title}\". You cannot see the parent conversation and it cannot see yours; everything you need is in the task text. Work the task to completion using your tools, then finish with a single clear final answer — that final message is returned verbatim to the parent agent as the result, and it is the ONLY thing the parent receives. So the final message must contain the complete deliverable itself: the full report, document, list, code or answer the task asked for, in full — never a summary of what you did, a pointer to a file you wrote, or \"see above\". If you produced a file, paste its full content into the final message as well. Do not ask the parent or the user questions; make reasonable assumptions and state them. Do not restate the task or add meta-commentary. Do not create scheduled tasks or delegate further.\n" +
+            (if (!cfg.workingDirectory.isNullOrEmpty()) {
+                "Sandbox Isolation: Your dedicated working directory is `${cfg.workingDirectory}`. All `shell_execute` commands start in `${cfg.workingDirectory}` automatically (`\$MINIS_WORKER_DIR` is set to this path), and relative paths in `file_read`/`file_write`/`file_edit` resolve inside `${cfg.workingDirectory}`. Write all temporary files, scripts, and outputs inside `${cfg.workingDirectory}` so you never collide with parallel sibling workers.\n"
+            } else "") +
+            (if (cfg.assignedTabId != null && cfg.assignedTabId >= 0 && browserEnabled) {
+                "Dedicated Browser Tab: Tab `#${cfg.assignedTabId}` has been pre-allocated exclusively for you in `BrowserTabPool`. Always pass `tab_id: ${cfg.assignedTabId}` on your `browser_use` calls so your browsing stays completely isolated from sibling workers.\n"
+            } else "") +
             browserSharingSection(browserEnabled) +
             "You have at most ${cfg.maxTurns} tool rounds; on the last one tools are withdrawn and you are asked to write the deliverable from what you have, so start writing before you run out. If the task genuinely exceeds what you can do at your capability level, end your final message with a line `[ESCALATE] <one-line reason>` so the parent can rerun it on a stronger model.\n\n" +
             subAgentInstructionsSection(cfg.agentInstructions)
@@ -436,7 +454,8 @@ object HelperRunner {
     /** The parent-tier system-prompt bullet (byte-identical to iOS), or "" when
      *  the tool is not offered (helper vm, or Settings › Agents off). */
     fun systemPromptBullet(enabled: Boolean): String = if (!enabled) "" else
-        "- subagent_task: Delegate a self-contained task to a sub agent that runs its own tool loop in an isolated hidden session, and inspect or stop the ones you started. Full contract in the tool schema. Two things it does not say: the `<agent_callback>` result and progress messages are written by the system, not typed by the user; and while a sub agent runs the user sees it in the tool bar and can watch or stop it.\n"
+        "- subagent_task: Delegate a self-contained task to a sub agent that runs its own tool loop in an isolated hidden session, and inspect or stop the ones you started. Full contract in the tool schema. Two things it does not say: the `<agent_callback>` result and progress messages are written by the system, not typed by the user; and while a sub agent runs the user sees it in the tool bar and can watch or stop it.\n" +
+            "- spawn_subagent: Act as a Staff Engineer / Research Lead and dispatch 2–5 parallel sandboxed worker sub-agents simultaneously (`workers` array). Each worker gets its own isolated working directory (`/var/minis/workspace/swarm_<id>/<worker_id>`), its own dedicated browser tab from `BrowserTabPool` (with optional pre-opened `url`), and runs on the fast/cheap model from `ModelGroups` (`model_choice: \"sub_model\"` by default, or `\"same_as_me\"` / `\"default_model\"`). Use `spawn_subagent` whenever researching multiple competitors/sources in parallel, testing 2–5 code/script approaches concurrently, or Auditing multiple subsystems at once so all workers execute in parallel and fan-in their structured results into your clean context window.\n"
 
     // ── Payloads (block content + tool_result JSON) ─────────────────────
 

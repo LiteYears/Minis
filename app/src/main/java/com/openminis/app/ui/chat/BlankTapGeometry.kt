@@ -621,6 +621,7 @@ class ChatViewModel(
         /** [T-stop-choice] Tools that never run a shell command: stopping only them leaves the shells alone. */
         private val SHELL_FREE_TOOLS = setOf(
             com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME,
+            com.openminis.app.agent.jobs.HelperRunner.SWARM_TOOL_NAME,
             com.openminis.app.agent.userask.UserAskPromptText.TOOL_NAME,
         )
 
@@ -14188,7 +14189,8 @@ class ChatViewModel(
                         // has its process group killed, so it returns with its
                         // partial output; a waiting delegation moves to the
                         // background (delegateDetach) and is not interrupted.
-                        val isDelegation = name == com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME
+                        val isDelegation = name == com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME ||
+                            name == com.openminis.app.agent.jobs.HelperRunner.SWARM_TOOL_NAME
                         val toolRun = foregroundTools.run(
                             id, name,
                             cancellable = name != "shell_execute" && !isDelegation,
@@ -14632,11 +14634,12 @@ class ChatViewModel(
 
         return when (name) {
             FileReadTool.NAME -> {
-                val result = FileReadTool.execute(argsJson, fsSessionId, context)
+                val resolvedArgs = resolveWorkerPathArgs(argsJson)
+                val result = FileReadTool.execute(resolvedArgs, fsSessionId, context)
                 // Record skill usage when SKILL.md under /var/minis/skills/<id>/ is read.
                 if (result.success) {
                     runCatching {
-                        val readPath = JSONObject(argsJson).optString("path", "")
+                        val readPath = JSONObject(resolvedArgs).optString("path", "")
                         if (readPath.isNotEmpty()) {
                             skillRepository?.skillIdFromPath(readPath)?.let { sid ->
                                 skillRepository.recordSkillUse(sid)
@@ -14646,18 +14649,24 @@ class ChatViewModel(
                 }
                 result
             }
-            FileWriteTool.NAME -> FileWriteTool.execute(argsJson, fsSessionId, context).also {
-                if (it.success) maybeReloadSkillsForPath(argsJson)
+            FileWriteTool.NAME -> {
+                val resolvedArgs = resolveWorkerPathArgs(argsJson)
+                FileWriteTool.execute(resolvedArgs, fsSessionId, context).also {
+                    if (it.success) maybeReloadSkillsForPath(resolvedArgs)
+                }
             }
-            FileEditTool.NAME -> FileEditTool.execute(argsJson, fsSessionId, context).also {
-                if (it.success) maybeReloadSkillsForPath(argsJson)
+            FileEditTool.NAME -> {
+                val resolvedArgs = resolveWorkerPathArgs(argsJson)
+                FileEditTool.execute(resolvedArgs, fsSessionId, context).also {
+                    if (it.success) maybeReloadSkillsForPath(resolvedArgs)
+                }
             }
             // T178: pass sessionId + context so read_image routes through
             // resolveSessionHostPath like file_read/write/edit do — without
             // these, the tool consults the global last-writer-wins
             // bindMounts map and would surface another session's
             // /var/minis/{workspace,attachments,offloads,browser} files.
-            ReadImageTool.NAME -> executeReadImageTool(argsJson)
+            ReadImageTool.NAME -> executeReadImageTool(resolveWorkerPathArgs(argsJson))
             "shell_execute" -> executeShellCommand(argsJson, toolId, toolBlocks, assistantId, currentText).also {
                 // [T-android-skill-scan-parity] Stands in for the iOS fakefs
                 // notifier: a shell command may have cloned, edited or removed a
@@ -14715,6 +14724,19 @@ class ChatViewModel(
                         com.openminis.app.agent.jobs.HelperRunner.rejectionJson(
                             "tools_disabled",
                             "Agents are turned off in this app's settings; delegate_task cannot be used. " +
+                                "Do not try it again in this conversation.",
+                        ),
+                        false,
+                    )
+                }
+            com.openminis.app.agent.jobs.HelperRunner.SWARM_TOOL_NAME ->
+                if (com.openminis.app.tools.AgentToolSwitch.AGENTS.isEnabled(context)) {
+                    executeSpawnSubAgent(argsJson, toolId, toolBlocks, assistantId, currentText)
+                } else {
+                    ToolExecutionResult(
+                        com.openminis.app.agent.jobs.HelperRunner.rejectionJson(
+                            "tools_disabled",
+                            "Agents are turned off in this app's settings; spawn_subagent cannot be used. " +
                                 "Do not try it again in this conversation.",
                         ),
                         false,
@@ -15227,6 +15249,445 @@ class ChatViewModel(
         clearDelegateOverride(toolId)
         AppLogger.info(TAG, "[delegate_task] END job=${job.id.take(8)} status=$finalStatus turns=${facts.turns} elapsed=${elapsed / 1000}s result=${facts.lastText.length}ch")
         return ToolExecutionResult(json, finalStatus == "completed", toolTitle = title)
+    }
+
+    /**
+     * Resolve relative `path` arguments in `file_read`/`file_write`/`file_edit`
+     * against a parallel swarm worker's isolated `workingDirectory` when set.
+     */
+    private fun resolveWorkerPathArgs(argsJson: String): String {
+        val workdir = helperConfig?.workingDirectory?.takeIf { it.isNotBlank() } ?: return argsJson
+        return runCatching {
+            val o = JSONObject(argsJson)
+            val rawPath = o.optString("path", "").trim()
+            if (rawPath.isNotEmpty() && !rawPath.startsWith("/") && !rawPath.startsWith("minis://")) {
+                val cleanedRel = rawPath.removePrefix("./")
+                val resolved = "${workdir.trimEnd('/')}/$cleanedRel"
+                o.put("path", resolved)
+                o.toString()
+            } else {
+                argsJson
+            }
+        }.getOrDefault(argsJson)
+    }
+
+    /**
+     * Execute `spawn_subagent` — Sub-Agent Swarm & Parallel Sandboxed Workers.
+     *
+     * Spawns 1–5 parallel worker sub-agents concurrently across:
+     * 1. Isolated Linux working directories (`/var/minis/workspace/swarm_<id>/<worker_slug>`)
+     * 2. Dedicated isolated browser tabs from `BrowserTabPool` (`allocateWorkerTab`)
+     * 3. Fast/cheap model from `ModelGroups` (`SubAgentModelChoice.SUB_MODEL` by default,
+     *    falling back cleanly to the parent model if no Sub group is configured)
+     * Then fans-in all structured deliverables into a single clean context result.
+     */
+    private suspend fun executeSpawnSubAgent(
+        argsJson: String,
+        toolId: String,
+        toolBlocks: MutableList<AssistantBlock>,
+        assistantId: String,
+        currentText: String,
+    ): ToolExecutionResult {
+        val hr = com.openminis.app.agent.jobs.HelperRunner
+        val swarm = com.openminis.app.agent.jobs.SubAgentSwarm
+        val detachSeen = delegateDetach.value
+        val args = swarm.parseArgs(argsJson)
+        val title = args.title.ifEmpty { "Sub-Agent Swarm" }
+        fun reject(reason: String, detail: String): ToolExecutionResult {
+            AppLogger.warning(TAG, "[spawn_subagent] REJECTED $reason: $detail")
+            return ToolExecutionResult(hr.rejectionJson(reason, detail), false, toolTitle = title)
+        }
+        if (isHelper) {
+            return reject("depth_limit", "Helpers cannot spawn nested sub-agent swarms (max delegation depth is 1). Do the work yourself.")
+        }
+        if (!com.openminis.app.agent.jobs.AgentSettings.isEnabled(context)) {
+            return reject("disabled", "Delegation is turned off in Settings › Agents.")
+        }
+        if (args.workers.isEmpty()) {
+            return reject(
+                "empty_workers",
+                "`workers` array is required and must contain 1–${swarm.MAX_WORKERS} worker objects `{id, title, task, url?}`.",
+            )
+        }
+
+        val parentSid = activeSessionId
+        val parentRow = chatRepository.getSession(parentSid)
+        val roster = providerRepository.subAgents
+        val registry = com.openminis.app.agent.jobs.AgentJobRegistry
+        val browserEnabled = com.openminis.app.tools.AgentToolSwitch.BROWSER.isEnabled(context)
+
+        val shortSwarmId = toolId.replace(Regex("[^a-zA-Z0-9]"), "").takeLast(8).ifEmpty {
+            (System.currentTimeMillis() % 100_000L).toString()
+        }
+        val swarmRootDir = "/var/minis/workspace/swarm_$shortSwarmId"
+        runCatching {
+            com.openminis.app.sandbox.PRootKernel.resolveSessionHostPath(fsSessionId, swarmRootDir, context)?.mkdirs()
+        }
+
+        val startedAt = System.currentTimeMillis()
+        val liveStatuses = java.util.concurrent.CopyOnWriteArrayList<com.openminis.app.agent.jobs.SubAgentSwarm.SwarmWorkerStatus>(
+            args.workers.map { spec ->
+                val workdir = "$swarmRootDir/${spec.slug}"
+                runCatching {
+                    com.openminis.app.sandbox.PRootKernel.resolveSessionHostPath(fsSessionId, workdir, context)?.mkdirs()
+                }
+                com.openminis.app.agent.jobs.SubAgentSwarm.SwarmWorkerStatus(
+                    workerId = spec.id,
+                    slug = spec.slug,
+                    title = spec.title,
+                    childSessionId = "",
+                    jobId = "",
+                    status = "starting",
+                    modelUsed = "",
+                    tierUsed = "sub",
+                    modelOrigin = null,
+                    modelGroupName = null,
+                    workdir = workdir,
+                    tabId = null,
+                    initialUrl = spec.url,
+                    currentTool = null,
+                    currentActivity = "initializing sandbox",
+                    turns = 0,
+                    elapsedMs = 0L,
+                    summary = "",
+                    result = "",
+                )
+            }
+        )
+
+        suspend fun writeBlock(content: String, status: ToolBlockStatus? = null) {
+            if (assistantId.isEmpty()) {
+                writeDelegateBlock(toolId, content, status)
+                return
+            }
+            val i = toolBlocks.indexOfFirst { it.id == toolId }
+            if (i >= 0) toolBlocks[i] = toolBlocks[i].copy(content = content, toolTitle = toolBlocks[i].toolTitle.ifEmpty { title })
+            withContext(Dispatchers.Main) {
+                writeDelegateBlock(toolId, content, status)
+                if (i >= 0) updateAssistantMessage(assistantId, currentText, true, toolBlocks)
+            }
+        }
+
+        writeBlock(
+            swarm.progressJson(title, swarmRootDir, liveStatuses.toList(), 0L),
+            ToolBlockStatus.RUNNING,
+        )
+
+        val finalWorkerResults = try {
+            kotlinx.coroutines.supervisorScope {
+                val tickerJob = launch(Dispatchers.Default) {
+                    while (isActive) {
+                        kotlinx.coroutines.delay(1_000L)
+                        val now = System.currentTimeMillis()
+                        writeBlock(
+                            swarm.progressJson(title, swarmRootDir, liveStatuses.toList(), now - startedAt),
+                            ToolBlockStatus.RUNNING,
+                        )
+                    }
+                }
+
+                try {
+                    args.workers.mapIndexed { idx, spec ->
+                        async(Dispatchers.Default) {
+                            val workdir = "$swarmRootDir/${spec.slug}"
+                            val workerStartMs = System.currentTimeMillis()
+                            val subAgent = com.openminis.app.data.model.SubAgentRoster.resolve(spec.agentName, roster)
+                                ?: com.openminis.app.data.model.SubAgentRoster.resolve(null, roster)
+                                ?: com.openminis.app.data.model.SubAgentDefinition.makeBuiltIn()
+
+                            val resolution = com.openminis.app.agent.jobs.ModelTierResolver.resolveForSubAgent(
+                                pinnedGroupId = subAgent.modelGroupId,
+                                choice = spec.modelChoice,
+                                repo = providerRepository,
+                                parentBindingJson = parentRow?.modelBinding,
+                                parentModelId = parentRow?.modelId ?: currentModel?.id,
+                                parentActiveEntryId = _activeEntryId.value,
+                            )
+                            if (resolution == null) {
+                                val failedStatus = liveStatuses[idx].copy(
+                                    status = "failed",
+                                    currentActivity = "no model configured",
+                                    elapsedMs = System.currentTimeMillis() - workerStartMs,
+                                    errorDetail = "No model is configured for worker '${spec.id}'.",
+                                )
+                                liveStatuses[idx] = failedStatus
+                                return@async failedStatus
+                            }
+
+                            val child = chatRepository.createSession(
+                                modelId = resolution.seedModelId,
+                                title = hr.childSessionTitle(context, "${spec.id}: ${spec.title}", subAgent.name.takeIf { !subAgent.isBuiltIn }),
+                                memoryEnabled = false,
+                                parentSessionId = parentSid,
+                                parentToolUseId = toolId,
+                            )
+                            parentRow?.source?.let { chatRepository.dao.updateSource(child.id, it) }
+                            resolution.bindingJson?.let { chatRepository.updateSessionBinding(child.id, it, resolution.seedModelId) }
+
+                            run {
+                                val pinnedGroupLevel = subAgent.modelGroupId
+                                    ?.let { providerRepository.group(it) }?.defaultThinkingLevel
+                                val level = subAgent.thinkingLevelOverride
+                                    ?: pinnedGroupLevel
+                                    ?: parentRow?.thinkingOverride?.let { ThinkingLevel.decoded(it) }
+                                if (level != null && level.isEnabled) {
+                                    chatRepository.dao.updateThinkingOverride(child.id, level.name)
+                                }
+                            }
+
+                            val needsDedicatedTab = browserEnabled && (
+                                !spec.url.isNullOrEmpty() ||
+                                    spec.task.contains("http://", ignoreCase = true) ||
+                                    spec.task.contains("https://", ignoreCase = true) ||
+                                    spec.task.contains("browser", ignoreCase = true) ||
+                                    spec.task.contains("website", ignoreCase = true) ||
+                                    spec.task.contains("page", ignoreCase = true) ||
+                                    spec.task.contains("search", ignoreCase = true) ||
+                                    spec.task.contains("competitor", ignoreCase = true) ||
+                                    spec.task.contains("research", ignoreCase = true)
+                                )
+                            val allocatedTabId = if (needsDedicatedTab) {
+                                runCatching { browserTabPool.allocateWorkerTab(child.id, spec.url) }.getOrNull()
+                            } else null
+
+                            val workerPrompt = swarm.buildWorkerPrompt(
+                                spec = spec,
+                                sharedContext = args.sharedContext,
+                                workdir = workdir,
+                                tabId = allocatedTabId,
+                                totalWorkers = args.workers.size,
+                                workerIndex = idx,
+                            )
+
+                            val job = registry.register(
+                                title = "${spec.id}: ${spec.title}",
+                                origin = com.openminis.app.agent.jobs.AgentJobOrigin.TOOL,
+                                trigger = com.openminis.app.agent.jobs.AgentJobTrigger.Immediate,
+                                target = com.openminis.app.agent.jobs.AgentJobTarget.ChildOfCurrent(parentSid, toolId),
+                                prompt = workerPrompt,
+                                then = com.openminis.app.agent.jobs.AgentJobThen.None,
+                                agentName = subAgent.name,
+                            )
+                            registry.setModelOrigin(job.id, resolution.origin.wire)
+                            registry.registerInterruptedCounter(parentSid) { countInterruptedChildren(parentSid) }
+                            registry.setTierUsed(job.id, resolution.tierUsed.wire)
+                            registry.setProgressLevel(job.id, "none")
+
+                            val childVm = withContext(Dispatchers.Main) {
+                                com.openminis.app.debug.HeadlessChatRunner.viewModelFor(
+                                    context, child.id, com.openminis.app.ui.chat.ChatViewModelStore.PoolKind.CHILD,
+                                ).also {
+                                    it.helperConfig = com.openminis.app.agent.jobs.HelperConfig(
+                                        parentSessionId = parentSid,
+                                        parentToolUseId = toolId,
+                                        jobId = job.id,
+                                        maxTurns = hr.MAX_TURNS,
+                                        title = "${spec.id}: ${spec.title}",
+                                        tierUsed = resolution.tierUsed,
+                                        agentName = subAgent.name.takeIf { !subAgent.isBuiltIn },
+                                        agentInstructions = subAgent.instructions,
+                                        workingDirectory = workdir,
+                                        assignedTabId = allocatedTabId,
+                                    )
+                                    it.adoptBrowserTabPool(browserTabPool)
+                                }
+                            }
+                            registry.registerSteerHook(job.id) { msg -> childVm.enqueueSteer(msg) }
+                            registry.registerMissedSteerDrain(job.id) { childVm.drainMissedSteers() }
+                            registry.registerTabRelease(job.id) {
+                                viewModelScope.launch { browserTabPool.releaseTabs(child.id) }
+                            }
+
+                            liveStatuses[idx] = liveStatuses[idx].copy(
+                                childSessionId = child.id,
+                                jobId = job.id,
+                                status = "running",
+                                modelUsed = resolution.modelLabel,
+                                tierUsed = resolution.tierUsed.wire,
+                                modelOrigin = resolution.origin.wire,
+                                modelGroupName = resolution.modelGroupName,
+                                tabId = allocatedTabId,
+                                currentActivity = "starting",
+                            )
+
+                            var workerStatus = "completed"
+                            var wrapUpAskedAt: Long? = null
+                            var wrapUpToolStopped = false
+                            try {
+                                val ready = withContext(Dispatchers.Default) {
+                                    withTimeoutOrNull(5_000L) { childVm.activeEntryId.first { it != null } }
+                                }
+                                if (ready == null) {
+                                    registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.FAILED, null)
+                                    val failedStatus = liveStatuses[idx].copy(
+                                        status = "failed",
+                                        currentActivity = "provider init failed",
+                                        elapsedMs = System.currentTimeMillis() - workerStartMs,
+                                        errorDetail = "Worker '${spec.id}' could not resolve a provider.",
+                                    )
+                                    liveStatuses[idx] = failedStatus
+                                    return@async failedStatus
+                                }
+
+                                val outcome = withContext(Dispatchers.Main) { childVm.submitPrompt(workerPrompt) }
+                                if (outcome !is SubmitOutcome.Sent) {
+                                    registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.FAILED, null)
+                                    val failedStatus = liveStatuses[idx].copy(
+                                        status = "failed",
+                                        currentActivity = "did not start ($outcome)",
+                                        elapsedMs = System.currentTimeMillis() - workerStartMs,
+                                        errorDetail = "Worker '${spec.id}' did not start ($outcome).",
+                                    )
+                                    liveStatuses[idx] = failedStatus
+                                    return@async failedStatus
+                                }
+
+                                registry.markRunning(job.id, child.id) {
+                                    if (childVm.isStreaming.value) childVm.cancelStream()
+                                }
+                                com.openminis.app.agent.jobs.SubAgentTerminationStore.shared.begin(child.id, job.id, parentSid)
+                                AppLogger.info(
+                                    TAG,
+                                    "[spawn_subagent] START worker=${spec.id} job=${job.id.take(8)} child=${child.id.take(8)} " +
+                                        "workdir=$workdir tab=${allocatedTabId ?: "-"} model=${resolution.modelLabel}",
+                                )
+
+                                while (childVm.isStreaming.value) {
+                                    val now = System.currentTimeMillis()
+                                    if (delegateDetach.value != detachSeen) {
+                                        workerStatus = "cancelled"
+                                        withContext(Dispatchers.Main) { childVm.cancelStream() }
+                                        withTimeoutOrNull(3_000L) { childVm.isStreaming.first { !it } }
+                                        break
+                                    }
+                                    if (now - workerStartMs >= args.minutes * 60_000L) {
+                                        val asked = wrapUpAskedAt
+                                        if (asked == null) {
+                                            wrapUpAskedAt = now
+                                            childVm.helperWrapUpRequested = true
+                                            AppLogger.warning(TAG, "[spawn_subagent] worker=${spec.id} budget over after ${args.minutes}m — requesting wrap-up")
+                                        } else if (now - asked >= hr.WRAP_UP_GRACE_MS) {
+                                            workerStatus = "timeout"
+                                            withContext(Dispatchers.Main) { childVm.cancelStream() }
+                                            withTimeoutOrNull(5_000L) { childVm.isStreaming.first { !it } }
+                                            break
+                                        } else if (now - asked >= hr.WRAP_UP_TOOL_PATIENCE_MS && !wrapUpToolStopped) {
+                                            wrapUpToolStopped = true
+                                            ExecutionCoordinator.stopCurrentCommand(child.id)
+                                        }
+                                    }
+                                    val lastBlock = childLiveToolBlock(childVm)
+                                    val toolName = lastBlock?.toolName.orEmpty()
+                                    val toolAct = lastBlock?.toolTitle?.ifEmpty { toolName } ?: "working"
+                                    val activeTab = browserTabPool.tabIdsOwnedBy(child.id).lastOrNull() ?: allocatedTabId
+                                    liveStatuses[idx] = liveStatuses[idx].copy(
+                                        currentTool = toolName.ifEmpty { null },
+                                        currentActivity = toolAct,
+                                        tabId = activeTab,
+                                        elapsedMs = now - workerStartMs,
+                                    )
+                                    withTimeoutOrNull(600L) {
+                                        kotlinx.coroutines.flow.combine(childVm.isStreaming, delegateDetach) { streaming, detach ->
+                                            !streaming || detach != detachSeen
+                                        }.first { it }
+                                    }
+                                }
+                            } catch (e: CancellationException) {
+                                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                                    if (childVm.isStreaming.value) childVm.cancelStream()
+                                    registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.CANCELLED, null)
+                                    recordChildTermination(
+                                        childVm, child.id, job.id, parentSid, loopStatus = "cancelled",
+                                        budgetExpired = childVm.helperWrapUpRequested,
+                                        errorText = null, resultText = "",
+                                        delivery = com.openminis.app.agent.jobs.SubAgentTermination.Delivery.INLINE,
+                                    )
+                                }
+                                throw e
+                            }
+
+                            val workerElapsed = System.currentTimeMillis() - workerStartMs
+                            val facts = hr.childRunFacts(chatRepository.dao.loadMessages(child.id))
+                            val childError = childVm.messages.value.lastOrNull { it.role == "assistant" }?.error
+                            if (workerStatus == "completed") {
+                                workerStatus = when {
+                                    registry.job(job.id)?.state == com.openminis.app.agent.jobs.AgentJobState.CANCELLED -> "cancelled"
+                                    childError != null -> "failed"
+                                    else -> "completed"
+                                }
+                            }
+                            val termination = recordChildTermination(
+                                childVm, child.id, job.id, parentSid,
+                                loopStatus = workerStatus,
+                                budgetExpired = wrapUpAskedAt != null || childVm.helperWrapUpRequested,
+                                errorText = childError,
+                                resultText = facts.lastText,
+                                delivery = com.openminis.app.agent.jobs.SubAgentTermination.Delivery.INLINE,
+                            )
+                            workerStatus = hr.reportedStatus(workerStatus, facts.lastText, termination)
+                            val summary = hr.runSummaryLine(facts.toolNames, facts.turns, facts.input, facts.output, facts.cacheRead)
+                            registry.setSummaryLine(job.id, summary)
+                            registry.finish(
+                                job.id,
+                                when (workerStatus) {
+                                    "completed", com.openminis.app.agent.jobs.HelperRunner.NO_DELIVERABLE ->
+                                        com.openminis.app.agent.jobs.AgentJobState.DONE
+                                    "cancelled" -> com.openminis.app.agent.jobs.AgentJobState.CANCELLED
+                                    "timeout" -> com.openminis.app.agent.jobs.AgentJobState.TIMEOUT
+                                    else -> com.openminis.app.agent.jobs.AgentJobState.FAILED
+                                },
+                                facts.lastText,
+                            )
+                            val deliverableText = if (termination != null && termination.isTerminal) {
+                                com.openminis.app.agent.jobs.SubAgentTerminationRules.helperResultText(facts.lastText, termination)
+                            } else {
+                                facts.lastText.ifEmpty { hr.emptyResultNote(workerStatus) }
+                            }
+                            val doneStatus = liveStatuses[idx].copy(
+                                status = workerStatus,
+                                currentTool = null,
+                                currentActivity = workerStatus,
+                                turns = facts.turns,
+                                elapsedMs = workerElapsed,
+                                summary = summary,
+                                result = deliverableText,
+                                errorDetail = childError,
+                            )
+                            liveStatuses[idx] = doneStatus
+                            AppLogger.info(
+                                TAG,
+                                "[spawn_subagent] END worker=${spec.id} status=$workerStatus turns=${facts.turns} elapsed=${workerElapsed / 1000}s",
+                            )
+                            doneStatus
+                        }
+                    }.map { it.await() }
+                } finally {
+                    tickerJob.cancel()
+                }
+            }
+        } catch (e: CancellationException) {
+            clearDelegateOverride(toolId)
+            throw e
+        }
+
+        val totalElapsed = System.currentTimeMillis() - startedAt
+        val resultPayload = swarm.resultJson(
+            title = title,
+            swarmRootDir = swarmRootDir,
+            workers = finalWorkerResults,
+            elapsedMs = totalElapsed,
+        )
+        clearDelegateOverride(toolId)
+        val anyCompleted = finalWorkerResults.any { it.status == "completed" }
+        writeBlock(
+            resultPayload,
+            if (anyCompleted) ToolBlockStatus.SUCCESS else ToolBlockStatus.FAILED,
+        )
+        return ToolExecutionResult(
+            output = resultPayload,
+            success = anyCompleted,
+            toolTitle = title,
+        )
     }
 
     /**
@@ -15970,6 +16431,19 @@ class ChatViewModel(
             // budget). `command` is rewritten to the bash-wrapped form on the S/E
             // path; `bashReminder` is attached if we fall back to sh. Only this
             // agent path runs here; the in-app terminal is untouched.
+            // If this ChatViewModel is a parallel swarm worker with an isolated
+            // workingDirectory, ensure the host directory exists and prepend
+            // `mkdir -p '<workdir>' && cd '<workdir>' && export MINIS_WORKER_DIR='<workdir>'`
+            // so every shell process starts inside its isolated sandbox folder.
+            val workerDir = helperConfig?.workingDirectory?.takeIf { it.isNotBlank() }
+            if (workerDir != null) {
+                runCatching {
+                    com.openminis.app.sandbox.PRootKernel.resolveSessionHostPath(fsSessionId, workerDir, context)?.mkdirs()
+                }
+                val safeDir = workerDir.replace("'", "'\"'\"'")
+                command = "mkdir -p '$safeDir' && cd '$safeDir' && export MINIS_WORKER_DIR='$safeDir' && (\n$command\n)"
+            }
+
             BashismDetector.ensureLoaded(context)
             val bashism = BashismDetector.detect(command)
             var bashReminder: String? = null
@@ -16147,11 +16621,18 @@ class ChatViewModel(
         )
 
     private suspend fun executeBrowserUseTool(argsJson: String): ToolExecutionResult {
-        val input = BrowserActionInput.parse(argsJson)
+        val parsed = BrowserActionInput.parse(argsJson)
             ?: return ToolExecutionResult("Error: Invalid browser_use input", false)
+        val assignedTab = helperConfig?.assignedTabId?.takeIf { it >= 0 }
+        val owner = browserOwnerId
+        val input = if (assignedTab != null && (parsed.tabId == null || (owner != null && !browserTabPool.mayUse(parsed.tabId, owner)))) {
+            parsed.copy(tabId = assignedTab)
+        } else {
+            parsed
+        }
 
         return try {
-            val result = browserTabPool.execute(input, owner = browserOwnerId)
+            val result = browserTabPool.execute(input, owner = owner)
             val toolTitle = try {
                 JSONObject(argsJson).optString("tool_title", "browser_use")
             } catch (_: Exception) { "browser_use" }
@@ -16175,7 +16656,7 @@ class ChatViewModel(
      * Returns the host absolute path on success, null otherwise.
      */
     private fun persistBrowserArtifact(filename: String, data: ByteArray): String? =
-        BrowserArtifacts.persist(activeSessionId, { context.filesDir }, filename, data)
+        BrowserArtifacts.persist(fsSessionId.ifEmpty { activeSessionId }, { context.filesDir }, filename, data)
 
     /**
      * Convert a Linux path under /var/minis/ to a percent-encoded minis:// URL.
@@ -16264,9 +16745,21 @@ class ChatViewModel(
      * cost of being wrong is a spinner that stops, versus one that never does.
      */
     private fun delegateJobIsAlive(content: String): Boolean {
-        val jobId = runCatching { org.json.JSONObject(content).optString("job_id", "") }.getOrNull()
-        if (jobId.isNullOrEmpty()) return false
-        return com.openminis.app.agent.jobs.AgentJobRegistry.job(jobId)?.isActive == true
+        val o = runCatching { org.json.JSONObject(content) }.getOrNull() ?: return false
+        val jobId = o.optString("job_id", "")
+        if (jobId.isNotEmpty() && com.openminis.app.agent.jobs.AgentJobRegistry.job(jobId)?.isActive == true) {
+            return true
+        }
+        val workers = o.optJSONArray("workers")
+        if (workers != null) {
+            for (i in 0 until workers.length()) {
+                val wJobId = workers.optJSONObject(i)?.optString("job_id", "").orEmpty()
+                if (wJobId.isNotEmpty() && com.openminis.app.agent.jobs.AgentJobRegistry.job(wJobId)?.isActive == true) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     /**
@@ -17858,7 +18351,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 ExecutionCoordinator.interruptForegroundCommands(sessionId)
             }
         }
-        if (targets(com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME)) {
+        if (targets(com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME) ||
+            targets(com.openminis.app.agent.jobs.HelperRunner.SWARM_TOOL_NAME)) {
             delegateDetach.value = delegateDetach.value + 1
         }
         foregroundTools.interrupt(ids)

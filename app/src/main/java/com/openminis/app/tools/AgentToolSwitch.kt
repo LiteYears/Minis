@@ -3,6 +3,7 @@ package com.openminis.app.tools
 import android.content.Context
 import com.openminis.app.browser.BrowserAction
 import com.openminis.app.data.ContextOffload
+import com.openminis.app.data.model.AgentSchemaNode
 import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.AgentToolParam
 import com.openminis.app.data.model.LLMMessage
@@ -68,7 +69,7 @@ enum class AgentToolSwitch(val key: String, val defaultValue: Boolean) {
             // [T-sub-agents-v1] The renamed tool plus the two names
             // shipped builds wrote, so the switch still governs a
             // replayed call from an older transcript.
-            "subagent_task", "delegate_task", "agent_status" -> AGENTS
+            "subagent_task", "spawn_subagent", "delegate_task", "agent_status" -> AGENTS
             com.openminis.app.agent.userask.UserAskPromptText.TOOL_NAME -> USER_ASK
             else -> null
         }
@@ -171,6 +172,7 @@ object AgentTools {
         }
         if (!isHelper && delegateEnabled) {
             add(subAgentTaskDefinition(rosterNames))
+            add(spawnSubAgentDefinition(rosterNames))
         }
         if (userAskExposed && !isHelper) add(com.openminis.app.agent.userask.UserAskPromptText.definition())
     }
@@ -219,6 +221,71 @@ object AgentTools {
                 "child_session_id",
             ),
         )
+
+    /**
+     * Sub-Agent Swarm & Parallel Sandboxed Workers (`spawn_subagent`).
+     * Allows the primary orchestrator model to spawn 2–5 parallel workers,
+     * each with its own isolated working directory, dedicated browser tab from
+     * BrowserTabPool, and fast/cheap model from ModelGroups (`sub_model` by default),
+     * then fan-in their structured results.
+     */
+    private fun spawnSubAgentDefinition(rosterNames: List<String>): AgentToolDefinition {
+        val workerItemSchema = AgentSchemaNode.Obj(
+            description = "Specification for a single parallel sandboxed worker sub-agent.",
+            properties = listOf(
+                "id" to AgentSchemaNode.Str("Short unique identifier for this worker (e.g. 'worker_1', 'competitor_stripe', 'approach_rust'). Used to name its isolated working directory."),
+                "title" to AgentSchemaNode.Str("Concise 3-8 word label for this worker's assignment shown in the swarm UI card."),
+                "task" to AgentSchemaNode.Str("Complete, self-contained instructions for this worker: goal, files/URLs to inspect, commands to run, and exact structured output to return."),
+                "url" to AgentSchemaNode.Str("Optional initial URL to pre-open in this worker's dedicated isolated BrowserTabPool tab before its first turn."),
+                "agent" to AgentSchemaNode.Str("Optional sub-agent persona from the roster.", enumValues = rosterNames),
+                "model_choice" to AgentSchemaNode.Str(
+                    "Optional per-worker model tier override. Defaults to the swarm's `model_choice` ('sub_model' — the fast/cheap ModelGroup).",
+                    enumValues = listOf("sub_model", "same_as_me", "default_model"),
+                ),
+            ),
+            required = listOf("id", "title", "task"),
+        )
+        return AgentToolDefinition(
+            name = com.openminis.app.agent.jobs.SubAgentSwarm.TOOL_NAME,
+            description = "Spawn a parallel swarm of 2–5 sandboxed worker sub-agents (`workers`) that execute simultaneously and fan-in their structured deliverables into your clean context window.\n\n" +
+                "Each worker automatically receives:\n" +
+                "1. An isolated Linux working directory (`/var/minis/workspace/swarm_<id>/<worker_id>`) where all `shell_execute` commands and relative `file_read`/`file_write`/`file_edit` paths execute without colliding with sibling workers.\n" +
+                "2. An isolated dedicated browser tab from `BrowserTabPool` (with optional `url` pre-loaded) that is automatically released when the worker finishes.\n" +
+                "3. A cheaper/faster model from the user's `ModelGroups` (`model_choice: \"sub_model\"` by default, with automatic fallback to this conversation's model if no Sub Model Group is configured).\n\n" +
+                "Use `spawn_subagent` whenever you act as a Staff Engineer or Research Lead — e.g. researching 2–5 competitors/websites in parallel across separate browser tabs, benchmarking or testing 2–4 code/script approaches in isolated directories, or auditing multiple modules simultaneously.",
+            parameters = mapOf(
+                "tool_title" to AgentToolParam(
+                    "string",
+                    "A concise 5-10 word summary of what this swarm does, shown on the swarm card (e.g. 'Research 4 competitor pricing pages in parallel', 'Benchmark 3 sorting implementations'). Use the same language as the user.",
+                ),
+                "workers" to AgentToolParam(
+                    type = "array",
+                    description = "Array of 2–5 parallel worker specifications (1–5 supported). Each worker runs concurrently in its own isolated sandbox directory and dedicated browser tab.",
+                    schema = AgentSchemaNode.Arr(
+                        description = "2–5 parallel worker specifications.",
+                        items = workerItemSchema,
+                        minItems = 1,
+                        maxItems = com.openminis.app.agent.jobs.SubAgentSwarm.MAX_WORKERS,
+                    ),
+                ),
+                "shared_context" to AgentToolParam(
+                    "string",
+                    "Optional shared background context, constraints, or output format requirements appended to every worker's prompt.",
+                ),
+                "model_choice" to AgentToolParam(
+                    "string",
+                    "Default model tier for workers in this swarm. Defaults to \"sub_model\" (the fast/cheap ModelGroup from ModelGroups, falling back to the primary model if unconfigured). Use \"same_as_me\" or \"default_model\" only when workers require frontier reasoning.",
+                    enumValues = listOf("sub_model", "same_as_me", "default_model"),
+                ),
+                "max_minutes" to AgentToolParam(
+                    "integer",
+                    "Wall-clock time budget in minutes for the parallel swarm (default 5, maximum 30). Workers still running at the deadline receive a wrap-up turn to return their findings.",
+                ),
+            ),
+            required = listOf("tool_title", "workers"),
+            propertyOrdering = listOf("tool_title", "workers", "shared_context", "model_choice", "max_minutes"),
+        )
+    }
 
     // Aligned with iOS AIChatViewModel.swift:4982-4993
     private fun shellExecuteDefinition(): AgentToolDefinition = AgentToolDefinition(

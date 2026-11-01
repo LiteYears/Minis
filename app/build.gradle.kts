@@ -167,9 +167,7 @@ abstract class WriteBuildInfoTask : DefaultTask() {
 androidComponents {
     onVariants { variant ->
         val cap = variant.name.replaceFirstChar { it.uppercase() }
-        val task = tasks.register<WriteBuildInfoTask>("write${cap}BuildInfo") {
-            outputs.upToDateWhen { false }
-        }
+        val task = tasks.register<WriteBuildInfoTask>("write${cap}BuildInfo")
         variant.sources.assets?.addGeneratedSourceDirectory(task, WriteBuildInfoTask::outputDir)
     }
 }

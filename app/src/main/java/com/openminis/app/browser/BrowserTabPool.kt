@@ -67,7 +67,7 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
          * the fan-out case, precisely because WebView memory is the real
          * constraint here.
          */
-        const val MAX_TABS_WITH_AGENTS = 6
+        const val MAX_TABS_WITH_AGENTS = 8
         private const val IDLE_CHECK_INTERVAL_MS = 60_000L  // 60 seconds
         /** Default idle timeout — matches iOS BrowserTabPool.idleTimeout (15 minutes). */
         const val DEFAULT_IDLE_TIMEOUT_MINUTES = 15
@@ -218,10 +218,10 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
     // here — it just has not been reported yet.
 
     /** tab id → owning agent's session id. Absent = the chat's own tab. */
-    private val tabOwner = mutableMapOf<Int, String>()
+    private val tabOwner = ConcurrentHashMap<Int, String>()
 
     /** Each agent's most recently used tab, for implicit targeting. */
-    private val lastTabByOwner = mutableMapOf<String, Int>()
+    private val lastTabByOwner = ConcurrentHashMap<String, Int>()
 
     /** Tabs one agent may hold at once. The chat itself keeps [MAX_TABS]. */
     private val agentTabQuota = AGENT_TAB_QUOTA
@@ -1340,6 +1340,40 @@ class BrowserTabPool(private val context: Context) : BrowserTabPoolRegistry.Regi
                 ". Use tab_id: ${tab.id} to target this tab.",
             tabId = tab.id,
         )
+    }
+
+    /**
+     * Pre-allocate a dedicated, isolated browser tab for a parallel swarm worker
+     * owned by [owner] (`childSessionId`). If [initialUrl] is non-blank, starts
+     * loading that URL immediately; otherwise initializes a blank page.
+     *
+     * Returns the allocated `tab.id`, or `null` if the pool/device tab cap is full.
+     */
+    suspend fun allocateWorkerTab(owner: String, initialUrl: String? = null): Int? = withContext(Dispatchers.Main) {
+        if (owner.isBlank()) return@withContext null
+        val existing = tabIdsOwnedBy(owner)
+        if (existing.isNotEmpty()) return@withContext existing.first()
+        val currentTabs = _tabs.value.toMutableList()
+        val ceiling = effectiveMaxTabs(owner)
+        if (currentTabs.size >= ceiling) return@withContext null
+        val rawUrl = initialUrl?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanUrl = rawUrl?.let { u ->
+            if (!u.contains("://") && !u.startsWith("about:") && !u.startsWith("minis:") && !u.startsWith("file:") && !u.startsWith("data:")) {
+                "https://$u"
+            } else {
+                u
+            }
+        }
+        val tab = createTab(currentTabs, cleanUrl, owner) ?: return@withContext null
+        tabOwner[tab.id] = owner
+        lastTabByOwner[owner] = tab.id
+        if (tab.needsInitialBlankPage) {
+            tab.needsInitialBlankPage = false
+            tab.manager.loadBlankPage()
+        }
+        saveState()
+        Log.i(TAG, "Allocated isolated swarm worker tab ${tab.id} for owner=${owner.take(8)} url=${cleanUrl ?: "about:blank"}")
+        tab.id
     }
 
     /**

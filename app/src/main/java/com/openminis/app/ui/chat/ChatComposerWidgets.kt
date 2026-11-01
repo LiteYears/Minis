@@ -590,7 +590,7 @@ private fun ToolPreviewThumbnail(
     // work one level down", which is the same question the ring is asking.
     val subAgentLive = punchThroughDepth > 0 ||
         (
-            block.toolName == com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME &&
+            com.openminis.app.agent.jobs.HelperRunner.isSubAgentToolName(block.toolName) &&
                 (remember(block.content, block.toolStatus, block.toolTitle) { parseHelperBlock(block) }.phase as? HelperPhase.Running)?.tool != null
             )
     val subAgentGlow = helperAccent()
@@ -950,7 +950,8 @@ private fun ToolPreviewThumbnail(
             // Recursing into ToolPreviewThumbnail is what makes every existing
             // renderer apply to the child for free; the depth cap stops a chain
             // of delegations from nesting without bound.
-            com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME -> {
+            com.openminis.app.agent.jobs.HelperRunner.TOOL_NAME,
+            com.openminis.app.agent.jobs.HelperRunner.SWARM_TOOL_NAME -> {
                 val childId = remember(block.content, block.toolStatus, block.toolTitle) {
                     parseHelperBlock(block).childSessionId
                 }

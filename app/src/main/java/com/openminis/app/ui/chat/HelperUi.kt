@@ -202,6 +202,21 @@ internal fun helperToolLabel(name: String): String {
     return spaced.replaceFirstChar { if (it.isLowerCase()) it.titlecase(java.util.Locale.US) else it.toString() }
 }
 
+internal data class SwarmWorkerUiItem(
+    val workerId: String,
+    val title: String,
+    val childSessionId: String?,
+    val status: String,
+    val modelUsed: String?,
+    val workdir: String,
+    val tabId: Int?,
+    val url: String?,
+    val currentTool: String?,
+    val currentActivity: String?,
+    val turns: Int,
+    val elapsedSeconds: Int,
+)
+
 internal data class HelperBlockInfo(
     val title: String,
     val phase: HelperPhase,
@@ -214,6 +229,9 @@ internal data class HelperBlockInfo(
      * that is the correct default rather than a gap to fill.
      */
     val agent: String? = null,
+    val isSwarm: Boolean = false,
+    val swarmDir: String? = null,
+    val swarmWorkers: List<SwarmWorkerUiItem> = emptyList(),
 ) {
     /**
      * [T-android-neverstarted-not-running] Whether anything is actually in
@@ -247,7 +265,41 @@ private fun parseJson(content: String): JSONObject? {
  */
 internal fun parseHelperBlock(block: AssistantBlock): HelperBlockInfo {
     val title = block.toolTitle.ifEmpty { block.toolName }
-    val o = parseJson(block.content) ?: return HelperBlockInfo(title, HelperPhase.Starting, null, null, null)
+    val isSwarmTool = block.toolName == HelperRunner.SWARM_TOOL_NAME
+    val o = parseJson(block.content) ?: return HelperBlockInfo(
+        title, HelperPhase.Starting, null, null, null,
+        agent = if (isSwarmTool) "Swarm" else null,
+        isSwarm = isSwarmTool,
+    )
+    val isSwarm = isSwarmTool || o.optBoolean("swarm", false)
+    val swarmDir = o.optString("swarm_dir", "").ifEmpty { null }
+    val swarmWorkers = buildList {
+        val arr = o.optJSONArray("workers")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val w = arr.optJSONObject(i) ?: continue
+                add(
+                    SwarmWorkerUiItem(
+                        workerId = w.optString("worker_id", "worker_${i + 1}"),
+                        title = w.optString("title", "Worker ${i + 1}"),
+                        childSessionId = w.optString("child_session_id", "").ifEmpty { null },
+                        status = w.optString("status", "running"),
+                        modelUsed = w.optString("model_used", "").ifEmpty { null },
+                        workdir = w.optString("workdir", ""),
+                        tabId = if (w.has("tab_id")) w.optInt("tab_id", -1).takeIf { it >= 0 } else null,
+                        url = w.optString("url", "").ifEmpty { null },
+                        currentTool = w.optString("tool", "").ifEmpty { null },
+                        currentActivity = w.optString("activity", "").ifEmpty { null },
+                        turns = w.optInt("turns", 0),
+                        elapsedSeconds = w.optInt("elapsed_s", 0),
+                    )
+                )
+            }
+        }
+    }
+    val swarmBadge = if (isSwarm) {
+        if (swarmWorkers.isNotEmpty()) "Swarm · ${swarmWorkers.size}" else "Swarm"
+    } else null
     val childId = o.optString("child_session_id", "").ifEmpty { null }
     val summaryLine = o.optString("summary", "").ifEmpty { null }?.removePrefix("Summary: ")
     // [T-android-unknown-status] Absent `status` falls back to EMPTY, not to
@@ -304,7 +356,10 @@ internal fun parseHelperBlock(block: AssistantBlock): HelperBlockInfo {
             val elapsed = o.optLong("elapsed_s", -1L)
             val clock = if (elapsed >= 0 && o.has("elapsed_s")) HelperRunner.formatClock(elapsed * 1000) else ""
             val last = o.optString("last_message", "").ifEmpty { null }
-            return HelperBlockInfo(title, HelperPhase.Running(tool, activity, clock), childId, last, summaryLine)
+            return HelperBlockInfo(
+                title, HelperPhase.Running(tool, activity, clock), childId, last, summaryLine,
+                agent = swarmBadge, isSwarm = isSwarm, swarmDir = swarmDir, swarmWorkers = swarmWorkers,
+            )
         }
         status = "interrupted"
     }
@@ -329,7 +384,10 @@ internal fun parseHelperBlock(block: AssistantBlock): HelperBlockInfo {
             errorDetail = o.optString("error_detail", "").ifEmpty { null },
         ),
         childId, result.ifEmpty { null }, summaryLine,
-        agent = o.optString("agent", "").trim().ifEmpty { null },
+        agent = swarmBadge ?: o.optString("agent", "").trim().ifEmpty { null },
+        isSwarm = isSwarm,
+        swarmDir = swarmDir,
+        swarmWorkers = swarmWorkers,
     )
 }
 
@@ -498,7 +556,7 @@ internal fun helperElapsedLabel(s: Int): String = if (s >= 60) "${s / 60}m ${s %
 
 /** Icon for a child's tool name — the same vocabulary the parent's blocks use. */
 internal fun helperToolIcon(name: String?): ImageVector = when (name) {
-    null, "", "subagent_task", "delegate_task", "agent_status" -> Icons.Default.Groups
+    null, "", "subagent_task", "spawn_subagent", "delegate_task", "agent_status" -> Icons.Default.Groups
     else -> toolIconFor(name)
 }
 
@@ -929,7 +987,10 @@ private fun HelperControlDetailContent(block: AssistantBlock, summary: String) {
  * conversation is reached from the sheet's top-right chat-bubble button.
  */
 @Composable
-internal fun HelperDetailContent(block: AssistantBlock) {
+internal fun HelperDetailContent(
+    block: AssistantBlock,
+    onOpenAgentTranscript: ((String) -> Unit)? = null,
+) {
     // [T-android-subagent-control-capsule] A control call is not a delegation:
     // it has no child session, no model, no elapsed time and no deliverable, so
     // the delegation body below would render a card of empty rows. Show what
@@ -1174,6 +1235,13 @@ internal fun HelperDetailContent(block: AssistantBlock) {
                 SubAgentStatChips(d, remainingMs, budgetMinutes = if (info.isRunning) budgetMinutes else null)
             }
         }
+        if (info.isSwarm && info.swarmWorkers.isNotEmpty()) {
+            SwarmWorkersOverviewCard(
+                swarmDir = info.swarmDir,
+                workers = info.swarmWorkers,
+                onOpenAgentTranscript = onOpenAgentTranscript,
+            )
+        }
         taskArgs?.let { SubAgentTaskCard(it) }
         // 2. current tool (running only)
         (info.phase as? HelperPhase.Running)?.let { p ->
@@ -1237,8 +1305,189 @@ internal fun HelperDetailContent(block: AssistantBlock) {
         }
         // [T-subagent-detail-rich] Steer or stop, only while there is a run to act on.
         val cid = info.childSessionId
-        if (info.isRunning && cid != null) {
+        if (info.isRunning && cid != null && !info.isSwarm) {
             SubAgentActionsCard(childSessionId = cid, canSteer = clock.jobIsLive)
+        }
+    }
+}
+
+@Composable
+private fun SwarmWorkersOverviewCard(
+    swarmDir: String?,
+    workers: List<SwarmWorkerUiItem>,
+    onOpenAgentTranscript: ((String) -> Unit)?,
+) {
+    val accent = helperAccent()
+    val completedCount = workers.count { it.status == "completed" }
+    AgentDetailCard(
+        title = "Parallel Sandboxed Workers ($completedCount/${workers.size} done)",
+        icon = Icons.Default.Groups,
+        iconTint = accent,
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (!swarmDir.isNullOrEmpty()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        "Swarm Root:",
+                        fontSize = 11.sp,
+                        color = ChatColors.secondaryText,
+                    )
+                    Text(
+                        swarmDir,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = ChatColors.primaryText,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            workers.forEach { w ->
+                val isRunning = w.status == "running" || w.status == "starting"
+                val statusColor = if (isRunning) accent else helperStatusColor(w.status)
+                val rowShape = RoundedCornerShape(8.dp)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(rowShape)
+                        .background(ChatColors.secondaryBg.copy(alpha = 0.65f))
+                        .border(0.5.dp, statusColor.copy(alpha = 0.35f), rowShape)
+                        .then(
+                            if (w.childSessionId != null && onOpenAgentTranscript != null) {
+                                Modifier.clickable { onOpenAgentTranscript(w.childSessionId) }
+                            } else Modifier
+                        )
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        if (isRunning) {
+                            HelperSpinner(11, 1.5f)
+                        } else {
+                            Icon(
+                                helperStatusGlyph(w.status),
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(12.dp),
+                            )
+                        }
+                        Text(
+                            w.workerId,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = accent,
+                        )
+                        Text(
+                            w.title,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = ChatColors.primaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (w.elapsedSeconds > 0) {
+                            Text(
+                                helperElapsedLabel(w.elapsedSeconds),
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = ChatColors.tertiaryText,
+                            )
+                        }
+                        if (w.childSessionId != null && onOpenAgentTranscript != null) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "Open worker transcript",
+                                tint = ChatColors.tertiaryText,
+                                modifier = Modifier.size(15.dp),
+                            )
+                        }
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (w.tabId != null && w.tabId >= 0) {
+                            Text(
+                                "Tab #${w.tabId}",
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.SemiBold,
+                                color = accent,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(accent.copy(alpha = 0.14f))
+                                    .padding(horizontal = 5.dp, vertical = 1.dp),
+                            )
+                        }
+                        w.modelUsed?.let { model ->
+                            Text(
+                                model,
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = ChatColors.secondaryText,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        if (w.turns > 0) {
+                            Text(
+                                "${w.turns} turns",
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = ChatColors.tertiaryText,
+                            )
+                        }
+                    }
+                    if (w.workdir.isNotEmpty()) {
+                        Text(
+                            "dir: ${w.workdir}",
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = ChatColors.tertiaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (isRunning && (!w.currentTool.isNullOrEmpty() || !w.currentActivity.isNullOrEmpty())) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            if (!w.currentTool.isNullOrEmpty()) {
+                                Icon(
+                                    helperToolIcon(w.currentTool),
+                                    contentDescription = null,
+                                    tint = accent,
+                                    modifier = Modifier.size(11.dp),
+                                )
+                                Text(
+                                    helperToolLabel(w.currentTool),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = accent,
+                                )
+                            }
+                            if (!w.currentActivity.isNullOrEmpty()) {
+                                Text(
+                                    w.currentActivity,
+                                    fontSize = 11.sp,
+                                    color = ChatColors.secondaryText,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
