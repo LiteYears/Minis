@@ -1648,9 +1648,22 @@ object ResponseIdleTimeoutSetting {
 object StopReasons {
     const val REFUSAL = "refusal"
     const val CONTENT_FILTER = "content_filter"
+    const val SAFETY = "safety"
+    const val PROHIBITED_CONTENT = "prohibited_content"
+    const val BLOCKLIST = "blocklist"
+    const val SPII = "spii"
+
+    private val REFUSAL_REASONS = setOf(
+        REFUSAL,
+        CONTENT_FILTER,
+        SAFETY,
+        PROHIBITED_CONTENT,
+        BLOCKLIST,
+        SPII,
+    )
 
     fun isRefusal(stopReason: String?): Boolean =
-        stopReason == REFUSAL || stopReason == CONTENT_FILTER
+        stopReason != null && stopReason.lowercase() in REFUSAL_REASONS
 
     /**
      * [T-android-max-tokens-notice] The reply hit the output-token limit. Port
@@ -1673,6 +1686,11 @@ object StopReasons {
      * (`categoryMessage`, already formatted) it names the policy and says
      * resending will not help; otherwise the generic text. The provider's own
      * explanation (English, from the API) follows after a blank line.
+     *
+     * Note: Upstream provider refusals (Anthropic `stop_reason=refusal`, OpenAI
+     * `content_filter`, Gemini `SAFETY`/`PROHIBITED_CONTENT`) are enforced by the
+     * remote model provider's server-side classifiers and cannot be overridden by
+     * local application prompts.
      */
     fun refusalErrorText(categoryMessage: String?, genericMessage: String, explanation: String?): String {
         val base = categoryMessage?.takeIf { it.isNotBlank() } ?: genericMessage

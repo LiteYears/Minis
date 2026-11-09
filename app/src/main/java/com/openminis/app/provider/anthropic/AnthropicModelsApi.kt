@@ -360,6 +360,10 @@ class AnthropicProvider(
      */
     var enhancedCache: Boolean = false
 
+    /** Active context instruction policy propagated from ProviderFactory. */
+    var contextInstructionPolicy: com.openminis.app.agent.ContextInstructionPolicy =
+        com.openminis.app.agent.ContextInstructionPolicy.STANDARD
+
     /**
      * Build a `cache_control` object honoring [enhancedCache]. Default 5-minute
      * TTL is `{"type":"ephemeral"}`; enhanced is `{"type":"ephemeral","ttl":"1h"}`.
@@ -659,15 +663,20 @@ class AnthropicProvider(
      * - **API key (isOAuth=false)**: single user-prompt block with `cache_control: ephemeral`.
      *   Returns null when the prompt is null/empty (iOS parity — no empty `system` field).
      */
-    internal fun resolveSystemPrompt(userPrompt: String?): JSONArray? {
-        val claudeCodePrefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
+    internal fun resolveSystemPrompt(
+        userPrompt: String?,
+        policy: com.openminis.app.agent.ContextInstructionPolicy = contextInstructionPolicy,
+    ): JSONArray? {
+        val effectivePrompt = com.openminis.app.agent.ContextInstructionPolicy
+            .ensureSystemPromptForProvider(userPrompt, policy)
         if (isOAuth) {
+            val claudeCodePrefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
             // Strip the prefix if the caller already prepended it; the tail is the real user prompt.
             val tail = when {
-                userPrompt == null -> ""
-                userPrompt.startsWith(claudeCodePrefix) ->
-                    userPrompt.removePrefix(claudeCodePrefix).trimStart('\n')
-                else -> userPrompt
+                effectivePrompt == null -> ""
+                effectivePrompt.startsWith(claudeCodePrefix) ->
+                    effectivePrompt.removePrefix(claudeCodePrefix).trimStart('\n')
+                else -> effectivePrompt
             }
             val arr = JSONArray()
             // Block 1: Claude Code base prompt — NO cache_control (iOS parity).
@@ -686,10 +695,10 @@ class AnthropicProvider(
             return arr
         }
         // API key path: single cached block, or null when prompt is missing/empty.
-        if (userPrompt.isNullOrEmpty()) return null
+        if (effectivePrompt.isNullOrEmpty()) return null
         return JSONArray().put(JSONObject().apply {
             put("type", "text")
-            put("text", userPrompt)
+            put("text", effectivePrompt)
             put("cache_control", ephemeralCacheControl())
         })
     }

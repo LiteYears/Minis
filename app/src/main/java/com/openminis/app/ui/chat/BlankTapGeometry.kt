@@ -15100,7 +15100,8 @@ class ChatViewModel(
             clearDelegateOverride(toolId)
             return reject("child_start_failed", "The helper session could not resolve a provider.")
         }
-        val outcome = withContext(Dispatchers.Main) { childVm.submitPrompt(hr.childPrompt(args)) }
+        val instructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.get(context)
+        val outcome = withContext(Dispatchers.Main) { childVm.submitPrompt(hr.childPrompt(args, instructionPolicy)) }
         if (outcome !is SubmitOutcome.Sent) {
             registry.setThen(job.id, com.openminis.app.agent.jobs.AgentJobThen.None)
             registry.finish(job.id, com.openminis.app.agent.jobs.AgentJobState.FAILED, null)
@@ -15457,6 +15458,7 @@ class ChatViewModel(
                                 tabId = allocatedTabId,
                                 totalWorkers = args.workers.size,
                                 workerIndex = idx,
+                                policy = com.openminis.app.agent.ContextInstructionPolicy.get(context),
                             )
 
                             val job = registry.register(
@@ -16261,6 +16263,7 @@ class ChatViewModel(
                     result,
                     com.openminis.app.tools.VisionGroupResolver.groupName(providerRepository),
                     question = customPrompt,
+                    policy = com.openminis.app.agent.ContextInstructionPolicy.get(context),
                 )
             is com.openminis.app.tools.VisionGroupResolver.VisionResult.Failure ->
                 com.openminis.app.tools.VisionGroupResolver.failureText(result.reason)
@@ -16590,9 +16593,19 @@ class ChatViewModel(
             val withBashReminder = bashReminder?.let { rem ->
                 if (result.exitCode != 0 || bashism.hasSilent) "$redactedOut\n\n$rem" else redactedOut
             } ?: redactedOut
+            // Detect missing privileges and unsupported Android/Alpine PRoot
+            // kernel/network functionality (raw ICMP, raw SYN scans, AF_PACKET,
+            // nested ptrace, CAP_NET_ADMIN/CAP_SYS_ADMIN) and append actionable
+            // local or remote-lab alternatives.
+            val withPRootDiag = com.openminis.app.sandbox.PRootEnvironmentAdvisor.appendDiagnosticIfApplicable(
+                command = originalCommand,
+                exitCode = result.exitCode,
+                output = withBashReminder,
+                timedOut = timedOut,
+            )
             // [T-android-shell-process-budget] Last, so nothing is appended
             // after the note that the command waited in the process queue.
-            val withReminder = result.queueNote?.let { "$withBashReminder\n\n$it" } ?: withBashReminder
+            val withReminder = result.queueNote?.let { "$withPRootDiag\n\n$it" } ?: withPRootDiag
 
             ToolExecutionResult(
                 output = withReminder,
@@ -17291,10 +17304,15 @@ class ChatViewModel(
         // must be dropped when browser_use is switched off (same prompt/schema
         // drift rule as the parent's browser bullet below).
         val browserToolEnabled = com.openminis.app.tools.AgentToolSwitch.BROWSER.isEnabled(context)
+        val instructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.get(context)
         val identitySection = helperConfig?.let {
-            com.openminis.app.agent.jobs.HelperRunner.identitySection(it, browserEnabled = browserToolEnabled)
+            com.openminis.app.agent.jobs.HelperRunner.identitySection(
+                it,
+                browserEnabled = browserToolEnabled,
+                policy = instructionPolicy,
+            )
         }
-            ?: com.openminis.app.agent.SystemPromptBuilder.identitySection(context)
+            ?: com.openminis.app.agent.SystemPromptBuilder.identitySection(context, instructionPolicy)
         // [T-memory-toggle-gates-injection-and-tools-android] Mirror the iOS
         // gate: when memory is disabled for this session, replace the
         // "memory_write / memory_get" tool bullets and the "Memory system:"
@@ -17481,12 +17499,12 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // restore, returning to the app) queue a background rescan instead;
         // see SkillRepository.requestReload. The old per-send
         // reloadFromDisk() cost ~2 s per send for a user with 490 skills.
-        val skillFragment = skillRepository?.skillPromptFragment(activeSessionId)
+        val skillFragment = skillRepository?.skillPromptFragment(activeSessionId, instructionPolicy)
         // [T-mcp-integration-android] Re-read servers.json (the CLI / file
         // browser may have changed it out-of-band) then build the Top-20
         // enabled-MCP disclosure, injected right after the skills fragment.
         mcpRepository?.reloadFromDisk()
-        val mcpFragment = mcpRepository?.mcpPromptFragment(activeSessionId)
+        val mcpFragment = mcpRepository?.mcpPromptFragment(activeSessionId, instructionPolicy)
         // [T-memory-toggle-gates-injection-and-tools-android] Skip loading
         // GLOBAL.md + recent daily logs entirely when the user has turned
         // memory off for this session. Cheaper (no disk read) and — more
@@ -17495,8 +17513,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // intentionally NOT gated by this toggle: skills are part of the
         // tool surface and SOUL.md is part of identity, both orthogonal
         // to the memory feature.
-        val globalMemoryFragment = if (memoryOn) memoryRepository?.loadGlobalMemoryFragment() else null
-        val dailyMemoryFragment = if (memoryOn) memoryRepository?.loadRecentDailyMemoryFragment() else null
+        val globalMemoryFragment = if (memoryOn) memoryRepository?.loadGlobalMemoryFragment(instructionPolicy) else null
+        val dailyMemoryFragment = if (memoryOn) memoryRepository?.loadRecentDailyMemoryFragment(instructionPolicy) else null
         // [XSessionDiag] Hypothesis 3: ties the memory-injection sizes to a
         // SESSION id. MemoryRepository itself has no session context, so its own
         // `memory/daily-inject` line (which names the source files) cannot say who
@@ -17510,8 +17528,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 "dailyChars=${dailyMemoryFragment?.length ?: 0}",
         )
 
+        val coreCapabilitiesSection =
+            com.openminis.app.agent.SystemPromptBuilder.coreCapabilitiesAndMethodologySection(instructionPolicy)
+        val policySection = instructionPolicy.systemPromptSection()
+
         return buildString {
             append(base)
+            append("\n\n")
+            append(coreCapabilitiesSection)
+            if (policySection.isNotEmpty()) {
+                append("\n\n")
+                append(policySection)
+            }
             if (skillFragment != null) {
                 append("\n\n")
                 append(skillFragment)

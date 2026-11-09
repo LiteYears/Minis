@@ -114,6 +114,10 @@ class OpenAIProvider private constructor(
      */
     var thinkingRuleInstanceId: String? = null
 
+    /** Active context instruction policy propagated from ProviderFactory. */
+    var contextInstructionPolicy: com.openminis.app.agent.ContextInstructionPolicy =
+        com.openminis.app.agent.ContextInstructionPolicy.STANDARD
+
     /**
      * [T-sse-idle-timeout] This instance's response idle timeout, in seconds
      * ([com.openminis.app.provider.ResponseIdleTimeoutSetting]), set by
@@ -2431,10 +2435,12 @@ class OpenAIProvider private constructor(
             WireToolIdMap()
         }
         val messagesArray = JSONArray()
-        if (systemPrompt != null) {
+        val effectiveSystemPrompt = com.openminis.app.agent.ContextInstructionPolicy
+            .ensureSystemPromptForProvider(systemPrompt, contextInstructionPolicy)
+        if (effectiveSystemPrompt != null) {
             messagesArray.put(JSONObject().apply {
                 put("role", "system")
-                put("content", systemPrompt)
+                put("content", effectiveSystemPrompt)
             })
         }
 
@@ -3683,8 +3689,10 @@ class OpenAIProvider private constructor(
             .ultrafastUnsupportedNote(com.openminis.app.data.FastModePrefs.tier(), model)
             ?.let { com.openminis.app.logging.AppLogger.info("OpenAIProvider", "[SpeedTier] $it") }
 
-        if (systemPrompt != null) {
-            body.put("instructions", systemPrompt)
+        val effectiveSystemPrompt = com.openminis.app.agent.ContextInstructionPolicy
+            .ensureSystemPromptForProvider(systemPrompt, contextInstructionPolicy)
+        if (effectiveSystemPrompt != null) {
+            body.put("instructions", effectiveSystemPrompt)
         }
 
         // Tools — flat shape required by Responses API ({type, name, description,

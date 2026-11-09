@@ -241,6 +241,7 @@ object SubAgentSwarm {
         tabId: Int?,
         totalWorkers: Int,
         workerIndex: Int,
+        policy: com.openminis.app.agent.ContextInstructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.STANDARD,
     ): String {
         val sb = StringBuilder()
         sb.append("[Swarm Worker ${workerIndex + 1} of $totalWorkers — ID: ${spec.id} (\"${spec.title}\")]\n")
@@ -258,6 +259,7 @@ object SubAgentSwarm {
             sb.append("\n\n--- Shared Swarm Context ---\n")
             sb.append(sharedContext.trim())
         }
+        sb.append(policy.subAgentPromptGuidance())
         return sb.toString()
     }
 

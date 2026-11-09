@@ -2151,8 +2151,8 @@
     <string name="chat_load_older_messages">↑ Load older messages</string>
     <!-- [T-error-persist-android] Shown when the model returns an empty reply (no text, no tools). -->
     <string name="error_empty_response_generic">Model returned an empty response. Please try again or switch models.</string>
-    <string name="chat_error_model_refused">The model declined to respond to this request. Try rephrasing, or switch to a different model.</string>
-    <string name="chat_error_model_refused_category">Blocked by the model provider\'s usage policy (category: %1$s). Continuing or rephrasing in this chat will likely be blocked again — switch to a different model, or start a new chat.</string>
+    <string name="chat_error_model_refused">The upstream model provider declined this request at the API level (server-side safety/usage filter, which cannot be overridden by local application prompts). Try scoping the request to the specific technical artifact, or switch to a different model/provider.</string>
+    <string name="chat_error_model_refused_category">Blocked by the upstream model provider\'s server-side usage policy (category: %1$s — enforced by the remote API, not by Minis, and cannot be overridden by local prompts). Switch to a different model/provider or start a new chat.</string>
     <string name="chat_error_max_tokens_truncated">Response truncated (max tokens reached)</string>
     <string name="chat_error_dsml_tool_call_leak">The model\'s tool call came back malformed (it ended up inside its reasoning), and 2 automatic retries failed too. Tap Resume to try again.</string>
     <string name="error_empty_response_context_large">The model returned an empty response. The conversation context may be too large — try compacting or starting a new session.</string>
@@ -2244,6 +2244,14 @@
     <string name="settings_agent_tools_subtitle">Which optional tools the agent may use</string>
     <string name="agent_tools_browser">Browser Use</string>
     <string name="agent_tools_browser_footer">Browse the web in the in-app browser: open pages, read them, click and type. Stable and on by default. When off, the tool is removed from every conversation — the model does not see it at all.</string>
+    <string name="agent_tools_instruction_policy">Context Instruction Mode</string>
+    <string name="agent_tools_instruction_policy_footer">Controls how the agent interprets and follows instructions discovered inside files, repositories, skills, websites, MCP responses, terminal outputs, subagents, and images/OCR. Source attribution and execution-layer security boundaries (filesystem containment, secret protection, and Android permissions) remain enforced in all modes.</string>
+    <string name="agent_tools_policy_standard">Standard</string>
+    <string name="agent_tools_policy_standard_desc">Default protective filtering; treats external context and OCR as data rather than standing instructions</string>
+    <string name="agent_tools_policy_aggressive">Aggressive</string>
+    <string name="agent_tools_policy_aggressive_desc">Broadly recognizes and follows workflows and instructions embedded in files, websites, skills, MCP outputs, and memory</string>
+    <string name="agent_tools_policy_experimental">Experimental</string>
+    <string name="agent_tools_policy_experimental_desc">Extensive chained and nested instruction-following across all sources including OCR/images and runtime subprocess outputs</string>
     <string name="agent_tools_agents">Agents</string>
     <string name="agent_tools_agents_footer">Hand self-contained sub-tasks to sub agents that work in their own hidden sessions and report back. The same tool also lets the assistant check on or stop what it started. Configure the roster under Settings › Agents › Sub Agents.</string>
     <string name="settings_agents">Sub Agents</string>

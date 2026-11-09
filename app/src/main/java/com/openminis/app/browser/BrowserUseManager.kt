@@ -1871,11 +1871,14 @@ class BrowserUseManager(
             }
             json.has("text") && json.has("length") -> {
                 val title = json.optString("title", "")
-                if (title.isNotEmpty()) appendLine("Title: $title")
                 val text = json.optString("text", "")
                 val len = json.optInt("length", text.length)
+                val policy = runCatching {
+                    com.openminis.app.agent.ContextInstructionPolicy.get(webView.context)
+                }.getOrDefault(com.openminis.app.agent.ContextInstructionPolicy.STANDARD)
+                if (title.isNotEmpty()) appendLine("Title: $title")
                 appendLine("Text ($len chars):")
-                append(text.take(10000))
+                append(text.take(policy.maxBrowserFormattedTextChars()))
             }
             json.has("count") && json.has("elements") -> {
                 val count = json.optInt("count")

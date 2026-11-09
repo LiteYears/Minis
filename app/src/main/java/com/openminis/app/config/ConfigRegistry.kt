@@ -200,7 +200,9 @@ class ConfigRegistry internal constructor() {
         @Volatile private var INSTANCE: ConfigRegistry? = null
 
         fun get(): ConfigRegistry =
-            INSTANCE ?: error("ConfigRegistry not initialized; call init() from Application.onCreate")
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: ConfigRegistry().also { INSTANCE = it }
+            }
 
         fun init(
             context: Context,

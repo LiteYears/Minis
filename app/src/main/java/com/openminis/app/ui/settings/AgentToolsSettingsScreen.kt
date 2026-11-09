@@ -8,6 +8,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import com.openminis.app.R
+import com.openminis.app.agent.ContextInstructionPolicy
 import com.openminis.app.tools.AgentToolSwitch
 
 /**
@@ -38,7 +39,11 @@ fun AgentToolsSettingsScreen(onBack: () -> Unit) {
     var userAskNotify by remember {
         mutableStateOf(com.openminis.app.agent.userask.UserAskSettings.notifyInBackground(context))
     }
+    var instructionPolicy by remember {
+        mutableStateOf(ContextInstructionPolicy.get(context))
+    }
     var showWaitPicker by remember { mutableStateOf(false) }
+    var showPolicyPicker by remember { mutableStateOf(false) }
 
     SettingsScaffold(title = stringResource(R.string.settings_agent_tools), onBack = onBack) {
         SettingsSection(footer = stringResource(R.string.agent_tools_browser_footer)) {
@@ -83,6 +88,14 @@ fun AgentToolsSettingsScreen(onBack: () -> Unit) {
                 )
             }
         }
+        SettingsSection(footer = stringResource(R.string.agent_tools_instruction_policy_footer)) {
+            SettingsValueRow(
+                title = stringResource(R.string.agent_tools_instruction_policy),
+                value = instructionPolicyLabel(instructionPolicy),
+                onClick = { showPolicyPicker = true },
+                showDivider = false,
+            )
+        }
         if (showWaitPicker) {
             androidx.compose.material3.AlertDialog(
                 onDismissRequest = { showWaitPicker = false },
@@ -111,6 +124,34 @@ fun AgentToolsSettingsScreen(onBack: () -> Unit) {
                 },
             )
         }
+        if (showPolicyPicker) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { showPolicyPicker = false },
+                title = { androidx.compose.material3.Text(stringResource(R.string.agent_tools_instruction_policy)) },
+                text = {
+                    androidx.compose.foundation.layout.Column {
+                        for (policy in ContextInstructionPolicy.entries) {
+                            SettingsChoiceRow(
+                                title = "${instructionPolicyLabel(policy)} — ${instructionPolicyDescription(policy)}",
+                                selected = policy == instructionPolicy,
+                                onSelect = {
+                                    instructionPolicy = policy
+                                    ContextInstructionPolicy.set(context, policy)
+                                    showPolicyPicker = false
+                                },
+                                showDivider = false,
+                            )
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { showPolicyPicker = false }) {
+                        androidx.compose.material3.Text(stringResource(R.string.user_ask_cancel))
+                    }
+                },
+            )
+        }
         // [T-android-subagent-settings-parity] The agents switch is NOT here.
         //
         // It lives on Settings > Agents > Sub Agents, which is also where the
@@ -126,3 +167,17 @@ fun AgentToolsSettingsScreen(onBack: () -> Unit) {
 private fun userAskWaitLabel(minutes: Int): String =
     if (minutes == 0) stringResource(R.string.user_ask_setting_indefinitely)
     else stringResource(R.string.user_ask_setting_minutes, minutes)
+
+@Composable
+private fun instructionPolicyLabel(policy: ContextInstructionPolicy): String = when (policy) {
+    ContextInstructionPolicy.STANDARD -> stringResource(R.string.agent_tools_policy_standard)
+    ContextInstructionPolicy.AGGRESSIVE -> stringResource(R.string.agent_tools_policy_aggressive)
+    ContextInstructionPolicy.EXPERIMENTAL -> stringResource(R.string.agent_tools_policy_experimental)
+}
+
+@Composable
+private fun instructionPolicyDescription(policy: ContextInstructionPolicy): String = when (policy) {
+    ContextInstructionPolicy.STANDARD -> stringResource(R.string.agent_tools_policy_standard_desc)
+    ContextInstructionPolicy.AGGRESSIVE -> stringResource(R.string.agent_tools_policy_aggressive_desc)
+    ContextInstructionPolicy.EXPERIMENTAL -> stringResource(R.string.agent_tools_policy_experimental_desc)
+}

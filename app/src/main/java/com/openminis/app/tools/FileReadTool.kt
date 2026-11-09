@@ -36,7 +36,20 @@ object FileReadTool {
         propertyOrdering = listOf("tool_title", "path", "offset", "lines", "direction", "max_length"),
     )
 
-    fun execute(argsJson: String, sessionId: String, context: Context): ToolExecutionResult {
+    fun defaultMaxLengthFor(
+        policy: com.openminis.app.agent.ContextInstructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.STANDARD,
+    ): Int = when (policy) {
+        com.openminis.app.agent.ContextInstructionPolicy.STANDARD -> 15_000
+        com.openminis.app.agent.ContextInstructionPolicy.AGGRESSIVE,
+        com.openminis.app.agent.ContextInstructionPolicy.EXPERIMENTAL -> 40_000
+    }
+
+    fun execute(
+        argsJson: String,
+        sessionId: String,
+        context: Context,
+        policy: com.openminis.app.agent.ContextInstructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.get(context),
+    ): ToolExecutionResult {
         return try {
             val args = JSONObject(argsJson)
             val path = args.optString("path", "")
@@ -54,7 +67,8 @@ object FileReadTool {
             // full file size so it can paginate with offset/lines if needed.
             // iOS mirrors this cap in AIChatViewModel.executeFileRead.
             val MAX_LENGTH_HARD_CAP = 80_000
-            val maxLength = args.optInt("max_length", 15000).coerceAtMost(MAX_LENGTH_HARD_CAP)
+            val defaultMaxLen = defaultMaxLengthFor(policy)
+            val maxLength = args.optInt("max_length", defaultMaxLen).coerceAtMost(MAX_LENGTH_HARD_CAP)
             val direction = args.optString("direction", "head")
 
             if (path.isBlank()) {

@@ -1217,6 +1217,12 @@ object ProviderFactory {
         // merge helpers early-return and the built body stays byte-identical to
         // before this change.
         (provider as? OpenAIProvider)?.modelOverrides = overrides?.takeIf { !it.isEmpty }
+        if (context != null) {
+            val instructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.get(context)
+            (provider as? OpenAIProvider)?.contextInstructionPolicy = instructionPolicy
+            (provider as? GeminiProvider)?.contextInstructionPolicy = instructionPolicy
+            (provider as? AnthropicProvider)?.contextInstructionPolicy = instructionPolicy
+        }
         return provider
     }
 }

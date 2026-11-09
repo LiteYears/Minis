@@ -286,10 +286,16 @@ object HelperRunner {
         )
     }
 
-    /** The prompt the child receives: task + optional verbatim context. */
-    fun childPrompt(args: DelegateTaskArgs): String =
-        if (args.context.isEmpty()) args.task
+    /** The prompt the child receives: task + optional verbatim context + policy guidance. */
+    fun childPrompt(
+        args: DelegateTaskArgs,
+        policy: com.openminis.app.agent.ContextInstructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.STANDARD,
+    ): String {
+        val base = if (args.context.isEmpty()) args.task
         else args.task + "\n\n--- Context from the delegating agent ---\n" + args.context
+        val guidance = policy.subAgentPromptGuidance()
+        return if (guidance.isEmpty()) base else base + guidance
+    }
 
     /** The child session's title — the one place that spells the prefix. */
     /**
@@ -360,8 +366,13 @@ object HelperRunner {
     /** System-prompt preamble for a helper vm — replaces the SOUL identity
      *  section. Describe the environment, do not assign identity (the
      *  `minis-model-use` identity-pollution lesson, OpenMinis#103). */
-    fun identitySection(cfg: HelperConfig, browserEnabled: Boolean = true): String =
-        "You are running as a helper (sub-agent) inside an app called Minis, on an Android device with a fully functional Linux shell (Alpine Linux, aarch64). This is the calling environment, not your identity — keep your own model identity unchanged.\n" +
+    fun identitySection(
+        cfg: HelperConfig,
+        browserEnabled: Boolean = true,
+        policy: com.openminis.app.agent.ContextInstructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.STANDARD,
+    ): String {
+        val policyBlock = policy.subAgentPromptGuidance().let { if (it.isEmpty()) "" else "${it.trimStart()}\n\n" }
+        return "You are running as a helper (sub-agent) inside an app called Minis, on an Android device with a fully functional Linux shell (Alpine Linux, aarch64). This is the calling environment, not your identity — keep your own model identity unchanged.\n" +
             "A parent agent delegated ONE focused task to you: \"${cfg.title}\". You cannot see the parent conversation and it cannot see yours; everything you need is in the task text. Work the task to completion using your tools, then finish with a single clear final answer — that final message is returned verbatim to the parent agent as the result, and it is the ONLY thing the parent receives. So the final message must contain the complete deliverable itself: the full report, document, list, code or answer the task asked for, in full — never a summary of what you did, a pointer to a file you wrote, or \"see above\". If you produced a file, paste its full content into the final message as well. Do not ask the parent or the user questions; make reasonable assumptions and state them. Do not restate the task or add meta-commentary. Do not create scheduled tasks or delegate further.\n" +
             (if (!cfg.workingDirectory.isNullOrEmpty()) {
                 "Sandbox Isolation: Your dedicated working directory is `${cfg.workingDirectory}`. All `shell_execute` commands start in `${cfg.workingDirectory}` automatically (`\$MINIS_WORKER_DIR` is set to this path), and relative paths in `file_read`/`file_write`/`file_edit` resolve inside `${cfg.workingDirectory}`. Write all temporary files, scripts, and outputs inside `${cfg.workingDirectory}` so you never collide with parallel sibling workers.\n"
@@ -371,7 +382,9 @@ object HelperRunner {
             } else "") +
             browserSharingSection(browserEnabled) +
             "You have at most ${cfg.maxTurns} tool rounds; on the last one tools are withdrawn and you are asked to write the deliverable from what you have, so start writing before you run out. If the task genuinely exceeds what you can do at your capability level, end your final message with a line `[ESCALATE] <one-line reason>` so the parent can rerun it on a stronger model.\n\n" +
+            policyBlock +
             subAgentInstructionsSection(cfg.agentInstructions)
+    }
 
     /**
      * [T-android-subagent-prompt-parity] The shared-browser paragraph iOS gives

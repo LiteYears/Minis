@@ -738,6 +738,39 @@ internal object ConfigBuiltins {
                 defaultValue = com.openminis.app.tools.AgentToolSwitch.AGENTS.defaultValue,
             )
         )
+        r.register(
+            ClosureField(
+                path = "agentTools.instructionPolicy",
+                displayName = "Context Instruction Policy",
+                description = "Controls how the agent recognizes and follows embedded instructions discovered in contextual sources (websites, files, Markdown/TXT/JSON/XML/code, MCP responses, skills, memory, terminal output, subagents, and images/OCR): standard (default protective behavior), aggressive (broadly follow embedded instructions), or experimental (extensive chained and nested instruction-following across all content sources).",
+                valueSchema = ConfigSchema.StrEnum(
+                    com.openminis.app.agent.ContextInstructionPolicy.entries.map { it.wire },
+                ),
+                risk = ConfigRisk.SENSITIVE,
+                revertable = true,
+                readable = ConfigReadable(
+                    ConfigValueFormatter.EnumLabels(
+                        mapOf(
+                            "standard" to "Standard",
+                            "aggressive" to "Aggressive",
+                            "experimental" to "Experimental",
+                        )
+                    )
+                ),
+                reader = {
+                    ConfigValue.Str(com.openminis.app.agent.ContextInstructionPolicy.get(context).wire)
+                },
+                writer = { v ->
+                    val raw = (v as? ConfigValue.Str)?.value
+                        ?: throw ConfigError.TypeMismatch("string")
+                    val parsed = com.openminis.app.agent.ContextInstructionPolicy.fromWireOrNull(raw)
+                        ?: throw ConfigError.InvalidValue(
+                            "Invalid instructionPolicy '$raw'. Expected one of: standard, aggressive, experimental."
+                        )
+                    com.openminis.app.agent.ContextInstructionPolicy.set(context, parsed)
+                },
+            )
+        )
         // [T-port-fold-tools] Settings → Appearance → Tool Calls
         // (`chat.foldTools`, iOS userDefaults chat.foldConsecutiveTools).
         // [PAR-261022-05] On by default on every platform.
@@ -1583,7 +1616,10 @@ internal object ConfigBuiltins {
                     val raw = (v as? ConfigValue.Str)?.value
                         ?: throw ConfigError.TypeMismatch("string")
                     if (com.openminis.app.agent.SystemPromptBuilder
-                            .containsInjectionPattern(raw)
+                            .containsInjectionPattern(
+                                raw,
+                                com.openminis.app.agent.ContextInstructionPolicy.get(context),
+                            )
                     ) {
                         throw ConfigError.InvalidValue(
                             "Body contains a prompt-injection pattern (\"ignore/disregard/forget … previous/prior instructions\"). SOUL.md is for personality, not instructions to the model."

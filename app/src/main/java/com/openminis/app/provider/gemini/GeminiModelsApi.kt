@@ -149,6 +149,10 @@ class GeminiProvider(
     /** [T-net-android-phase3] Policy tag (prov:<instanceId>), set by ProviderFactory. */
     override var netTag: String? = null
 
+    /** Active context instruction policy propagated from ProviderFactory. */
+    var contextInstructionPolicy: com.openminis.app.agent.ContextInstructionPolicy =
+        com.openminis.app.agent.ContextInstructionPolicy.STANDARD
+
     /**
      * [T-net-android-phase3] The client for this request: [baseClient] itself
      * unless Settings > Network routes this provider through the local entry
@@ -284,6 +288,8 @@ class GeminiProvider(
         try {
             var started = false
             var lastFinishReason: String? = null
+            var lastRefusalCategory: String? = null
+            var lastRefusalExplanation: String? = null
             var line: String?
             while (reader.readLine().also { line = it } != null) {
                 val l = line ?: continue
@@ -324,8 +330,18 @@ class GeminiProvider(
                 extractFinishReason(json)?.let { reason ->
                     lastFinishReason = reason
                 }
+                extractRefusalDetails(json)?.let { (cat, expl) ->
+                    if (cat != null) lastRefusalCategory = cat
+                    if (expl != null) lastRefusalExplanation = expl
+                }
             }
-            send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn"))
+            send(
+                LLMStreamChunk.Finished(
+                    stopReason = lastFinishReason ?: "end_turn",
+                    refusalCategory = lastRefusalCategory,
+                    refusalExplanation = lastRefusalExplanation,
+                )
+            )
         } catch (e: Exception) {
             cancel("Stream error", mapError(e))
         } finally {
@@ -513,9 +529,11 @@ class GeminiProvider(
         // responsible) rather than the model id. Dropping it costs nothing: the preamble
         // is guidance for a text responder, and a TTS model speaks `contents` verbatim.
         val rejectsSystemInstruction = "audio" in model.outputModalities.orEmpty()
-        if (systemPrompt != null && !rejectsSystemInstruction) {
+        val effectiveSystemPrompt = com.openminis.app.agent.ContextInstructionPolicy
+            .ensureSystemPromptForProvider(systemPrompt, contextInstructionPolicy)
+        if (effectiveSystemPrompt != null && !rejectsSystemInstruction) {
             body.put("systemInstruction", JSONObject().put(
-                "parts", JSONArray().put(JSONObject().put("text", systemPrompt))
+                "parts", JSONArray().put(JSONObject().put("text", effectiveSystemPrompt))
             ))
         }
 
@@ -691,15 +709,37 @@ class GeminiProvider(
         return calls
     }
 
-    private fun extractFinishReason(json: JSONObject): String? {
-        val candidates = json.optJSONArray("candidates") ?: return null
-        val first = candidates.optJSONObject(0) ?: return null
-        val reason = first.safeOptString("finishReason", "").ifEmpty { return null }
-        return when (reason) {
-            "STOP" -> "end_turn"
-            "MAX_TOKENS" -> "max_tokens"
-            else -> reason.lowercase()
+    internal fun extractFinishReason(json: JSONObject): String? {
+        val candidates = json.optJSONArray("candidates")
+        val first = candidates?.optJSONObject(0)
+        val reason = first?.safeOptString("finishReason", "").orEmpty()
+        if (reason.isNotEmpty()) {
+            return when (reason) {
+                "STOP" -> "end_turn"
+                "MAX_TOKENS" -> "max_tokens"
+                else -> reason.lowercase()
+            }
         }
+        val blockReason = json.optJSONObject("promptFeedback")?.safeOptString("blockReason", "").orEmpty()
+        if (blockReason.isNotEmpty()) {
+            return blockReason.lowercase()
+        }
+        return null
+    }
+
+    internal fun extractRefusalDetails(json: JSONObject): Pair<String?, String?>? {
+        val feedback = json.optJSONObject("promptFeedback")
+        val blockReason = feedback?.safeOptString("blockReason", "")?.takeIf { it.isNotEmpty() }
+        val blockMessage = feedback?.safeOptString("blockReasonMessage", "")?.takeIf { it.isNotEmpty() }
+        val first = json.optJSONArray("candidates")?.optJSONObject(0)
+        val finishMessage = first?.safeOptString("finishMessage", "")?.takeIf { it.isNotEmpty() }
+        val finishReason = first?.safeOptString("finishReason", "")?.takeIf { it.isNotEmpty() }
+        if (blockReason != null || (finishReason != null && com.openminis.app.provider.StopReasons.isRefusal(finishReason))) {
+            val category = blockReason?.lowercase() ?: finishReason?.lowercase()
+            val explanation = blockMessage ?: finishMessage
+            return category to explanation
+        }
+        return null
     }
 
     /**
