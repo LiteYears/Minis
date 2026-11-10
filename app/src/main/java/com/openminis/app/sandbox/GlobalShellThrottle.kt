@@ -329,9 +329,37 @@ sealed class RootfsInstallState {
 class RootfsManager private constructor(private val context: Context) {
 
     val rootfsDir: File = File(context.filesDir, "alpine-rootfs")
-    val prootBinary: File = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
+    private val fallbackProotDir: File = File(context.filesDir, "proot-bin")
+
+    @Volatile
+    private var prootExecutionVerified: Boolean? = null
+
+    /**
+     * Directory containing the active `libproot.so` and `libproot-loader*.so` binaries.
+     * Prefers `applicationInfo.nativeLibraryDir`, falling back to `filesDir/proot-bin`
+     * if PackageManager did not extract `arm64-v8a` libraries to `nativeLibraryDir`.
+     */
+    val effectiveNativeLibDir: File
+        get() {
+            val sysNativeDir = context.applicationInfo.nativeLibraryDir?.let(::File)
+            if (sysNativeDir != null) {
+                val primary = File(sysNativeDir, "libproot.so")
+                if (primary.exists() && primary.canExecute()) {
+                    return sysNativeDir
+                }
+            }
+            val fallback = File(fallbackProotDir, "libproot.so")
+            if (fallback.exists() && fallback.canExecute()) {
+                return fallbackProotDir
+            }
+            return sysNativeDir ?: fallbackProotDir
+        }
+
+    val prootBinary: File
+        get() = File(effectiveNativeLibDir, "libproot.so")
+
     val isProotAvailable: Boolean
-        get() = prootBinary.exists() && prootBinary.canExecute()
+        get() = prootBinary.exists() && prootBinary.canExecute() && (prootExecutionVerified != false)
 
     private val archFile: File get() = File(rootfsDir, ".arch")
 
@@ -379,11 +407,13 @@ class RootfsManager private constructor(private val context: Context) {
             // 1. Check for bundled assets matching current architecture or generic names
             val assetCandidates = listOf(
                 "alpine-minirootfs-$currentArch.tar.gz",
-                ROOTFS_ASSET,
                 "alpine-minirootfs-$currentArch.tar",
+                ROOTFS_ASSET,
                 ROOTFS_ASSET_TAR,
                 "alpine-minirootfs-aarch64.tar.gz",
-                "alpine-minirootfs-x86_64.tar.gz"
+                "alpine-minirootfs-aarch64.tar",
+                "alpine-minirootfs-x86_64.tar.gz",
+                "alpine-minirootfs-x86_64.tar",
             )
 
             var foundAsset: String? = null
@@ -408,12 +438,18 @@ class RootfsManager private constructor(private val context: Context) {
                     val progressStream = ProgressInputStream(rawAsset, assetTotal) { fraction ->
                         _installState.value = RootfsInstallState.Extracting(fraction)
                     }
-                    if (foundAsset.endsWith(".gz")) {
-                        GZIPInputStream(progressStream).use { gzipStream ->
+                    val buffered = java.io.BufferedInputStream(progressStream, 16384)
+                    buffered.mark(4)
+                    val b0 = buffered.read()
+                    val b1 = buffered.read()
+                    buffered.reset()
+                    val isGzip = (b0 == 0x1f && b1 == 0x8b)
+                    if (isGzip) {
+                        GZIPInputStream(buffered).use { gzipStream ->
                             extractTar(gzipStream, rootfsDir)
                         }
                     } else {
-                        extractTar(progressStream, rootfsDir)
+                        extractTar(buffered, rootfsDir)
                     }
                 }
             } else {
@@ -586,22 +622,73 @@ class RootfsManager private constructor(private val context: Context) {
     }
 
     /** Directory containing extracted native libraries (read-only, executable). */
-    val nativeLibDir: File = File(context.applicationInfo.nativeLibraryDir)
+    val nativeLibDir: File = context.applicationInfo.nativeLibraryDir?.let(::File) ?: fallbackProotDir
 
     /**
-     * Verify PRoot binary is available in the native library directory.
+     * Verify PRoot binary is available in the native library directory, or
+     * attempt fallback extraction from the APK if `nativeLibraryDir/libproot.so`
+     * was omitted by PackageManager on a multi-ABI device.
      */
     suspend fun installProotIfNeeded() = withContext(Dispatchers.IO) {
+        val sysNativeDir = context.applicationInfo.nativeLibraryDir?.let(::File)
+        val primary = sysNativeDir?.let { File(it, "libproot.so") }
+        if (primary == null || !primary.exists()) {
+            tryExtractProotFromApk()
+        }
+
+        val candidate = prootBinary
+        if (candidate.exists() && candidate.canExecute() && prootExecutionVerified == null) {
+            prootExecutionVerified = runCatching {
+                val proc = ProcessBuilder(candidate.absolutePath, "--version")
+                    .redirectErrorStream(true)
+                    .start()
+                proc.waitFor(2, TimeUnit.SECONDS)
+                true
+            }.getOrElse { e ->
+                Log.w(TAG, "PRoot binary at $candidate is not executable on this host/kernel (${e.message}); enabling host shell fallback.")
+                false
+            }
+        }
+
         if (!isProotAvailable) {
             Log.w(
                 TAG,
-                "PRoot binary not found at $prootBinary (arch=${detectDeviceArch()}). " +
+                "PRoot binary not available at $prootBinary (arch=${detectDeviceArch()}). " +
                     "Falling back to host /system/bin/sh execution."
             )
             return@withContext
         }
 
         Log.d(TAG, "PRoot binary available at $prootBinary")
+    }
+
+    private fun tryExtractProotFromApk() {
+        val sourceApk = context.applicationInfo.sourceDir?.let(::File) ?: return
+        if (!sourceApk.isFile) return
+        runCatching {
+            java.util.zip.ZipFile(sourceApk).use { zip ->
+                val targets = listOf("libproot.so", "libproot-loader.so", "libproot-loader32.so")
+                var extractedAny = false
+                for (name in targets) {
+                    val entry = zip.getEntry("lib/arm64-v8a/$name") ?: continue
+                    fallbackProotDir.mkdirs()
+                    val dest = File(fallbackProotDir, name)
+                    if (!dest.exists() || dest.length() != entry.size) {
+                        zip.getInputStream(entry).use { input ->
+                            FileOutputStream(dest).use { output -> input.copyTo(output) }
+                        }
+                    }
+                    dest.setReadable(true, false)
+                    dest.setExecutable(true, false)
+                    extractedAny = true
+                }
+                if (extractedAny) {
+                    Log.i(TAG, "Extracted PRoot binaries from APK into $fallbackProotDir")
+                }
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "Fallback APK extraction for PRoot skipped: ${e.message}")
+        }
     }
 
     /**

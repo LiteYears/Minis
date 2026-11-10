@@ -181,7 +181,14 @@ class TerminalNativeView @JvmOverloads constructor(
 
     // ── Touch handling ─────────────────────────────────────────────────────
 
+    private var scrollRemainderPx: Float = 0f
+
     private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onDown(e: MotionEvent): Boolean {
+            scrollRemainderPx = 0f
+            return true
+        }
+
         override fun onSingleTapUp(e: MotionEvent): Boolean {
             // Tapping outside an active selection cancels it; otherwise pass focus.
             if (emulator?.selectionRect?.value != null) {
@@ -203,14 +210,13 @@ class TerminalNativeView @JvmOverloads constructor(
             distanceX: Float,
             distanceY: Float,
         ): Boolean {
-            // distanceY is e1.y - e2.y in Android's GestureDetector — i.e.
-            // positive when the finger moves up. Scroll back through history
-            // means moving content down on screen, which from the user's
-            // POV is dragging the finger down, distanceY < 0.
             val em = emulator ?: return false
+            if (cellHeight <= 0f) return false
             // Reverse sign: dragging down (distanceY < 0) increases scrollOffset.
-            val rowDelta = (-distanceY / cellHeight).toInt()
+            scrollRemainderPx += -distanceY
+            val rowDelta = (scrollRemainderPx / cellHeight).toInt()
             if (rowDelta != 0) {
+                scrollRemainderPx -= rowDelta * cellHeight
                 em.scrollOffset = (em.scrollOffset + rowDelta).coerceAtLeast(0)
             }
             return true

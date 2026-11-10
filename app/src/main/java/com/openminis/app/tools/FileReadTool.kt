@@ -23,7 +23,7 @@ object FileReadTool {
 
     fun definition(): AgentToolDefinition = AgentToolDefinition(
         name = NAME,
-        description = "Read a file from the Linux filesystem. Faster than shell_execute for reading files — no shell overhead. Returns file content with metadata. Rejects binary files.",
+        description = "Read a file from the Linux filesystem, or optionally list a directory (`list_dir: true`) or search across files (`search_pattern`). Faster than shell_execute — no shell overhead. Returns file content with metadata. Rejects binary files.",
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Read Python script contents', 'Check system configuration file'). Use the same language as the user."),
             "path" to AgentToolParam("string", "Absolute Linux path to read (e.g. /var/minis/workspace/data.csv)"),
@@ -31,9 +31,11 @@ object FileReadTool {
             "lines" to AgentToolParam("integer", "Maximum number of lines to return (default: all lines up to max_length)"),
             "max_length" to AgentToolParam("integer", "Maximum character length of returned content (default: 15000)"),
             "direction" to AgentToolParam("string", "Read direction: 'head' (from start, default) or 'tail' (from end of file)"),
+            "search_pattern" to AgentToolParam("string", "Optional regex or substring pattern to search inside `path` (file or directory) with 1-based line numbers, without spawning a shell."),
+            "list_dir" to AgentToolParam("boolean", "If true and `path` is a directory, return a structured listing of its entries with sizes instead of an error (default: false)."),
         ),
         required = listOf("tool_title", "path"),
-        propertyOrdering = listOf("tool_title", "path", "offset", "lines", "direction", "max_length"),
+        propertyOrdering = listOf("tool_title", "path", "offset", "lines", "direction", "max_length", "search_pattern", "list_dir"),
     )
 
     fun defaultMaxLengthFor(
@@ -55,21 +57,12 @@ object FileReadTool {
             val path = args.optString("path", "")
             val toolTitle = args.optString("tool_title", NAME)
             val offset = args.optInt("offset", 1).coerceAtLeast(1)
-            // T-FILEREAD-CAP: hard upper bound on returned content length.
-            // Pre-cap, the agent could ask for `max_length=1_000_000` and we
-            // would happily inline a 400 KB base64 image into a tool_result —
-            // which then renders as a single user-message bubble and locks
-            // up Compose's StaticLayout / LineBreaker for tens of seconds
-            // (see HangDetector report for session
-            // e84882d7-2087-47f8-9300-ff2c897fe0b4: 820 KB partsJson, 43 s
-            // hang in nComputeLineBreaks). Cap at 80 KB regardless of
-            // requested value; the truncation tail below tells the agent the
-            // full file size so it can paginate with offset/lines if needed.
-            // iOS mirrors this cap in AIChatViewModel.executeFileRead.
             val MAX_LENGTH_HARD_CAP = 80_000
             val defaultMaxLen = defaultMaxLengthFor(policy)
             val maxLength = args.optInt("max_length", defaultMaxLen).coerceAtMost(MAX_LENGTH_HARD_CAP)
             val direction = args.optString("direction", "head")
+            val searchPattern = args.optString("search_pattern", "").trim()
+            val listDir = args.optBoolean("list_dir", false)
 
             if (path.isBlank()) {
                 return ToolExecutionResult("Error: 'path' is required", false, toolTitle = toolTitle)
@@ -84,7 +77,30 @@ object FileReadTool {
                 return ToolExecutionResult("Error: File not found: $path$hint", false, toolTitle = toolTitle)
             }
 
+            if (searchPattern.isNotEmpty()) {
+                return try {
+                    FileToolIO.run("Searching $path") {
+                        searchInPath(file, path, searchPattern, maxLength, toolTitle)
+                    }
+                } catch (e: FileToolIO.TimedOut) {
+                    ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle, timedOut = true)
+                } catch (e: FileToolIO.OutOfMemory) {
+                    ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle)
+                }
+            }
+
             if (file.isDirectory) {
+                if (listDir) {
+                    return try {
+                        FileToolIO.run("Listing $path") {
+                            listDirectoryStructured(file, path, maxLength, toolTitle)
+                        }
+                    } catch (e: FileToolIO.TimedOut) {
+                        ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle, timedOut = true)
+                    } catch (e: FileToolIO.OutOfMemory) {
+                        ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle)
+                    }
+                }
                 val hint = directoryEntriesHint(file, path)
                 return ToolExecutionResult("Error: Path is a directory: $path$hint", false, toolTitle = toolTitle)
             }
@@ -272,6 +288,179 @@ object FileReadTool {
         }
         header += "]"
         return ToolExecutionResult("$header\n$content", true, toolTitle = toolTitle)
+    }
+
+    internal fun listDirectoryStructured(
+        dir: File,
+        requestedPath: String,
+        maxLength: Int,
+        toolTitle: String,
+    ): ToolExecutionResult {
+        val entries = dir.listFiles()
+            ?.sortedWith(compareBy<File>({ !it.isDirectory }, { it.name.lowercase() }))
+            .orEmpty()
+        val normalizedBase = requestedPath.trimEnd('/').ifEmpty { "/" }
+        if (entries.isEmpty()) {
+            return ToolExecutionResult("[$normalizedBase/ | 0 entries | empty directory]", true, toolTitle = toolTitle)
+        }
+        val sb = StringBuilder()
+        var shown = 0
+        for (entry in entries) {
+            val line = if (entry.isDirectory) {
+                val childCount = entry.listFiles()?.size ?: 0
+                "dir   ${entry.name}/ ($childCount items)\n"
+            } else {
+                "file  ${entry.name} (${entry.length()} bytes)\n"
+            }
+            if (sb.length + line.length > maxLength) break
+            sb.append(line)
+            shown++
+        }
+        val truncNote = if (shown < entries.size) " | showing $shown of ${entries.size}" else ""
+        val header = "[$normalizedBase/ | ${entries.size} entries$truncNote]"
+        return ToolExecutionResult("$header\n${sb.toString().trimEnd()}", true, toolTitle = toolTitle)
+    }
+
+    private val SKIP_SEARCH_DIRS = setOf(".git", "node_modules", ".gradle", "build", "__pycache__", ".venv", "venv", ".cache")
+
+    internal fun searchInPath(
+        root: File,
+        requestedPath: String,
+        pattern: String,
+        maxLength: Int,
+        toolTitle: String,
+    ): ToolExecutionResult {
+        val regex = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.getOrNull()
+        val lowerNeedle = pattern.lowercase()
+        val sb = StringBuilder()
+        var matchCount = 0
+        var filesScanned = 0
+        val maxMatches = 250
+        val maxFileBytes = 2L * 1024 * 1024
+        val normalizedBase = requestedPath.trimEnd('/')
+
+        fun scanSingleFile(f: File, displayPath: String) {
+            if (matchCount >= maxMatches || sb.length >= maxLength) return
+            val len = f.length()
+            if (len <= 0L || len > maxFileBytes) return
+            val isBin = runCatching {
+                f.inputStream().use { input ->
+                    val buf = ByteArray(minOf(2048L, len).toInt())
+                    val r = input.read(buf)
+                    if (r > 0) buf.take(r).any { it == 0.toByte() } else false
+                }
+            }.getOrDefault(true)
+            if (isBin) return
+            filesScanned++
+            runCatching {
+                f.bufferedReader(Charsets.UTF_8).useLines { seq ->
+                    var lineNo = 0
+                    for (line in seq) {
+                        lineNo++
+                        val hit = if (regex != null) {
+                            regex.containsMatchIn(line)
+                        } else {
+                            line.lowercase().contains(lowerNeedle)
+                        }
+                        if (hit) {
+                            matchCount++
+                            val snippet = if (line.length > 220) line.take(220) + "…" else line
+                            val row = "$displayPath:$lineNo: $snippet\n"
+                            if (sb.length + row.length <= maxLength) {
+                                sb.append(row)
+                            }
+                            if (matchCount >= maxMatches || sb.length >= maxLength) break
+                        }
+                    }
+                }
+            }
+        }
+
+        val visitedDirs = HashSet<String>()
+
+        fun walkDir(dir: File, relPrefix: String, depth: Int) {
+            if (depth > 8 || matchCount >= maxMatches || sb.length >= maxLength) return
+            val canonical = runCatching { dir.canonicalPath }.getOrDefault(dir.absolutePath)
+            if (!visitedDirs.add(canonical)) return
+            val children = dir.listFiles()?.sortedBy { it.name }.orEmpty()
+            for (child in children) {
+                if (matchCount >= maxMatches || sb.length >= maxLength) break
+                if (child.isDirectory) {
+                    if (child.name in SKIP_SEARCH_DIRS) continue
+                    val nextRel = if (relPrefix.isEmpty()) child.name else "$relPrefix/${child.name}"
+                    walkDir(child, nextRel, depth + 1)
+                } else if (child.isFile) {
+                    val rel = if (relPrefix.isEmpty()) child.name else "$relPrefix/${child.name}"
+                    scanSingleFile(child, "$normalizedBase/$rel")
+                }
+            }
+        }
+
+        if (root.isFile) {
+            scanSingleFile(root, requestedPath)
+        } else {
+            walkDir(root, "", 0)
+        }
+
+        val header = "[Search '$pattern' in $requestedPath | $matchCount match(es) across $filesScanned file(s)]"
+        val body = if (matchCount == 0) "(No matches found)" else sb.toString().trimEnd()
+        return ToolExecutionResult("$header\n$body", true, toolTitle = toolTitle)
+    }
+}
+
+/**
+ * Per-session bounded undo ring buffer for `file_edit` and `file_write`.
+ * Stores the previous content of modified text files (< 2 MB) so an accidental
+ * edit or overwrite can be reverted in one call (`file_edit` with `undo: true`).
+ */
+object FileUndoStore {
+    private const val MAX_SNAPSHOT_BYTES = 2L * 1024 * 1024
+    private const val MAX_SESSION_TOTAL_BYTES = 4L * 1024 * 1024
+    private const val MAX_HISTORY_PER_SESSION = 16
+
+    private data class Snapshot(
+        val path: String,
+        val bytes: ByteArray,
+        val timestampMs: Long,
+    )
+
+    private val snapshotsBySession = java.util.concurrent.ConcurrentHashMap<String, ArrayDeque<Snapshot>>()
+
+    private fun normalizePath(path: String): String =
+        path.trim().replace(Regex("/+"), "/")
+
+    fun recordSnapshot(sessionId: String, path: String, file: File) {
+        try {
+            if (!file.exists() || !file.isFile) return
+            val len = file.length()
+            if (len <= 0L || len > MAX_SNAPSHOT_BYTES) return
+            val bytes = file.readBytes()
+            val key = sessionId.ifBlank { "__default__" }
+            val normPath = normalizePath(path)
+            val deque = snapshotsBySession.getOrPut(key) { ArrayDeque() }
+            synchronized(deque) {
+                deque.addLast(Snapshot(path = normPath, bytes = bytes, timestampMs = System.currentTimeMillis()))
+                while (deque.size > MAX_HISTORY_PER_SESSION ||
+                    (deque.size > 1 && deque.sumOf { it.bytes.size.toLong() } > MAX_SESSION_TOTAL_BYTES)
+                ) {
+                    deque.removeFirst()
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun revertLast(sessionId: String, path: String, targetFile: File): ByteArray? {
+        val key = sessionId.ifBlank { "__default__" }
+        val normPath = normalizePath(path)
+        val deque = snapshotsBySession[key] ?: return null
+        val snap = synchronized(deque) {
+            val idx = deque.indexOfLast { it.path == normPath }
+            if (idx < 0) null else deque.removeAt(idx)
+        } ?: return null
+        targetFile.parentFile?.mkdirs()
+        targetFile.writeBytes(snap.bytes)
+        return snap.bytes
     }
 }
 

@@ -592,11 +592,31 @@ class BrowserUseManager(
             override fun onReceivedError(
                 view: WebView, request: WebResourceRequest, error: WebResourceError
             ) {
+                val errUrl = request.url?.toString().orEmpty()
+                val errDesc = error.description?.toString().orEmpty()
+                recordNativeNetworkError(request.method ?: "GET", errUrl, error.errorCode, errDesc)
                 if (request.isForMainFrame) {
                     _isLoading.value = false
-                    Log.e(TAG, "Navigation error: ${error.description}")
+                    Log.e(TAG, "Navigation error: $errDesc")
                     navigationDeferred?.complete(Unit)
                     navigationDeferred = null
+                }
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView,
+                request: WebResourceRequest,
+                errorResponse: android.webkit.WebResourceResponse,
+            ) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                val status = errorResponse.statusCode
+                if (status >= 400) {
+                    recordNativeNetworkError(
+                        method = request.method ?: "GET",
+                        url = request.url?.toString().orEmpty(),
+                        status = status,
+                        detail = errorResponse.reasonPhrase ?: "HTTP $status",
+                    )
                 }
             }
 
@@ -622,24 +642,6 @@ class BrowserUseManager(
 
             // [T-android-minis-url-session-scope] Resolve against THIS session
             // first, and only then fall back to the global bind-mount map.
-            //
-            // `workspace`, `attachments`, `offloads` and `browser` live under
-            // `minis-sessions/<sid>/`, but the global map only gains a
-            // `/var/minis/workspace` entry while some session's PRoot shell is
-            // running — and it is last-writer-wins across sessions. So the old
-            // global-only lookup failed in two ordinary situations: the shell
-            // had exited (path fell through to the rootfs copy of
-            // /var/minis/workspace, which is empty), or another session had
-            // booted more recently and the mount pointed at ITS workspace.
-            //
-            // Measured on a GEM-W09: `minis://workspace/jump-jump.html` 404'd
-            // while the file sat intact at 5969 bytes in
-            // minis-sessions/145d6883…/workspace/. The rootfs directory the
-            // resolver actually reached contained nothing but `.` and `..`.
-            // That is also why the failure looked intermittent and looked like
-            // it depended on subdirectory depth — it depends on neither, only
-            // on whether the global mount happens to point at the right
-            // session at that moment.
             val sessionId = sessionIdProvider()
             val ctx = appContext
             val localFile = if (sessionId != null && ctx != null) {
@@ -655,11 +657,6 @@ class BrowserUseManager(
                     emptyMap(), "File not found: $host$path".byteInputStream())
             }
             val mimeType = guessMimeType(localFile.name)
-            // For HTML mainframe responses, inject a `<meta viewport>` matching
-            // the agent's session viewport when the page doesn't declare one.
-            // Without this, Android WebView falls back to a hardcoded 980 CSS
-            // px width regardless of the WebView's measured size, making
-            // `set_viewport` look like a no-op for `minis://` HTML pages.
             val stream = if (mimeType == "text/html" && lastAppliedViewport != null) {
                 ensureMetaViewport(localFile.readBytes(), lastAppliedViewport!!.first)
             } else {
@@ -685,9 +682,6 @@ class BrowserUseManager(
             text.contains("name='viewport'", ignoreCase = true)) {
             return text.toByteArray(Charsets.UTF_8).inputStream()
         }
-        // user-scalable=yes is the default but state it explicitly so a
-        // future change to WebView defaults can't silently disable
-        // pinch-zoom on the agent's auto-injected viewport.
         val meta = "<meta name=\"viewport\" content=\"width=$cssWidth, initial-scale=1.0, user-scalable=yes\">"
         val headIdx = text.indexOf("<head", ignoreCase = true).takeIf { it >= 0 }?.let {
             text.indexOf('>', it).takeIf { gt -> gt >= 0 }?.plus(1)
@@ -695,7 +689,6 @@ class BrowserUseManager(
         val rewritten = if (headIdx != null) {
             text.substring(0, headIdx) + meta + text.substring(headIdx)
         } else {
-            // No <head>: prepend the meta so it's still parsed before body.
             "$meta$text"
         }
         return rewritten.toByteArray(Charsets.UTF_8).inputStream()
@@ -722,10 +715,44 @@ class BrowserUseManager(
         }
     }
 
+    private val nativeConsoleLogs = ArrayDeque<String>()
+    private val nativeNetworkErrors = ArrayDeque<String>()
+
+    private fun recordNativeConsoleMessage(level: String, msg: String, sourceId: String?, lineNumber: Int) {
+        synchronized(nativeConsoleLogs) {
+            val loc = if (!sourceId.isNullOrBlank()) " (${sourceId.takeLast(80)}:$lineNumber)" else ""
+            nativeConsoleLogs.addLast("[$level] ${msg.take(360)}$loc")
+            while (nativeConsoleLogs.size > 60) nativeConsoleLogs.removeFirst()
+        }
+    }
+
+    private fun recordNativeNetworkError(method: String, url: String, status: Int, detail: String) {
+        if (url.isBlank()) return
+        synchronized(nativeNetworkErrors) {
+            nativeNetworkErrors.addLast("$method ${url.take(240)} -> status=$status ($detail)")
+            while (nativeNetworkErrors.size > 60) nativeNetworkErrors.removeFirst()
+        }
+    }
+
     private fun setupWebChromeClient() {
         webView.webChromeClient = object : WebChromeClient() {
             override fun onReceivedTitle(view: WebView, title: String?) {
                 _pageTitle.value = title ?: ""
+            }
+
+            override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
+                if (consoleMessage != null) {
+                    val lvl = consoleMessage.messageLevel()?.name ?: "LOG"
+                    if (lvl == "ERROR" || lvl == "WARNING") {
+                        recordNativeConsoleMessage(
+                            level = lvl.lowercase(),
+                            msg = consoleMessage.message().orEmpty(),
+                            sourceId = consoleMessage.sourceId(),
+                            lineNumber = consoleMessage.lineNumber(),
+                        )
+                    }
+                }
+                return super.onConsoleMessage(consoleMessage)
             }
 
             override fun onCreateWindow(
@@ -738,25 +765,6 @@ class BrowserUseManager(
             override fun onCloseWindow(window: WebView) {
                 onCloseWindow?.invoke()
             }
-
-            // [T-android-js-dialogs-256] Answer JS dialogs with a conservative
-            // default INSTEAD of showing them, and record what happened.
-            //
-            // This is unattended automation: showing a modal would block the
-            // page's JS thread on a human who isn't there, wedging the agent
-            // loop until the action dead-timeout fires. So the page is always
-            // answered immediately and never actually blocks — the only change
-            // versus the old silent-swallow behaviour is that the model now
-            // finds out it happened (see drainInterceptedDialogReport).
-            //
-            // confirm() answers false and prompt() answers null deliberately:
-            // the agent must not silently consent on the user's behalf to
-            // whatever was asked. The user-facing web preview does the exact
-            // opposite and shows real dialogs; see WebViewHolder.
-            //
-            // Returning true is what claims the dialog. Returning false (the
-            // WebChromeClient default) would let WebView apply the same default
-            // itself, but with no record — which is exactly the bug.
 
             override fun onJsAlert(
                 view: WebView?,
@@ -837,9 +845,6 @@ class BrowserUseManager(
     // -- Execute Action --
 
     suspend fun execute(input: BrowserActionInput): BrowserActionResult {
-        // (GH#245) Fail fast instead of driving a WebView that cannot answer.
-        // The pool normally rebuilds such a tab before handing it out; this
-        // catches the call that was already routed here when the flag flipped.
         if (isUnusable) {
             throw WebViewWedgedException(
                 if (isRendererDead) "browser tab renderer process died"
@@ -915,6 +920,8 @@ class BrowserUseManager(
                     manager = this,
                     nameOrId = input.scriptName ?: input.text,
                 )
+            BrowserAction.GET_CONSOLE_LOGS ->
+                return getConsoleAndNetworkLogs()
             BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS ->
                 return BrowserActionResult.error("Tab management actions must be routed through BrowserTabPool")
         }
@@ -2500,6 +2507,74 @@ class BrowserUseManager(
             _activeUserscriptsCount.value = BrowserUserscriptManager
                 .matchingScriptsForUrl(webView.context, _currentURL.value).size
         }
+    }
+
+    /**
+     * Returns a structured summary of console errors/warnings, uncaught exceptions,
+     * and failed network requests (`fetch`, `XHR`, and native WebView HTTP/resource errors).
+     */
+    private suspend fun getConsoleAndNetworkLogs(): BrowserActionResult {
+        val raw = runCatching { evaluateJavascriptValue(BrowserUseJS.getConsoleAndNetworkLogs()) }.getOrNull()
+        val json = runCatching { if (raw != null) JSONObject(raw) else null }.getOrNull()
+        val url = json?.optString("url", "")?.takeIf { it.isNotEmpty() } ?: _currentURL.value
+        val title = json?.optString("title", "")?.takeIf { it.isNotEmpty() } ?: _pageTitle.value
+
+        val consoleEntries = LinkedHashSet<String>()
+        synchronized(nativeConsoleLogs) {
+            consoleEntries.addAll(nativeConsoleLogs)
+        }
+        val jsConsole = json?.optJSONArray("consoleLogs")
+        if (jsConsole != null) {
+            for (i in 0 until jsConsole.length()) {
+                val item = jsConsole.optJSONObject(i) ?: continue
+                val lvl = item.optString("level", "error")
+                val msg = item.optString("message", "").trim()
+                if (msg.isNotEmpty()) {
+                    consoleEntries.add("[$lvl] $msg")
+                }
+            }
+        }
+
+        val netEntries = LinkedHashSet<String>()
+        synchronized(nativeNetworkErrors) {
+            netEntries.addAll(nativeNetworkErrors)
+        }
+        val jsNet = json?.optJSONArray("networkErrors")
+        if (jsNet != null) {
+            for (i in 0 until jsNet.length()) {
+                val item = jsNet.optJSONObject(i) ?: continue
+                val method = item.optString("method", "GET")
+                val reqUrl = item.optString("url", "")
+                val status = item.optInt("status", 0)
+                val detail = item.optString("detail", "")
+                if (reqUrl.isNotEmpty()) {
+                    netEntries.add("$method $reqUrl -> status=$status ($detail)")
+                }
+            }
+        }
+
+        val text = buildString {
+            appendLine("Browser Console & Network Telemetry")
+            if (url.isNotEmpty()) appendLine("  URL: $url")
+            if (title.isNotEmpty()) appendLine("  Title: $title")
+            appendLine("  Console Errors/Warnings (${consoleEntries.size}):")
+            if (consoleEntries.isEmpty()) {
+                appendLine("    (none)")
+            } else {
+                for (entry in consoleEntries.toList().takeLast(35)) {
+                    appendLine("    - $entry")
+                }
+            }
+            appendLine("  Failed Network Requests (${netEntries.size}):")
+            if (netEntries.isEmpty()) {
+                appendLine("    (none)")
+            } else {
+                for (entry in netEntries.toList().takeLast(35)) {
+                    appendLine("    - $entry")
+                }
+            }
+        }.trimEnd()
+        return BrowserActionResult(text = text)
     }
 
 }

@@ -200,16 +200,79 @@ class TerminalBuffer(
     // ── Resize ─────────────────────────────────────────────────────────────
     fun resize(newCols: Int, newRows: Int) {
         if (newCols <= 0 || newRows <= 0) return
-        val newGrid = Array(newRows) { r ->
-            Array(newCols) { c ->
-                if (r < rows && c < cols) grid[r][c] else TerminalCell.BLANK
+        if (newCols == cols && newRows == rows) return
+
+        var lastNonBlankRow = 0
+        for (r in rows - 1 downTo 0) {
+            if (grid[r].any { it.char != ' '.code || it.background != TerminalColor.Default }) {
+                lastNonBlankRow = r
+                break
             }
         }
+        val lowestActiveRow = maxOf(cursorRow, lastNonBlankRow)
+
+        val newGrid = Array(newRows) { Array(newCols) { TerminalCell.BLANK } }
+
+        if (newRows < rows && lowestActiveRow >= newRows) {
+            val shiftUp = (lowestActiveRow - newRows + 1).coerceIn(0, rows - newRows)
+            if (scrollbackEnabled) {
+                for (r in 0 until shiftUp) {
+                    scrollback.addLast(grid[r])
+                    if (scrollback.size > maxScrollback) scrollback.removeFirst()
+                }
+            }
+            for (r in 0 until newRows) {
+                val srcRow = r + shiftUp
+                if (srcRow < rows) {
+                    val copyCols = minOf(cols, newCols)
+                    for (c in 0 until copyCols) {
+                        newGrid[r][c] = grid[srcRow][c]
+                    }
+                }
+            }
+            cursorRow = (cursorRow - shiftUp).coerceIn(0, newRows - 1)
+            savedCursorRow = (savedCursorRow - shiftUp).coerceIn(0, newRows - 1)
+        } else if (newRows > rows && scrollbackEnabled && scrollback.isNotEmpty()) {
+            val extraRows = newRows - rows
+            val availableBelow = (newRows - 1 - lowestActiveRow).coerceAtLeast(0)
+            val pullCount = minOf(extraRows, availableBelow, scrollback.size)
+            for (r in pullCount - 1 downTo 0) {
+                val pulled = scrollback.removeLast()
+                val copyCols = minOf(pulled.size, newCols)
+                for (c in 0 until copyCols) {
+                    newGrid[r][c] = pulled[c]
+                }
+            }
+            for (r in 0 until rows) {
+                val dstRow = r + pullCount
+                if (dstRow < newRows) {
+                    val copyCols = minOf(cols, newCols)
+                    for (c in 0 until copyCols) {
+                        newGrid[dstRow][c] = grid[r][c]
+                    }
+                }
+            }
+            cursorRow = (cursorRow + pullCount).coerceIn(0, newRows - 1)
+            savedCursorRow = (savedCursorRow + pullCount).coerceIn(0, newRows - 1)
+        } else {
+            val copyRows = minOf(rows, newRows)
+            val copyCols = minOf(cols, newCols)
+            for (r in 0 until copyRows) {
+                for (c in 0 until copyCols) {
+                    newGrid[r][c] = grid[r][c]
+                }
+            }
+            cursorRow = minOf(cursorRow, newRows - 1)
+            savedCursorRow = minOf(savedCursorRow, newRows - 1)
+        }
+
         grid = newGrid
-        cols = newCols; rows = newRows
-        scrollTop = 0; scrollBottom = newRows - 1
+        cols = newCols
+        rows = newRows
+        scrollTop = 0
+        scrollBottom = newRows - 1
         cursorCol = minOf(cursorCol, newCols - 1)
-        cursorRow = minOf(cursorRow, newRows - 1)
+        savedCursorCol = minOf(savedCursorCol, newCols - 1)
         wrapPending = false
     }
 

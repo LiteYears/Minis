@@ -242,6 +242,10 @@ object AgentTools {
                     "Optional per-worker model tier override. Defaults to the swarm's `model_choice` ('sub_model' — the fast/cheap ModelGroup).",
                     enumValues = listOf("sub_model", "same_as_me", "default_model"),
                 ),
+                "output_files" to AgentSchemaNode.Arr(
+                    description = "Optional list of expected deliverable file paths (relative to the worker's working directory or absolute Linux paths) that will be verified upon worker completion.",
+                    items = AgentSchemaNode.Str("Expected file path"),
+                ),
             ),
             required = listOf("id", "title", "task"),
         )
@@ -249,7 +253,7 @@ object AgentTools {
             name = com.openminis.app.agent.jobs.SubAgentSwarm.TOOL_NAME,
             description = "Spawn a parallel swarm of 2–5 sandboxed worker sub-agents (`workers`) that execute simultaneously and fan-in their structured deliverables into your clean context window.\n\n" +
                 "Each worker automatically receives:\n" +
-                "1. An isolated Linux working directory (`/var/minis/workspace/swarm_<id>/<worker_id>`) where all `shell_execute` commands and relative `file_read`/`file_write`/`file_edit` paths execute without colliding with sibling workers.\n" +
+                "1. An isolated Linux working directory (`/var/minis/workspace/swarm_<id>/<worker_id>`) where all `shell_execute` commands and relative `file_read`/`file_write`/`file_edit` paths execute without colliding with sibling workers (plus a shared exchange folder `/var/minis/workspace/swarm_<id>/shared`).\n" +
                 "2. An isolated dedicated browser tab from `BrowserTabPool` (with optional `url` pre-loaded) that is automatically released when the worker finishes.\n" +
                 "3. A cheaper/faster model from the user's `ModelGroups` (`model_choice: \"sub_model\"` by default, with automatic fallback to this conversation's model if no Sub Model Group is configured).\n\n" +
                 "Use `spawn_subagent` whenever you act as a Staff Engineer or Research Lead — e.g. researching 2–5 competitors/websites in parallel across separate browser tabs, benchmarking or testing 2–4 code/script approaches in isolated directories, or auditing multiple modules simultaneously.",
@@ -293,6 +297,8 @@ object AgentTools {
         description = "Execute a command in an isolated Linux process (Alpine Linux via PRoot). " +
             "The command runs via /bin/sh -c with stdout and stderr merged. " +
             "Each invocation spawns a fresh process — there is no shared terminal session. " +
+            "For long-running background servers/watchers, use `minis-job start <cmd>`, `minis-job list`, `minis-job logs <id>`, and `minis-job stop <id>`. " +
+            "For cached toolchain packs (`core`, `data`, `web`, `net`, `media`), use `minis-pkg install <pack>`. " +
             "Default timeout is 15 minutes.",
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Install Python data analysis packages', 'List files in home directory'). Use the same language as the user."),
@@ -323,6 +329,7 @@ object AgentTools {
             "scroll to navigate long pages, scroll_and_collect to scroll through infinite-scroll/virtual-rendered pages (like Twitter/X timelines) and accumulate unique content items across scroll positions in a single call, " +
             "find_elements to discover interactive elements, " +
             "get_page_info for page metadata, get_backbone to get a structural overview of the page DOM as a simplified tree, " +
+            "get_console_logs to inspect captured JS console errors/warnings, uncaught exceptions, and failed fetch/XHR/HTTP network requests, " +
             "fetch to download files/resources using the page's session (returns metadata and a minis:// URL), " +
             "save_auth_profile / load_auth_profile / list_auth_profiles / delete_auth_profile to manage persistent Named Auth Profiles in the Authenticated Session Vault (persists cookies including HttpOnly + localStorage + sessionStorage across sessions so once the user logs into a site in the Browser Sheet, you can load their real authenticated session by profile_name), " +
             "install_userscript / list_userscripts / toggle_userscript / remove_userscript to install and manage persistent Tampermonkey Userscripts (`// ==UserScript==` headers, `@match` URL globs, `@run-at document-start|document-end|document-idle`, and full `GM_*` APIs: `GM_addStyle`, `GM_addElement`, `GM_getValue`, `GM_setValue`, `GM_deleteValue`, `GM_listValues`, `GM_setClipboard`, `GM_log`, `GM_waitForElement`, `GM_xmlhttpRequest`, `unsafeWindow`). Installed userscripts automatically inject on every matching page navigation and run immediately on the active page if it matches. You can also one-call activate built-in presets by passing `script_name`: `'anti-annoyance-shield'` (removes cookie banners, paywall overlays, and unlocks scroll), `'unlock-copy-selection'` (enables text selection/copy), `'auto-expand-articles'` (clicks Read More/Show More and uncollapses truncated articles), or `'spa-api-interceptor'` (captures fetch/XHR JSON responses into `window.__minis_captured_apis__`), " +
@@ -433,7 +440,7 @@ object BrowserUseTool {
 
     const val NAME = "browser_use"
 
-    val description = """Control web browser with up to 3 tabs. Actions: navigate to URL, take screenshot, click elements, type text, get page text, scroll, get page info, execute JavaScript, find elements by selector, hover, get readable content, set user agent, get page backbone (DOM structure), fetch resource, manage tabs (new_tab, close_tab, list_tabs).""".trimIndent()
+    val description = """Control web browser with up to 3 tabs. Actions: navigate to URL, take screenshot, som_snapshot (Set-of-Marks visual grounding), click elements, type text, get page text, scroll, get page info, get_console_logs (JS console & network errors), execute JavaScript, find elements by selector, hover, get readable content, set user agent, get page backbone (DOM structure), fetch resource, manage tabs (new_tab, close_tab, list_tabs).""".trimIndent()
 
     /**
      * Build the JSON tool definition for the Anthropic / OpenAI / Gemini API.
@@ -598,49 +605,60 @@ object BrowserUseTool {
 object FileEditTool {
     const val NAME = "file_edit"
 
+    data class EditHunk(
+        val oldString: String,
+        val newString: String,
+        val replaceAll: Boolean = false,
+    )
+
     fun definition(): AgentToolDefinition = AgentToolDefinition(
         name = NAME,
-        description = "Make targeted edits to an existing file using exact string replacement. ALWAYS use file_read first to see the current file contents before editing. Prefer file_edit over file_write when modifying existing files — only the changed part needs to be specified. The old_string must match exactly one location in the file (including whitespace/indentation), unless replace_all is true.",
+        description = "Make targeted edits to an existing file using exact string replacement (or pass `edits` array for multi-hunk atomic edits, or `undo: true` to revert the last edit/write to `path`). ALWAYS use file_read first to see the current file contents before editing. Prefer file_edit over file_write when modifying existing files — only the changed part needs to be specified. The old_string must match exactly one location in the file (including whitespace/indentation), unless replace_all is true.",
         parameters = mapOf(
             "tool_title" to AgentToolParam("string", "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Fix typo in Python script', 'Update config value'). Use the same language as the user."),
             "path" to AgentToolParam("string", "Absolute Linux path to the file to edit (e.g. /root/script.py)"),
             "old_string" to AgentToolParam("string", "The exact text to find in the file. Must match precisely including whitespace and indentation. Must be unique in the file unless replace_all is true."),
             "new_string" to AgentToolParam("string", "The replacement text. Use empty string to delete old_string."),
             "replace_all" to AgentToolParam("boolean", "If true, replace ALL occurrences of old_string (default: false)"),
+            "edits" to AgentToolParam(
+                type = "array",
+                description = "Optional array of `{old_string, new_string, replace_all}` edit hunks to apply atomically in sequence. When provided, top-level old_string and new_string may be omitted.",
+                schema = AgentSchemaNode.Arr(
+                    description = "Array of edit hunks applied atomically in sequence.",
+                    items = AgentSchemaNode.Obj(
+                        description = "A single search-and-replace edit hunk.",
+                        properties = listOf(
+                            "old_string" to AgentSchemaNode.Str("Exact text to find in the file."),
+                            "new_string" to AgentSchemaNode.Str("Replacement text (use empty string to delete)."),
+                            "replace_all" to AgentSchemaNode.Bool("If true, replace all occurrences of old_string in this hunk."),
+                        ),
+                        required = listOf("old_string", "new_string"),
+                    ),
+                    minItems = 1,
+                ),
+            ),
+            "undo" to AgentToolParam("boolean", "If true, revert `path` to its previous snapshot before the last file_edit or file_write in this session (default: false)."),
         ),
-        required = listOf("tool_title", "path", "old_string", "new_string"),
-        propertyOrdering = listOf("tool_title", "path", "old_string", "new_string", "replace_all"),
+        required = listOf("tool_title", "path"),
+        propertyOrdering = listOf("tool_title", "path", "old_string", "new_string", "replace_all", "edits", "undo"),
     )
 
     fun execute(argsJson: String, sessionId: String, context: Context): ToolExecutionResult {
         return try {
             val args = JSONObject(argsJson)
             val path = args.optString("path", "")
-            val oldString = args.optString("old_string", "")
-            val newString = args.optString("new_string", "")
+            val oldString = args.optString("old_string", "").ifEmpty { args.optString("old_text", "") }
+            val newString = if (args.has("new_string")) args.optString("new_string", "") else args.optString("new_text", "")
             val replaceAll = args.optBoolean("replace_all", false)
+            val undo = args.optBoolean("undo", false)
+            val editsArray = args.optJSONArray("edits")
+                ?: args.optString("edits", "").trim().takeIf { it.startsWith("[") }?.let {
+                    runCatching { JSONArray(it) }.getOrNull()
+                }
             val toolTitle = args.optString("tool_title", NAME)
 
             if (path.isBlank()) {
                 return ToolExecutionResult("Error: 'path' is required", false, toolTitle = toolTitle)
-            }
-            if (oldString.isEmpty()) {
-                return ToolExecutionResult("Error: 'old_string' is required and cannot be empty", false, toolTitle = toolTitle)
-            }
-
-            // [T-offload-placeholder-write-guard] (GH#374) See FileWriteTool.
-            // Only the REPLACEMENT text is checked: a placeholder in
-            // `old_string` is just a search that will not match, which the
-            // "old_string not found" path below already reports clearly.
-            if (ContextOffload.isOffloadPlaceholder(newString)) {
-                AppLogger.warning(
-                    "FileEdit",
-                    "REFUSED offload-placeholder edit path=$path bytes=${newString.length}",
-                )
-                return ToolExecutionResult(
-                    ContextOffload.placeholderWriteRefusal("new_string", path),
-                    false, toolTitle = toolTitle,
-                )
             }
 
             // T219: read-only mount guard — see FileWriteTool for rationale.
@@ -656,6 +674,54 @@ object FileEditTool {
             val file = PRootKernel.resolveSessionHostPath(sessionId, path, context)
                 ?: return ToolExecutionResult("Error: Cannot resolve path: $path", false, toolTitle = toolTitle)
 
+            if (undo) {
+                val restored = FileUndoStore.revertLast(sessionId, path, file)
+                    ?: return ToolExecutionResult(
+                        "Error: No undo snapshot available for $path in this session.",
+                        false, toolTitle = toolTitle,
+                    )
+                return ToolExecutionResult(
+                    "Reverted $path to previous snapshot (${restored.size} bytes)",
+                    true, toolTitle = toolTitle,
+                )
+            }
+
+            // Parse optional multi-hunk `edits` array if provided
+            val hunks = mutableListOf<EditHunk>()
+            if (editsArray != null && editsArray.length() > 0) {
+                for (i in 0 until editsArray.length()) {
+                    val item = editsArray.optJSONObject(i) ?: continue
+                    val hOld = item.optString("old_string", "").ifEmpty { item.optString("old_text", "") }
+                    val hNew = if (item.has("new_string")) item.optString("new_string", "") else item.optString("new_text", "")
+                    val hRepAll = item.optBoolean("replace_all", replaceAll)
+                    if (hOld.isEmpty()) {
+                        return ToolExecutionResult("Error: edits[$i].old_string cannot be empty", false, toolTitle = toolTitle)
+                    }
+                    if (ContextOffload.isOffloadPlaceholder(hNew)) {
+                        return ToolExecutionResult(
+                            ContextOffload.placeholderWriteRefusal("edits[$i].new_string", path),
+                            false, toolTitle = toolTitle,
+                        )
+                    }
+                    hunks.add(EditHunk(hOld, hNew, hRepAll))
+                }
+            } else {
+                if (oldString.isEmpty()) {
+                    return ToolExecutionResult("Error: 'old_string' is required and cannot be empty", false, toolTitle = toolTitle)
+                }
+                if (ContextOffload.isOffloadPlaceholder(newString)) {
+                    AppLogger.warning(
+                        "FileEdit",
+                        "REFUSED offload-placeholder edit path=$path bytes=${newString.length}",
+                    )
+                    return ToolExecutionResult(
+                        ContextOffload.placeholderWriteRefusal("new_string", path),
+                        false, toolTitle = toolTitle,
+                    )
+                }
+                hunks.add(EditHunk(oldString, newString, replaceAll))
+            }
+
             if (!file.exists()) {
                 val hint = FileReadTool.suggestNearbyFilesHint(file, path)
                 return ToolExecutionResult("Error: File not found: $path$hint", false, toolTitle = toolTitle)
@@ -666,7 +732,12 @@ object FileEditTool {
             // a tool error instead of killing the app.
             try {
                 FileToolIO.run("Editing $path", writes = true) {
-                    edit(file, path, oldString, newString, replaceAll, toolTitle)
+                    if (hunks.size == 1) {
+                        val h = hunks[0]
+                        edit(file, path, h.oldString, h.newString, h.replaceAll, toolTitle, sessionId)
+                    } else {
+                        editMultiHunk(file, path, hunks, toolTitle, sessionId)
+                    }
                 }
             } catch (e: FileToolIO.TimedOut) {
                 ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle, timedOut = true)
@@ -682,6 +753,75 @@ object FileEditTool {
     }
 
     /**
+     * Apply multiple hunks atomically in memory before writing to [file].
+     */
+    internal fun editMultiHunk(
+        file: java.io.File,
+        path: String,
+        hunks: List<EditHunk>,
+        toolTitle: String,
+        sessionId: String = "",
+    ): ToolExecutionResult {
+        val size = file.length()
+        if (size > FileToolIO.MAX_EDIT_BYTES) {
+            return ToolExecutionResult(
+                "Error: $path is $size bytes; file_edit handles files up to ${FileToolIO.MAX_EDIT_BYTES} bytes. " +
+                    "Use the shell (e.g. sed or a script) for larger files.",
+                false, toolTitle = toolTitle,
+            )
+        }
+        var workingContent = file.readText()
+        var totalReplacements = 0
+        val notes = mutableListOf<String>()
+
+        for ((idx, hunk) in hunks.withIndex()) {
+            var count = 0
+            var searchFrom = 0
+            while (true) {
+                val foundIdx = workingContent.indexOf(hunk.oldString, searchFrom)
+                if (foundIdx < 0) break
+                count++
+                searchFrom = foundIdx + hunk.oldString.length
+            }
+            if (count == 0) {
+                val fuzzy = tryFuzzyLineEdit(workingContent, hunk.oldString, hunk.newString, hunk.replaceAll)
+                if (fuzzy != null) {
+                    workingContent = fuzzy.newContent
+                    totalReplacements += fuzzy.replacements
+                    notes.add("hunk ${idx + 1}: ${fuzzy.note}")
+                    continue
+                }
+                val closestHint = buildClosestMatchHint(workingContent, hunk.oldString, path)
+                return ToolExecutionResult(
+                    "Error: edits[$idx].old_string not found in $path$closestHint",
+                    false, toolTitle = toolTitle,
+                )
+            }
+            if (count > 1 && !hunk.replaceAll) {
+                return ToolExecutionResult(
+                    "Error: edits[$idx].old_string found $count times in $path. Use replace_all=true or provide a unique old_string.",
+                    false, toolTitle = toolTitle,
+                )
+            }
+            workingContent = if (hunk.replaceAll) {
+                workingContent.replace(hunk.oldString, hunk.newString)
+            } else {
+                workingContent.replaceFirst(hunk.oldString, hunk.newString)
+            }
+            totalReplacements += if (hunk.replaceAll) count else 1
+        }
+
+        FileUndoStore.recordSnapshot(sessionId, path, file)
+        file.writeText(workingContent)
+        val syntaxWarn = validateJsonSyntaxWarning(path, workingContent)
+        val noteSuffix = if (notes.isNotEmpty()) ", ${notes.joinToString("; ")}" else ""
+        return ToolExecutionResult(
+            "Edited $path (${hunks.size} hunks, $totalReplacements replacement(s), ${workingContent.length} bytes$noteSuffix)$syntaxWarn",
+            true, toolTitle = toolTitle,
+        )
+    }
+
+    /**
      * Apply one file_edit to [file]. Pure apart from the file access, so tests
      * can call it on a temp file.
      */
@@ -692,6 +832,7 @@ object FileEditTool {
         newString: String,
         replaceAll: Boolean,
         toolTitle: String,
+        sessionId: String = "",
     ): ToolExecutionResult {
         // [T-port-filetool-size-guard] Refuse large files before reading
         // them (iOS FileToolIO.maxEditBytes, same message): readText() of a
@@ -723,6 +864,7 @@ object FileEditTool {
             // or unique indentation-insensitive matching for weaker models.
             val fuzzyEdited = tryFuzzyLineEdit(content, oldString, newString, replaceAll)
             if (fuzzyEdited != null) {
+                FileUndoStore.recordSnapshot(sessionId, path, file)
                 file.writeText(fuzzyEdited.newContent)
                 val syntaxWarn = validateJsonSyntaxWarning(path, fuzzyEdited.newContent)
                 return ToolExecutionResult(
@@ -749,6 +891,7 @@ object FileEditTool {
             content.replaceFirst(oldString, newString)
         }
 
+        FileUndoStore.recordSnapshot(sessionId, path, file)
         file.writeText(newContent)
         val replacements = if (replaceAll) count else 1
         val syntaxWarn = validateJsonSyntaxWarning(path, newContent)
@@ -1071,6 +1214,7 @@ object FileWriteTool {
                     if (parent != null && (createDirs || !parent.exists())) {
                         parent.mkdirs()
                     }
+                    FileUndoStore.recordSnapshot(sessionId, path, file)
 
                     if (append) {
                         file.appendText(content)

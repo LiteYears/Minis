@@ -142,33 +142,68 @@ class TerminalInputEditText @JvmOverloads constructor(
             EditorInfo.IME_ACTION_NONE
 
         return object : BaseInputConnection(this, false) {
-            // Most IME keys are routed through commitText. Forward verbatim
-            // and immediately clear any buffered composing state so the
-            // hidden EditText never accumulates characters.
+            private var activeComposingText: String = ""
+
+            private fun applyComposingUpdate(nextText: String, clearAfter: Boolean) {
+                if (activeComposingText.isEmpty()) {
+                    if (nextText.isNotEmpty()) {
+                        send(nextText.toByteArray(Charsets.UTF_8))
+                    }
+                    activeComposingText = if (clearAfter) "" else nextText
+                    return
+                }
+                var common = 0
+                val minLen = minOf(activeComposingText.length, nextText.length)
+                while (common < minLen && activeComposingText[common] == nextText[common]) {
+                    common++
+                }
+                // Avoid splitting a UTF-16 surrogate pair at the boundary
+                if (common > 0 && Character.isHighSurrogate(activeComposingText[common - 1])) {
+                    common--
+                }
+                val removedPortion = activeComposingText.substring(common)
+                val backspaces = removedPortion.codePointCount(0, removedPortion.length)
+                repeat(backspaces) { send(byteArrayOf(0x7F)) }
+
+                val addedPortion = nextText.substring(common)
+                if (addedPortion.isNotEmpty()) {
+                    send(addedPortion.toByteArray(Charsets.UTF_8))
+                }
+                activeComposingText = if (clearAfter) "" else nextText
+            }
+
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                if (text == null || text.isEmpty()) return true
-                send(text.toString().toByteArray(Charsets.UTF_8))
+                val str = text?.toString().orEmpty()
+                if (str.isEmpty() && activeComposingText.isEmpty()) return true
+                applyComposingUpdate(str, clearAfter = true)
                 return true
             }
 
             override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                if (text == null || text.isEmpty()) return true
-                send(text.toString().toByteArray(Charsets.UTF_8))
+                val str = text?.toString().orEmpty()
+                if (str.isEmpty() && activeComposingText.isEmpty()) return true
+                applyComposingUpdate(str, clearAfter = false)
                 return true
             }
 
             override fun sendKeyEvent(event: KeyEvent?): Boolean {
                 event ?: return false
                 if (event.action != KeyEvent.ACTION_DOWN) return true
+                activeComposingText = ""
                 return handleKeyEvent(event)
             }
 
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                activeComposingText = ""
                 repeat(beforeLength) { send(byteArrayOf(0x7F)) }
+                repeat(afterLength) { send("\u001B[3~".toByteArray(Charsets.UTF_8)) }
                 return true
             }
 
-            override fun finishComposingText(): Boolean = true
+            override fun finishComposingText(): Boolean {
+                activeComposingText = ""
+                return true
+            }
         }
     }
 

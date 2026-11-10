@@ -706,10 +706,28 @@ internal fun ToolDetailSheet(
                         val path = toolArgsObj.optString("path", "")
                             .ifEmpty { extractPartialJsonString("path", block.toolArgs) ?: "" }
                         val fileName = if (path.contains("/")) path.substringAfterLast("/") else path
+                        val editsArr = toolArgsObj.optJSONArray("edits")
+                        val isUndo = toolArgsObj.optBoolean("undo", false)
                         val oldStr = toolArgsObj.optString("old_string", "")
                             .ifEmpty { extractPartialJsonString("old_string", block.toolArgs) ?: "" }
+                            .ifEmpty {
+                                if (editsArr != null && editsArr.length() > 0) {
+                                    (0 until editsArr.length()).mapNotNull { i ->
+                                        editsArr.optJSONObject(i)?.optString("old_string", "")?.takeIf { it.isNotEmpty() }
+                                    }.joinToString("\n───\n")
+                                } else ""
+                            }
                         val newStr = toolArgsObj.optString("new_string", "")
                             .ifEmpty { extractPartialJsonString("new_string", block.toolArgs) ?: "" }
+                            .ifEmpty {
+                                if (editsArr != null && editsArr.length() > 0) {
+                                    (0 until editsArr.length()).mapNotNull { i ->
+                                        editsArr.optJSONObject(i)?.optString("new_string", "")?.takeIf { it.isNotEmpty() }
+                                    }.joinToString("\n───\n")
+                                } else if (isUndo) {
+                                    block.content.ifEmpty { "Revert to previous snapshot" }
+                                } else ""
+                            }
 
                         // T126-fix: ChatPalette.isDark follows the in-app theme
                         // override, isSystemInDarkTheme() doesn't.
@@ -725,6 +743,7 @@ internal fun ToolDetailSheet(
                             newStr.toByteArray(Charsets.UTF_8).size)
                         val sizeLabel = when {
                             isLive -> "streaming…"
+                            isUndo -> "undo"
                             bytes < 1024 -> "$bytes B"
                             else -> "${bytes / 1024} KB"
                         }

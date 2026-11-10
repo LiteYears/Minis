@@ -74,7 +74,8 @@ enum class BrowserAction(val value: String) {
     INSTALL_USERSCRIPT("install_userscript"),
     LIST_USERSCRIPTS("list_userscripts"),
     TOGGLE_USERSCRIPT("toggle_userscript"),
-    REMOVE_USERSCRIPT("remove_userscript");
+    REMOVE_USERSCRIPT("remove_userscript"),
+    GET_CONSOLE_LOGS("get_console_logs");
 
     /**
      * [T-browser-readaction-follow-tab-and-yolo-android] True when this action
@@ -90,7 +91,8 @@ enum class BrowserAction(val value: String) {
         fun fromString(s: String): BrowserAction? {
             val normalized = s.trim().lowercase()
             return map[normalized] ?: when (normalized) {
-                "set_of_marks", "mark_page", "visual_dom" -> SOM_SNAPSHOT
+                "set_of_marks", "mark_page", "visual_dom", "get_interactive_tree", "annotate_elements" -> SOM_SNAPSHOT
+                "get_console_and_network", "console_logs", "network_logs", "get_network_logs", "get_errors" -> GET_CONSOLE_LOGS
                 "switch_auth_profile", "restore_auth_profile" -> LOAD_AUTH_PROFILE
                 "save_userscript", "add_userscript", "create_userscript", "tampermonkey_install", "tampermonkey" -> INSTALL_USERSCRIPT
                 "get_userscripts", "tampermonkey_list", "userscripts" -> LIST_USERSCRIPTS

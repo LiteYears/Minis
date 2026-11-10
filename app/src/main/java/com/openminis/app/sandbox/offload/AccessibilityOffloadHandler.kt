@@ -574,21 +574,53 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         }
     }
 
+    private fun performClickWithFallback(
+        svc: MinisAccessibilityService,
+        node: AccessibilityNodeInfo,
+        args: OffloadArgs,
+    ): Boolean {
+        val isLong = args.hasFlag("long")
+        val action = if (isLong) AccessibilityNodeInfo.ACTION_LONG_CLICK
+        else AccessibilityNodeInfo.ACTION_CLICK
+
+        if (isLong) {
+            if (node.isLongClickable && node.performAction(action)) return true
+            var parent = node.parent
+            var depth = 0
+            while (parent != null && depth < 6) {
+                if (parent.isLongClickable && parent.performAction(action)) return true
+                parent = parent.parent
+                depth++
+            }
+        } else {
+            if (node.isClickable && node.performAction(action)) return true
+            var parent = node.parent
+            var depth = 0
+            while (parent != null && depth < 6) {
+                if (parent.isClickable && parent.performAction(action)) return true
+                parent = parent.parent
+                depth++
+            }
+            if (node.performAction(action)) return true
+        }
+
+        val r = Rect()
+        node.getBoundsInScreen(r)
+        if (r.width() > 0 && r.height() > 0) {
+            return tapXYRaw(svc, r.centerX(), r.centerY(), args).exitCode == 0
+        }
+        return false
+    }
+
     private fun tapNode(args: OffloadArgs): NativeOffloadResult {
         val svc = svcOrThrow()
         val nodeId = args.positional.getOrNull(2)
             ?: return NativeOffloadResult(2, "$TOOL tap node: missing <nodeId>\n")
         val n = svc.nodeRegistry.get(nodeId)
             ?: return err(args, "NODE_NOT_FOUND", "no live node with id=$nodeId")
-        val action = if (args.hasFlag("long")) AccessibilityNodeInfo.ACTION_LONG_CLICK
-                     else AccessibilityNodeInfo.ACTION_CLICK
-        if (!n.isClickable && !args.hasFlag("long")) {
-            val r = Rect(); n.getBoundsInScreen(r)
-            return tapXYRaw(svc, r.centerX(), r.centerY(), args)
-        }
-        return if (n.performAction(action))
+        return if (performClickWithFallback(svc, n, args))
             ok(args, JSONObject().put("nodeId", nodeId).put("action", "click"))
-        else err(args, "ACTION_FAILED", "performAction($action) returned false")
+        else err(args, "ACTION_FAILED", "click and gesture fallback failed for nodeId=$nodeId")
     }
 
     private fun tapXY(args: OffloadArgs): NativeOffloadResult {
@@ -622,44 +654,51 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         val contains = args.hasFlag("contains")
         val index = args.getInt("index") ?: 0
         val matches = ArrayList<AccessibilityNodeInfo>()
-        for (root in svc.rootNodes()) findByTextOrDesc(root, text, contains, 30, 0, matches)
+        val roots = svc.rootNodes()
+        for (root in roots) findByTextOrDesc(root, text, contains, 30, 0, matches, ignoreCase = false)
+        if (matches.isEmpty()) {
+            for (root in roots) findByTextOrDesc(root, text, contains, 30, 0, matches, ignoreCase = true)
+        }
         val n = matches.getOrNull(index)
             ?: return err(args, "NODE_NOT_FOUND",
                 "no node with text${if (contains) " containing " else "="}\"$text\" (matches: ${matches.size})")
-        if (n.isClickable) n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        else {
-            val r = Rect(); n.getBoundsInScreen(r)
-            tapXYRaw(svc, r.centerX(), r.centerY(), args)
-        }
-        return ok(args, JSONObject().put("text", text).put("action", "click"))
+        return if (performClickWithFallback(svc, n, args))
+            ok(args, JSONObject().put("text", text).put("action", "click"))
+        else err(args, "ACTION_FAILED", "click and gesture fallback failed for text=\"$text\"")
     }
 
     private fun findByTextOrDesc(
         node: AccessibilityNodeInfo?, target: String, contains: Boolean,
         maxDepth: Int, depth: Int, out: MutableList<AccessibilityNodeInfo>,
+        ignoreCase: Boolean = false,
     ) {
         if (node == null || depth > maxDepth) return
         val t = node.text?.toString()
         val d = node.contentDescription?.toString()
         val match = if (contains)
-            (t != null && t.contains(target)) || (d != null && d.contains(target))
+            (t != null && t.contains(target, ignoreCase = ignoreCase)) ||
+                (d != null && d.contains(target, ignoreCase = ignoreCase))
         else
-            t == target || d == target
+            (t != null && t.equals(target, ignoreCase = ignoreCase)) ||
+                (d != null && d.equals(target, ignoreCase = ignoreCase))
         if (match) out.add(node)
-        for (i in 0 until node.childCount) findByTextOrDesc(node.getChild(i), target, contains, maxDepth, depth + 1, out)
+        for (i in 0 until node.childCount) {
+            findByTextOrDesc(node.getChild(i), target, contains, maxDepth, depth + 1, out, ignoreCase)
+        }
     }
 
     private fun tapId(args: OffloadArgs): NativeOffloadResult {
         val svc = svcOrThrow()
         val rid = args.positional.getOrNull(2)
             ?: return NativeOffloadResult(2, "$TOOL tap id: missing <resourceId>\n")
+        val index = args.getInt("index") ?: 0
         val matches = ArrayList<AccessibilityNodeInfo>()
         for (root in svc.rootNodes()) findByResourceId(root, rid, 30, 0, matches)
-        val n = matches.firstOrNull()
+        val n = matches.getOrNull(index)
             ?: return err(args, "NODE_NOT_FOUND", "no node with resource-id=$rid")
-        return if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+        return if (performClickWithFallback(svc, n, args))
             ok(args, JSONObject().put("resourceId", rid).put("action", "click"))
-        else err(args, "ACTION_FAILED", "performAction(CLICK) returned false")
+        else err(args, "ACTION_FAILED", "click and gesture fallback failed for resource-id=$rid")
     }
 
     private fun findByResourceId(
@@ -667,7 +706,10 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         maxDepth: Int, depth: Int, out: MutableList<AccessibilityNodeInfo>,
     ) {
         if (node == null || depth > maxDepth) return
-        if (node.viewIdResourceName == rid) out.add(node)
+        val viewId = node.viewIdResourceName
+        if (viewId != null && (viewId == rid || viewId.endsWith(":id/$rid") || viewId.endsWith("/$rid"))) {
+            out.add(node)
+        }
         for (i in 0 until node.childCount) findByResourceId(node.getChild(i), rid, maxDepth, depth + 1, out)
     }
 
@@ -717,16 +759,47 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             "HOME" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME); ok(args, JSONObject().put("key", "HOME")) }
             "RECENTS" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS); ok(args, JSONObject().put("key", "RECENTS")) }
             "NOTIFICATIONS" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS); ok(args, JSONObject().put("key", "NOTIFICATIONS")) }
+            "ENTER", "IME_ENTER", "SEARCH", "SEND", "DONE", "GO", "NEXT" -> {
+                val target = resolveTargetEditable(svc, args)
+                val imeEnterId = android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
+                if (target != null && target.performAction(imeEnterId)) {
+                    ok(args, JSONObject().put("key", keyName.uppercase()).put("action", "ime_enter"))
+                } else {
+                    err(args, "ACTION_FAILED", "ACTION_IME_ENTER failed (no focused input accepting IME action)")
+                }
+            }
             else -> err(args, "INVALID_ARGS",
-                "key '$keyName' not supported via accessibility (try BACK/HOME/RECENTS/NOTIFICATIONS; for ENTER/DPAD use shizuku-cli `input keyevent`)")
+                "key '$keyName' not supported via accessibility (try BACK/HOME/RECENTS/NOTIFICATIONS/ENTER; for DPAD use shizuku-cli `input keyevent`)")
         }
     }
 
     private fun resolveTargetEditable(svc: MinisAccessibilityService, args: OffloadArgs): AccessibilityNodeInfo? {
         args.get("node")?.let { id -> return svc.nodeRegistry.get(id) }
-        for (root in svc.rootNodes()) {
+        val roots = svc.rootNodes()
+        for (root in roots) {
             val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             if (focused != null) return focused
+        }
+        for (root in roots) {
+            val a11yFocused = root.findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY)
+            if (a11yFocused != null && a11yFocused.isEditable) return a11yFocused
+        }
+        for (root in roots) {
+            val firstEd = firstEditable(root, 30, 0)
+            if (firstEd != null) {
+                firstEd.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                firstEd.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                return firstEd
+            }
+        }
+        return null
+    }
+
+    private fun firstEditable(node: AccessibilityNodeInfo?, maxDepth: Int, depth: Int): AccessibilityNodeInfo? {
+        if (node == null || depth > maxDepth) return null
+        if (node.isEditable && node.isVisibleToUser) return node
+        for (i in 0 until node.childCount) {
+            firstEditable(node.getChild(i), maxDepth, depth + 1)?.let { return it }
         }
         return null
     }
@@ -756,8 +829,42 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             "up", "left"    -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
             else -> return err(args, "INVALID_ARGS", "--direction must be up|down|left|right")
         }
+        var target: AccessibilityNodeInfo = n
+        if (!target.isScrollable) {
+            var p = target.parent
+            var d = 0
+            while (p != null && d < 8) {
+                if (p.isScrollable) { target = p; break }
+                p = p.parent
+                d++
+            }
+        }
         var done = 0
-        repeat(times) { if (n.performAction(action)) done++ }
+        repeat(times) {
+            if (target.performAction(action)) {
+                done++
+            } else {
+                val r = Rect()
+                target.getBoundsInScreen(r)
+                if (r.width() > 40 && r.height() > 40) {
+                    val cx = r.centerX()
+                    val cy = r.centerY()
+                    val dist = (if (direction == "down" || direction == "up") r.height() else r.width()) * 2 / 5
+                    val (dx, dy) = when (direction) {
+                        "down"  -> 0 to -dist
+                        "up"    -> 0 to dist
+                        "left"  -> dist to 0
+                        "right" -> -dist to 0
+                        else    -> 0 to 0
+                    }
+                    val path = Path().apply {
+                        moveTo(cx.toFloat(), cy.toFloat())
+                        lineTo((cx + dx).toFloat(), (cy + dy).toFloat())
+                    }
+                    if (svc.dispatchSimpleGesture(path, 0L, 300L)) done++
+                }
+            }
+        }
         return ok(args, JSONObject().put("scrolled", done).put("direction", direction))
     }
 
@@ -798,16 +905,41 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         }
         repeat(maxScrolls) {
             val matches = ArrayList<AccessibilityNodeInfo>()
-            for (root in svc.rootNodes()) findByTextOrDesc(root, text, contains = true, 30, 0, matches)
+            val roots = svc.rootNodes()
+            for (root in roots) findByTextOrDesc(root, text, contains = true, 30, 0, matches, ignoreCase = false)
+            if (matches.isEmpty()) {
+                for (root in roots) findByTextOrDesc(root, text, contains = true, 30, 0, matches, ignoreCase = true)
+            }
             val hit = matches.firstOrNull()
             if (hit != null) return ok(args, JSONObject()
                 .put("found", true)
                 .put("node", nodeToJson(svc.nodeRegistry, hit, 0, compact = true)))
             val scrolled = container?.performAction(action) ?: run {
                 var any = false
-                for (root in svc.rootNodes()) {
+                for (root in roots) {
                     val s = firstScrollable(root, 30, 0)
-                    if (s != null) { any = s.performAction(action); break }
+                    if (s != null && s.performAction(action)) { any = true; break }
+                }
+                if (!any && roots.isNotEmpty()) {
+                    val r = Rect()
+                    roots.first().getBoundsInScreen(r)
+                    if (r.width() > 100 && r.height() > 100) {
+                        val cx = r.centerX()
+                        val cy = r.centerY()
+                        val dist = (if (direction == "down" || direction == "up") r.height() else r.width()) * 2 / 5
+                        val (dx, dy) = when (direction) {
+                            "down"  -> 0 to -dist
+                            "up"    -> 0 to dist
+                            "left"  -> dist to 0
+                            "right" -> -dist to 0
+                            else    -> 0 to 0
+                        }
+                        val path = Path().apply {
+                            moveTo(cx.toFloat(), cy.toFloat())
+                            lineTo((cx + dx).toFloat(), (cy + dy).toFloat())
+                        }
+                        any = svc.dispatchSimpleGesture(path, 0L, 300L)
+                    }
                 }
                 any
             }
@@ -903,7 +1035,12 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         while (System.currentTimeMillis() < deadline) {
             for (root in svc.rootNodes()) {
                 val matches = ArrayList<AccessibilityNodeInfo>()
-                if (targetText != null) findByTextOrDesc(root, targetText, contains = containsOnly, 30, 0, matches)
+                if (targetText != null) {
+                    findByTextOrDesc(root, targetText, contains = containsOnly, 30, 0, matches, ignoreCase = false)
+                    if (matches.isEmpty()) {
+                        findByTextOrDesc(root, targetText, contains = containsOnly, 30, 0, matches, ignoreCase = true)
+                    }
+                }
                 if (targetId != null) findByResourceId(root, targetId, 30, 0, matches)
                 if (targetClass != null) findByClassName(root, targetClass, 30, 0, matches)
                 val found = matches.isNotEmpty()
@@ -944,12 +1081,27 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         return ok(args, JSONObject().put("stable", false).put("timedOut", true))
     }
 
+    private fun hashNodeSubtree(node: AccessibilityNodeInfo?, depth: Int, maxDepth: Int): Int {
+        if (node == null || depth > maxDepth) return 0
+        var h = node.windowId
+        h = h * 31 + (node.className?.hashCode() ?: 0)
+        h = h * 31 + (node.text?.hashCode() ?: 0)
+        h = h * 31 + (node.contentDescription?.hashCode() ?: 0)
+        h = h * 31 + node.childCount
+        val r = Rect()
+        node.getBoundsInScreen(r)
+        h = h * 31 + r.hashCode()
+        val limit = node.childCount.coerceAtMost(12)
+        for (i in 0 until limit) {
+            h = h * 31 + hashNodeSubtree(node.getChild(i), depth + 1, maxDepth)
+        }
+        return h
+    }
+
     private fun treeSignature(svc: MinisAccessibilityService): Int {
         var h = 0
         for (root in svc.rootNodes()) {
-            h = h * 31 + (root.text?.hashCode() ?: 0)
-            h = h * 31 + root.childCount
-            h = h * 31 + root.windowId
+            h = h * 31 + hashNodeSubtree(root, 0, 4)
         }
         val (pkg, cls) = svc.foregroundPackage()
         h = h * 31 + (pkg?.hashCode() ?: 0)

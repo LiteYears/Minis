@@ -1069,6 +1069,22 @@ class ChatViewModel(
                     missing.add(field)
                 }
             }
+            if (name == "file_edit" && missing.isEmpty()) {
+                val isUndo = args.optBoolean("undo", false)
+                val hasEdits = args.optJSONArray("edits")?.let { it.length() > 0 } == true ||
+                    args.optString("edits", "").trim().startsWith("[")
+                val hasLegacyAliases = args.optString("old_text", "").isNotEmpty()
+                if (!isUndo && !hasEdits && !hasLegacyAliases) {
+                    if (!args.has("old_string") || args.isNull("old_string") ||
+                        (args.opt("old_string") as? String)?.isEmpty() == true
+                    ) {
+                        missing.add("old_string")
+                    }
+                    if (!args.has("new_string") || args.isNull("new_string")) {
+                        missing.add("new_string")
+                    }
+                }
+            }
             if (missing.isNotEmpty()) {
                 return "Tool '$name' is missing required parameter(s): ${missing.joinToString(", ")}."
             }
@@ -11751,7 +11767,17 @@ class ChatViewModel(
         // loop or survive a cancel. A mid-loop injection that carries its own
         // prefill re-arms it (see the injectQueuedPromptsAsNewTurn call site).
         var pendingScriptedTurn: com.openminis.app.scheduled.ScriptedToolTurn? = scriptedTurnFor(prefill)
+        var lastSoulSignature = com.openminis.app.agent.SoulStore.fileSignature(context)
         for (turn in 0 until turnCap) {
+            if (turn > 0) {
+                val currentSoulSig = com.openminis.app.agent.SoulStore.fileSignature(context)
+                if (currentSoulSig != lastSoulSignature) {
+                    lastSoulSignature = currentSoulSig
+                    com.openminis.app.agent.SoulStore.refreshCache(context)
+                    loopSystemPrompt = systemPromptFor(currentProvider, buildSystemPrompt())
+                    AppLogger.info(TAG_STREAM, "[Soul] reloaded updated SOUL.md into systemPrompt at turn=$turn")
+                }
+            }
             // [stop-diag] Every iteration is one model request; turn>0 means the
             // previous turn's tool results were judged worth sending on.
             AppLogger.info(TAG_STREAM, "[stop-diag] turn=$turn START sid=$activeSessionId — requesting the model")
@@ -14652,13 +14678,23 @@ class ChatViewModel(
             FileWriteTool.NAME -> {
                 val resolvedArgs = resolveWorkerPathArgs(argsJson)
                 FileWriteTool.execute(resolvedArgs, fsSessionId, context).also {
-                    if (it.success) maybeReloadSkillsForPath(resolvedArgs)
+                    if (it.success) {
+                        maybeReloadSkillsForPath(resolvedArgs)
+                        if (resolvedArgs.contains("soul.md", ignoreCase = true)) {
+                            com.openminis.app.agent.SoulStore.refreshCache(context)
+                        }
+                    }
                 }
             }
             FileEditTool.NAME -> {
                 val resolvedArgs = resolveWorkerPathArgs(argsJson)
                 FileEditTool.execute(resolvedArgs, fsSessionId, context).also {
-                    if (it.success) maybeReloadSkillsForPath(resolvedArgs)
+                    if (it.success) {
+                        maybeReloadSkillsForPath(resolvedArgs)
+                        if (resolvedArgs.contains("soul.md", ignoreCase = true)) {
+                            com.openminis.app.agent.SoulStore.refreshCache(context)
+                        }
+                    }
                 }
             }
             // T178: pass sessionId + context so read_image routes through
@@ -14673,6 +14709,7 @@ class ChatViewModel(
                 // skill. The repository compares a directory signature in the
                 // background and only reloads when /var/minis/skills changed.
                 skillRepository?.requestReload("shell_execute")
+                com.openminis.app.agent.SoulStore.refreshCache(context)
             }
             // [T-tools-granular-switches] Refuse a switched-off tool at the
             // dispatcher too, not only by omitting it from the schema: a model
@@ -15323,6 +15360,7 @@ class ChatViewModel(
         val swarmRootDir = "/var/minis/workspace/swarm_$shortSwarmId"
         runCatching {
             com.openminis.app.sandbox.PRootKernel.resolveSessionHostPath(fsSessionId, swarmRootDir, context)?.mkdirs()
+            com.openminis.app.sandbox.PRootKernel.resolveSessionHostPath(fsSessionId, "$swarmRootDir/shared", context)?.mkdirs()
         }
 
         val startedAt = System.currentTimeMillis()
@@ -15645,6 +15683,17 @@ class ChatViewModel(
                             } else {
                                 facts.lastText.ifEmpty { hr.emptyResultNote(workerStatus) }
                             }
+                            val verifiedFilesList = spec.outputFiles.map { rawPath ->
+                                val linuxPath = if (rawPath.startsWith("/")) rawPath else "$workdir/${rawPath.removePrefix("./")}"
+                                val hostFile = runCatching {
+                                    com.openminis.app.sandbox.PRootKernel.resolveSessionHostPath(fsSessionId, linuxPath, context)
+                                }.getOrNull()
+                                if (hostFile != null && hostFile.exists() && hostFile.isFile && hostFile.length() > 0L) {
+                                    "[OK] `$rawPath` (${hostFile.length()} bytes)"
+                                } else {
+                                    "[MISSING] `$rawPath`"
+                                }
+                            }
                             val doneStatus = liveStatuses[idx].copy(
                                 status = workerStatus,
                                 currentTool = null,
@@ -15654,6 +15703,7 @@ class ChatViewModel(
                                 summary = summary,
                                 result = deliverableText,
                                 errorDetail = childError,
+                                verifiedFiles = verifiedFilesList,
                             )
                             liveStatuses[idx] = doneStatus
                             AppLogger.info(
@@ -17447,13 +17497,15 @@ File creation guidelines:
 Tool call style:
 - Default: do not narrate routine, low-risk tool calls — just call the tool directly.
 - Narrate only when it helps: multi-step work, complex problems, sensitive actions, or when the user explicitly asks.
-- Keep narration brief and value-dense; avoid repeating obvious steps.
+- When you do narrate or explain tool actions, planning, or intermediate progress, stay strictly in character and follow the active persona, voice, style, and language from SOUL.md.
+- Keep narration value-dense; avoid repeating obvious steps.
 - When a tool exists for an action, use it directly instead of explaining what you plan to do.
 - Use reasonable defaults and contextual inference to fill in missing details (e.g. 'tonight' means today, 'remind me' implies creating a reminder immediately). Only ask for clarification when genuinely ambiguous.
 
 Tone and style:
-- Reply in the language that best matches the user's input. Only switch languages when the user explicitly asks.
-- Be concise. Prefer action over explanation — when the user asks for something that can be done via shell, do it directly.
+- Embody your active identity, personality, behavioral instructions, `style`, and `lang` configuration from SOUL.md consistently across all conversations, planning, tool calls, execution updates, and final responses.
+- If SOUL.md specifies a `lang` (other than "auto") or prescribes a language in `style` / personality instructions, respond in that language by default unless the user explicitly asks to switch; otherwise reply in the language that best matches the user's input.
+- Unless SOUL.md specifies a more expressive, detailed, or stylized persona, keep operational updates concise and prefer direct action over boilerplate.
 
 Android framework commands (available to run via shell_execute):
 CLI tools at /usr/local/bin with the `android-` prefix give you access to Android framework capabilities and on-device control. Invoke them from shell_execute like any other binary — they are already on PATH. Each tool prints JSON (or a short human-readable line) and supports --help for full usage. Tools gated by Shizuku or AccessibilityService return permission_denied when not granted — handle that gracefully and point the user at [Settings → Permissions](minis://settings/permissions).

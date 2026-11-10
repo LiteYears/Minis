@@ -176,8 +176,12 @@ fun TerminalScreen(
         RootfsManager.getInstance(context).isProotAvailable
     }
 
-    // Pipe PTY output → emulator.
+    // Pipe PTY output → emulator (replaying any buffered output from the active session first).
     LaunchedEffect(terminalSession) {
+        val history = terminalSession.snapshotOutputHistory()
+        for (chunk in history) {
+            emulator.feed(chunk)
+        }
         terminalSession.outputBytes.collect { bytes ->
             emulator.feed(bytes)
         }
@@ -198,11 +202,14 @@ fun TerminalScreen(
     }
 
     // Start session + optional initCommand.
-    LaunchedEffect(Unit) {
-        if (!terminalSession.isRunning) terminalSession.start(sessionId = sessionId)
+    LaunchedEffect(terminalSession, sessionId, initCommand) {
+        val wasAlreadyRunning = terminalSession.isRunning
+        if (!wasAlreadyRunning) {
+            terminalSession.start(sessionId = sessionId)
+        }
         if (!initCommand.isNullOrBlank()) {
             // Pre-fill at the prompt without newline so the user can review.
-            kotlinx.coroutines.delay(500)
+            if (!wasAlreadyRunning) kotlinx.coroutines.delay(350)
             terminalSession.sendText(initCommand)
         }
     }
@@ -210,10 +217,6 @@ fun TerminalScreen(
     val hasHardwareKeyboard = com.openminis.app.ui.components.rememberHasHardwareKeyboard()
     LaunchedEffect(hasHardwareKeyboard) {
         if (hasHardwareKeyboard) inputController.requestFocus()
-    }
-
-    DisposableEffect(Unit) {
-        onDispose { terminalSession.stop() }
     }
 
     DisposableEffect(Unit) {
@@ -249,15 +252,16 @@ fun TerminalScreen(
                 snippetsExpanded = showSnippetsDrawer,
                 onToggleSnippets = { showSnippetsDrawer = !showSnippetsDrawer },
                 onRestart = {
+                    emulator.scrollOffset = 0
                     emulator.feed("\u001Bc".toByteArray())
-                    terminalSession.start(sessionId = sessionId)
+                    terminalSession.restart(sessionId = sessionId)
                 },
                 onClose = {
-                    terminalSession.stop()
                     onBack()
                 },
                 onClear = {
-                    terminalSession.sendRawBytes(byteArrayOf(0x15))
+                    emulator.scrollOffset = 0
+                    terminalSession.sendRawBytes(byteArrayOf(0x15, 0x0C)) // Ctrl+U then Ctrl+L
                     terminalSession.clearOutput()
                     emulator.feed("\u001Bc".toByteArray())
                 },
@@ -339,7 +343,14 @@ fun TerminalScreen(
                 onPaste = {
                     pasteFromClipboard(context) { text ->
                         emulator.scrollOffset = 0
-                        terminalSession.sendText(text)
+                        if (emulator.bracketedPaste) {
+                            val clean = text.replace("\u001B[200~", "").replace("\u001B[201~", "")
+                            terminalSession.sendRawBytes("\u001B[200~".toByteArray(Charsets.UTF_8))
+                            terminalSession.sendText(clean)
+                            terminalSession.sendRawBytes("\u001B[201~".toByteArray(Charsets.UTF_8))
+                        } else {
+                            terminalSession.sendText(text)
+                        }
                     }
                 },
                 onSendRaw = { bytes ->
@@ -489,14 +500,12 @@ private fun TerminalTopBar(
         Spacer(modifier = Modifier.weight(1f))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (sessionState == TerminalSession.State.STOPPED) {
-                CircularIconButton(
-                    icon = Icons.Default.Refresh,
-                    contentDescription = "Restart Shell",
-                    tint = TerminalAmber,
-                    onClick = onRestart,
-                )
-            }
+            CircularIconButton(
+                icon = Icons.Default.Refresh,
+                contentDescription = "Restart Shell",
+                tint = if (sessionState == TerminalSession.State.STOPPED) TerminalAmber else TerminalFg.copy(alpha = 0.85f),
+                onClick = onRestart,
+            )
             CircularIconButton(
                 icon = Icons.Default.Bolt,
                 contentDescription = "Quick Snippets",

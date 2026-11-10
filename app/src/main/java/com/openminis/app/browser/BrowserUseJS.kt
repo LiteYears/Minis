@@ -160,19 +160,33 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
     fun clickCoordinate(x: Int, y: Int): String = guardedRead("""
         (function() {
             var el = document.elementFromPoint($x, $y);
+            var depth = 0;
+            while (el && el.shadowRoot && el.shadowRoot.elementFromPoint && depth < 10) {
+                var inner = el.shadowRoot.elementFromPoint($x, $y);
+                if (!inner || inner === el) break;
+                el = inner;
+                depth++;
+            }
             if (!el) return JSON.stringify({error: 'No element at ($x, $y)'});
             if (el.disabled) return JSON.stringify({error: 'Element is disabled', tag: el.tagName, x: $x, y: $y});
-            var bOpts = {bubbles: true, cancelable: true, view: window};
-            var nbOpts = {bubbles: false, cancelable: true, view: window};
+            var bOpts = {bubbles: true, cancelable: true, view: window, clientX: $x, clientY: $y};
+            var nbOpts = {bubbles: false, cancelable: true, view: window, clientX: $x, clientY: $y};
+            try {
+                el.dispatchEvent(new PointerEvent('pointerover', bOpts));
+                el.dispatchEvent(new PointerEvent('pointerenter', nbOpts));
+                el.dispatchEvent(new PointerEvent('pointerdown', bOpts));
+                el.dispatchEvent(new PointerEvent('pointerup', bOpts));
+            } catch (e) {}
             el.dispatchEvent(new MouseEvent('mouseover', bOpts));
             el.dispatchEvent(new MouseEvent('mouseenter', nbOpts));
             el.dispatchEvent(new MouseEvent('mousemove', bOpts));
             el.dispatchEvent(new MouseEvent('mousedown', bOpts));
+            if (typeof el.focus === 'function') el.focus();
             el.dispatchEvent(new MouseEvent('mouseup', bOpts));
             el.click();
             el.dispatchEvent(new MouseEvent('mouseleave', nbOpts));
             el.dispatchEvent(new MouseEvent('mouseout', bOpts));
-            return JSON.stringify({clicked: true, tag: el.tagName, x: $x, y: $y, text: (el.innerText || '').substring(0, 100)});
+            return JSON.stringify({clicked: true, tag: el.tagName, x: $x, y: $y, text: (el.innerText || el.value || el.getAttribute('aria-label') || '').substring(0, 100)});
         })()
     """.trimIndent(), requiresBody = false)
 
@@ -198,7 +212,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             var el = queryDeep(document, rawSel);
             if (!el && rawSel) {
                 var needle = rawSel.replace(/^[#.\[\]"']+|[#.\[\]"']+$/g, '').trim().toLowerCase();
-                var inputs = document.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"], [role="searchbox"], [role="combobox"]');
+                var inputs = document.querySelectorAll('input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="searchbox"], [role="combobox"]');
                 for (var i = 0; i < inputs.length; i++) {
                     var inp = inputs[i];
                     var ph = (inp.getAttribute('placeholder') || '').toLowerCase();
@@ -233,6 +247,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                 return JSON.stringify({typed: true, selector: '${jsQuote(selector)}', length: valToSet.length});
             }
             if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                var prevVal = el.value;
                 var nativeSetter = Object.getOwnPropertyDescriptor(
                     el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value'
                 );
@@ -240,6 +255,18 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                     nativeSetter.set.call(el, valToSet);
                 } else {
                     el.value = valToSet;
+                }
+                if (el._valueTracker && typeof el._valueTracker.setValue === 'function') {
+                    try { el._valueTracker.setValue(prevVal); } catch (e) {}
+                }
+            } else if (el.isContentEditable) {
+                var insertedViaExec = false;
+                try {
+                    document.execCommand('selectAll', false, null);
+                    insertedViaExec = document.execCommand('insertText', false, valToSet);
+                } catch (e) {}
+                if (!insertedViaExec) {
+                    el.innerText = valToSet;
                 }
             } else {
                 el.innerText = valToSet;
@@ -443,37 +470,63 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
         val selectorJS = if (selector != null) "'${jsQuote(selector)}'" else "null"
         return guardedRead("""
             (function() {
+                function queryDeep(root, sel) {
+                    try { var f = root.querySelector(sel); if (f) return f; } catch(e) {}
+                    var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                    for (var i = 0; i < all.length; i++) {
+                        if (all[i].shadowRoot) {
+                            var sub = queryDeep(all[i].shadowRoot, sel);
+                            if (sub) return sub;
+                        }
+                    }
+                    return null;
+                }
                 var targetSelector = $selectorJS;
                 var target = null;
                 var scrolledElement = 'window';
                 if (targetSelector) {
-                    target = document.querySelector(targetSelector);
+                    target = queryDeep(document, targetSelector);
                     if (!target) return JSON.stringify({error: 'Element not found: ' + targetSelector});
+                    scrolledElement = targetSelector;
                 } else {
                     var beforeY = window.scrollY;
                     window.scrollBy(0, $pixels);
                     if (window.scrollY !== beforeY) {
-                        var sh = document.documentElement.scrollHeight || document.body.scrollHeight;
+                        var sh = document.documentElement.scrollHeight || (document.body ? document.body.scrollHeight : 0);
                         return JSON.stringify({scrolled: true, element: 'window', direction: '$dir', amount: $amount, scrollY: window.scrollY, scrollHeight: sh, viewportHeight: window.innerHeight});
                     }
-                    var best = null;
-                    var bestArea = 0;
+                    var bestDirectional = null;
+                    var bestDirectionalArea = 0;
+                    var bestAny = null;
+                    var bestAnyArea = 0;
                     function walk(el, depth) {
-                        if (depth > 10) return;
+                        if (!el || depth > 12) return;
+                        if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
                         var children = el.children;
+                        if (!children) return;
                         for (var i = 0; i < children.length; i++) {
                             var child = children[i];
                             var st = window.getComputedStyle(child);
+                            if (st.display === 'none' || st.visibility === 'hidden') continue;
                             var oy = st.overflowY;
-                            if ((oy === 'auto' || oy === 'scroll') && child.scrollHeight > child.clientHeight + 5) {
+                            if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && child.scrollHeight > child.clientHeight + 5) {
                                 var area = child.clientWidth * child.clientHeight;
-                                if (area > bestArea) { best = child; bestArea = area; }
+                                if (area > bestAnyArea) { bestAny = child; bestAnyArea = area; }
+                                var canScrollInDir = ($pixels > 0)
+                                    ? (child.scrollTop + child.clientHeight < child.scrollHeight - 1)
+                                    : (child.scrollTop > 0);
+                                if (canScrollInDir && area > bestDirectionalArea) {
+                                    bestDirectional = child;
+                                    bestDirectionalArea = area;
+                                }
                             }
                             walk(child, depth + 1);
+                            if (child.shadowRoot) walk(child.shadowRoot, depth + 1);
                         }
                     }
-                    walk(document.body, 0);
-                    if (best) { target = best; scrolledElement = best.tagName.toLowerCase(); }
+                    if (document.body) walk(document.body, 0);
+                    var chosen = bestDirectional || bestAny;
+                    if (chosen) { target = chosen; scrolledElement = chosen.tagName.toLowerCase(); }
                     else {
                         document.documentElement.scrollTop += $pixels;
                         return JSON.stringify({scrolled: true, element: 'document.documentElement', direction: '$dir', amount: $amount, scrollY: document.documentElement.scrollTop});
@@ -492,11 +545,34 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
 
     fun hover(selector: String): String = guardedRead("""
         (function() {
-            var el = document.querySelector('${jsQuote(selector)}');
+            var rawSel = '${jsQuote(selector)}';
+            function queryDeep(root, sel) {
+                try { var f = root.querySelector(sel); if (f) return f; } catch(e) {}
+                var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].shadowRoot) {
+                        var sub = queryDeep(all[i].shadowRoot, sel);
+                        if (sub) return sub;
+                    }
+                }
+                return null;
+            }
+            var el = queryDeep(document, rawSel);
             if (!el) return JSON.stringify({error: 'Element not found: ${jsQuote(selector)}'});
-            el.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
-            el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
-            return JSON.stringify({hovered: true, tag: el.tagName, text: (el.innerText || '').substring(0, 100)});
+            try { el.scrollIntoView({block: 'nearest', inline: 'nearest'}); } catch (e) {}
+            var r = el.getBoundingClientRect();
+            var cx = Math.round(r.left + r.width / 2);
+            var cy = Math.round(r.top + r.height / 2);
+            var bOpts = {bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy};
+            var nbOpts = {bubbles: false, cancelable: true, view: window, clientX: cx, clientY: cy};
+            try {
+                el.dispatchEvent(new PointerEvent('pointerover', bOpts));
+                el.dispatchEvent(new PointerEvent('pointerenter', nbOpts));
+            } catch (e) {}
+            el.dispatchEvent(new MouseEvent('mouseenter', nbOpts));
+            el.dispatchEvent(new MouseEvent('mouseover', bOpts));
+            el.dispatchEvent(new MouseEvent('mousemove', bOpts));
+            return JSON.stringify({hovered: true, tag: el.tagName, text: (el.innerText || el.getAttribute('aria-label') || '').substring(0, 100)});
         })()
     """.trimIndent(), requiresBody = false)
 
@@ -1066,8 +1142,19 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
      */
     fun clickMark(mark: Int): String = guardedRead("""
         (function() {
+            function queryDeep(root, sel) {
+                try { var f = root.querySelector(sel); if (f) return f; } catch(e) {}
+                var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].shadowRoot) {
+                        var sub = queryDeep(all[i].shadowRoot, sel);
+                        if (sub) return sub;
+                    }
+                }
+                return null;
+            }
             var el = (window.__minis_som_map__ && window.__minis_som_map__[$mark]) ||
-                     document.querySelector('[data-minis-mark="$mark"]');
+                     queryDeep(document, '[data-minis-mark="$mark"]');
             if (!el) {
                 return JSON.stringify({
                     error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'
@@ -1084,6 +1171,12 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             var cy = Math.round(r.top + r.height / 2);
             var bOpts = {bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy};
             var nbOpts = {bubbles: false, cancelable: true, view: window, clientX: cx, clientY: cy};
+            try {
+                el.dispatchEvent(new PointerEvent('pointerover', bOpts));
+                el.dispatchEvent(new PointerEvent('pointerenter', nbOpts));
+                el.dispatchEvent(new PointerEvent('pointerdown', bOpts));
+                el.dispatchEvent(new PointerEvent('pointerup', bOpts));
+            } catch (e) {}
             el.dispatchEvent(new MouseEvent('mouseover', bOpts));
             el.dispatchEvent(new MouseEvent('mouseenter', nbOpts));
             el.dispatchEvent(new MouseEvent('mousemove', bOpts));
@@ -1109,8 +1202,19 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
      */
     fun typeMark(mark: Int, text: String): String = guardedRead("""
         (function() {
+            function queryDeep(root, sel) {
+                try { var f = root.querySelector(sel); if (f) return f; } catch(e) {}
+                var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].shadowRoot) {
+                        var sub = queryDeep(all[i].shadowRoot, sel);
+                        if (sub) return sub;
+                    }
+                }
+                return null;
+            }
             var el = (window.__minis_som_map__ && window.__minis_som_map__[$mark]) ||
-                     document.querySelector('[data-minis-mark="$mark"]');
+                     queryDeep(document, '[data-minis-mark="$mark"]');
             if (!el) {
                 return JSON.stringify({
                     error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'
@@ -1138,6 +1242,7 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                 return JSON.stringify({typed: true, selector: '[mark=$mark] <SELECT>', mark: $mark, length: valToSet.length});
             }
             if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                var prevVal = el.value;
                 var nativeSetter = Object.getOwnPropertyDescriptor(
                     el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value'
                 );
@@ -1145,6 +1250,18 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                     nativeSetter.set.call(el, valToSet);
                 } else {
                     el.value = valToSet;
+                }
+                if (el._valueTracker && typeof el._valueTracker.setValue === 'function') {
+                    try { el._valueTracker.setValue(prevVal); } catch (e) {}
+                }
+            } else if (el.isContentEditable) {
+                var insertedViaExec = false;
+                try {
+                    document.execCommand('selectAll', false, null);
+                    insertedViaExec = document.execCommand('insertText', false, valToSet);
+                } catch (e) {}
+                if (!insertedViaExec) {
+                    el.innerText = valToSet;
                 }
             } else {
                 el.innerText = valToSet;
@@ -1171,8 +1288,19 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
      */
     fun hoverMark(mark: Int): String = guardedRead("""
         (function() {
+            function queryDeep(root, sel) {
+                try { var f = root.querySelector(sel); if (f) return f; } catch(e) {}
+                var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].shadowRoot) {
+                        var sub = queryDeep(all[i].shadowRoot, sel);
+                        if (sub) return sub;
+                    }
+                }
+                return null;
+            }
             var el = (window.__minis_som_map__ && window.__minis_som_map__[$mark]) ||
-                     document.querySelector('[data-minis-mark="$mark"]');
+                     queryDeep(document, '[data-minis-mark="$mark"]');
             if (!el) {
                 return JSON.stringify({
                     error: 'Set-of-Marks element [$mark] not found on the current page. Call som_snapshot (or screenshot with som=true) to refresh marks first.'
@@ -1181,8 +1309,18 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
             try {
                 el.scrollIntoView({block: 'nearest', inline: 'nearest'});
             } catch (e) {}
-            el.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
-            el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+            var r = el.getBoundingClientRect();
+            var cx = Math.round(r.left + r.width / 2);
+            var cy = Math.round(r.top + r.height / 2);
+            var bOpts = {bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy};
+            var nbOpts = {bubbles: false, cancelable: true, view: window, clientX: cx, clientY: cy};
+            try {
+                el.dispatchEvent(new PointerEvent('pointerover', bOpts));
+                el.dispatchEvent(new PointerEvent('pointerenter', nbOpts));
+            } catch (e) {}
+            el.dispatchEvent(new MouseEvent('mouseenter', nbOpts));
+            el.dispatchEvent(new MouseEvent('mouseover', bOpts));
+            el.dispatchEvent(new MouseEvent('mousemove', bOpts));
             return JSON.stringify({
                 hovered: true,
                 mark: $mark,
@@ -1250,10 +1388,13 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
     """.trimIndent(), requiresBody = false)
 
     /**
-     * Injected at page-start / page-finish to improve website compatibility:
+     * Injected at page-start / page-finish to improve website compatibility and telemetry:
      * - Masks `navigator.webdriver` so standard bot-detection scripts do not block rendering
      * - Ensures `window.chrome` and `navigator.languages` are populated
      * - Neutralizes blocking `window.onbeforeunload` dialogs that could stall navigation
+     * - Installs a bounded ring buffer (`__minis_console_logs__` & `__minis_network_logs__`)
+     *   capturing `console.error`, `console.warn`, uncaught exceptions, unhandled promise
+     *   rejections, and failed `fetch` / `XMLHttpRequest` requests (status >= 400 or network error).
      */
     fun stealthAndCompatibilityShim(): String = """
         (function() {
@@ -1280,8 +1421,105 @@ ${if (requiresBody) BODY_CHECK_JS else ""}
                     configurable: true
                 });
             } catch (e) {}
+            try {
+                var cLogs = window.__minis_console_logs__ = window.__minis_console_logs__ || [];
+                var nLogs = window.__minis_network_logs__ = window.__minis_network_logs__ || [];
+                function pushConsole(level, args) {
+                    try {
+                        var msg = Array.prototype.slice.call(args).map(function(a) {
+                            if (a instanceof Error) return (a.name || 'Error') + ': ' + (a.message || '');
+                            if (typeof a === 'object' && a !== null) {
+                                try { return JSON.stringify(a).substring(0, 240); } catch (e) { return String(a); }
+                            }
+                            return String(a);
+                        }).join(' ').substring(0, 400);
+                        cLogs.push({ level: level, message: msg, ts: Date.now() });
+                        if (cLogs.length > 50) cLogs.shift();
+                    } catch (e) {}
+                }
+                function pushNet(method, url, status, detail) {
+                    try {
+                        nLogs.push({
+                            method: String(method || 'GET').toUpperCase(),
+                            url: String(url || '').substring(0, 260),
+                            status: status || 0,
+                            detail: String(detail || '').substring(0, 200),
+                            ts: Date.now()
+                        });
+                        if (nLogs.length > 50) nLogs.shift();
+                    } catch (e) {}
+                }
+                ['error', 'warn'].forEach(function(lvl) {
+                    var orig = console[lvl];
+                    if (typeof orig === 'function') {
+                        console[lvl] = function() {
+                            pushConsole(lvl, arguments);
+                            return orig.apply(console, arguments);
+                        };
+                    }
+                });
+                window.addEventListener('error', function(ev) {
+                    var msg = (ev && ev.message) ? ev.message : 'Uncaught error';
+                    var loc = (ev && ev.filename) ? (' (' + ev.filename + ':' + (ev.lineno || 0) + ')') : '';
+                    pushConsole('uncaught_error', [msg + loc]);
+                });
+                window.addEventListener('unhandledrejection', function(ev) {
+                    var reason = ev && ev.reason;
+                    pushConsole('unhandled_rejection', [reason ? (reason.message || String(reason)) : 'Promise rejected']);
+                });
+                if (typeof window.fetch === 'function') {
+                    var origFetch = window.fetch;
+                    window.fetch = function(input, init) {
+                        var url = (typeof input === 'string') ? input : (input && input.url ? input.url : String(input));
+                        var method = (init && init.method) || (input && input.method) || 'GET';
+                        return origFetch.apply(this, arguments).then(function(resp) {
+                            if (resp && resp.status >= 400) {
+                                pushNet(method, url, resp.status, resp.statusText || 'HTTP ' + resp.status);
+                            }
+                            return resp;
+                        }, function(err) {
+                            pushNet(method, url, 0, err && err.message ? err.message : String(err));
+                            throw err;
+                        });
+                    };
+                }
+                if (typeof window.XMLHttpRequest === 'function') {
+                    var origOpen = XMLHttpRequest.prototype.open;
+                    var origSend = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.open = function(method, url) {
+                        this.__minis_method = method;
+                        this.__minis_url = url;
+                        return origOpen.apply(this, arguments);
+                    };
+                    XMLHttpRequest.prototype.send = function() {
+                        var xhr = this;
+                        xhr.addEventListener('loadend', function() {
+                            if (xhr.status >= 400 || xhr.status === 0) {
+                                pushNet(xhr.__minis_method || 'GET', xhr.__minis_url || '', xhr.status, xhr.statusText || (xhr.status === 0 ? 'Network/CORS error' : ''));
+                            }
+                        });
+                        return origSend.apply(this, arguments);
+                    };
+                }
+            } catch (e) {}
         })();
     """.trimIndent()
+
+    /**
+     * Reads captured console errors/warnings and failed network requests from the current page.
+     */
+    fun getConsoleAndNetworkLogs(): String = guardedRead("""
+        (function() {
+            var cLogs = (window.__minis_console_logs__ || []).slice(-40);
+            var nLogs = (window.__minis_network_logs__ || []).slice(-40);
+            return JSON.stringify({
+                url: String(location.href || ''),
+                title: String(document.title || ''),
+                consoleLogs: cLogs,
+                networkErrors: nLogs
+            });
+        })()
+    """.trimIndent(), requiresBody = false)
 }
 
 // BEGIN BrowserJSResult

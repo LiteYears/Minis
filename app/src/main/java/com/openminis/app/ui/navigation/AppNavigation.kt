@@ -1399,7 +1399,7 @@ fun AppNavigation(
             val context = androidx.compose.ui.platform.LocalContext.current
             val initCommand = backStackEntry.arguments?.getString("initCommand")
             val sessionId = backStackEntry.arguments?.getString("sessionId")
-            val session = remember { TerminalSession(context.applicationContext) }
+            val session = remember(sessionId) { TerminalSession.getOrCreate(context.applicationContext, sessionId) }
             TerminalScreen(
                 terminalSession = session,
                 onBack = { navController.safePopBackStack() },

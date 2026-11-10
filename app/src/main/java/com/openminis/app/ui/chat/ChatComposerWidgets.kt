@@ -734,10 +734,28 @@ private fun ToolPreviewThumbnail(
 
             "file_edit" -> {
                 // iOS: diff preview — old lines in red, new lines in green
+                val editsArr = args.optJSONArray("edits")
+                val isUndo = args.optBoolean("undo", false)
                 val oldStr = args.optString("old_string", "")
                     .ifEmpty { extractPartialJsonString("old_string", block.toolArgs) ?: "" }
+                    .ifEmpty {
+                        if (editsArr != null && editsArr.length() > 0) {
+                            (0 until editsArr.length()).mapNotNull { i ->
+                                editsArr.optJSONObject(i)?.optString("old_string", "")?.takeIf { it.isNotEmpty() }
+                            }.joinToString("\n")
+                        } else ""
+                    }
                 val newStr = args.optString("new_string", "")
                     .ifEmpty { extractPartialJsonString("new_string", block.toolArgs) ?: "" }
+                    .ifEmpty {
+                        if (editsArr != null && editsArr.length() > 0) {
+                            (0 until editsArr.length()).mapNotNull { i ->
+                                editsArr.optJSONObject(i)?.optString("new_string", "")?.takeIf { it.isNotEmpty() }
+                            }.joinToString("\n")
+                        } else if (isUndo) {
+                            "Revert to previous snapshot"
+                        } else ""
+                    }
                 Column(modifier = Modifier.padding(horizontal = 6.dp, vertical = 5.dp)) {
                     if (oldStr.isNotEmpty()) {
                         remember(oldStr) { ToolTextTail.lastLines(oldStr, 5).lines() }.forEach { line ->

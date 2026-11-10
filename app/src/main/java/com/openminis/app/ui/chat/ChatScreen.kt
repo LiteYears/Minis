@@ -1909,6 +1909,11 @@ fun ChatScreen(
 
     val performSendOrEnqueueNow: (String) -> Unit = handler@{ rawText ->
         if (viewModel.tryExecuteInputAsSlashCommand(rawText)) {
+            inputFieldValue = androidx.compose.ui.text.input.TextFieldValue(
+                text = "",
+                selection = androidx.compose.ui.text.TextRange.Zero,
+                composition = null,
+            )
             viewModel.setInputText("")
             releaseComposerAfterSend()
             return@handler
@@ -1928,6 +1933,11 @@ fun ChatScreen(
         // proper terminal exit: nothing is left to restore. The dismiss and
         // command-row paths keep their own restore behaviour untouched.
         viewModel.endSlashSessionForSend()
+        inputFieldValue = androidx.compose.ui.text.input.TextFieldValue(
+            text = "",
+            selection = androidx.compose.ui.text.TextRange.Zero,
+            composition = null,
+        )
         viewModel.setInputText("")
         releaseComposerAfterSend()
         viewModel.sendMessage(rawText)
@@ -6265,6 +6275,15 @@ fun ChatScreen(
                             var claimed = false
                             var lastPos = down.position
                             verticalDrag(down.id) { change ->
+                                if (!claimed && change.isConsumed) return@verticalDrag
+                                val currentDraft = viewModel.inputText.value
+                                if (!claimed && inputFocused &&
+                                    (currentDraft.count { it == '\n' } >= 3 || currentDraft.length > 180)
+                                ) {
+                                    // Allow the user to vertically scroll inside a multiline prompt
+                                    // without accidentally triggering swipe-to-send.
+                                    return@verticalDrag
+                                }
                                 val delta = change.positionChange()
                                 totalDx += delta.x
                                 totalDy += delta.y
@@ -6891,36 +6910,9 @@ fun ChatScreen(
                         // onSend; this lambda is the single source of
                         // truth for what "press Enter to send" means.
                         val performEnterSend: () -> Boolean = handler@{
-                            // [T-voice-send-waits-for-asr] Same gate as the
-                            // button: finish owed voice text first.
                             if (deferSendUntilVoiceFinished()) return@handler true
                             if (inputText.isBlank() && attachments.isEmpty()) return@handler false
-                            // Intercept slash commands so "/compact" et al.
-                            // run locally instead of being sent as a chat
-                            // turn. Mirrors iOS performSend().
-                            if (viewModel.tryExecuteInputAsSlashCommand(inputText)) {
-                                viewModel.setInputText("")
-                                releaseComposerAfterSend()
-                                return@handler true
-                            }
-                            // T160: snapshot → clear state + IME →
-                            // sendMessage. Same ordering as the send-
-                            // button click; finishComposingText fires
-                            // when focus drops so any IME composing
-                            // buffer is committed/dropped before the
-                            // empty inputText becomes visible.
-                            val toSend = inputText
-                            lastSendTimeMs = System.currentTimeMillis()
-                            viewModel.setInputText("")
-                            releaseComposerAfterSend()
-                            viewModel.sendMessage(toSend)
-                            noteSendForInputModePref()
-                            userScrolledAway = false
-                            coroutineScope.launch {
-                                tracedScrollToItem("SEND-PATH(keyboard-imeAction)/initial", 0, 0)
-                                kotlinx.coroutines.delay(100)
-                                tracedScrollToItem("SEND-PATH(keyboard-imeAction)/settle", 0, 0)
-                            }
+                            performSendOrEnqueueNow(inputText)
                             true
                         }
                         BasicTextField(
@@ -7153,7 +7145,7 @@ fun ChatScreen(
                                             // way. This one HAS a selection
                                             // cursor, so Tab takes the selected
                                             // row rather than the first.
-                                            Key.Enter, Key.Tab -> {
+                                            Key.Enter, Key.NumPadEnter, Key.Tab -> {
                                                 val result = viewModel.executeSelectedMention(
                                                     currentText = inputFieldValue.text,
                                                     currentCaret = inputFieldValue.selection.end,
@@ -7190,21 +7182,24 @@ fun ChatScreen(
                                     // (Appearance → Return Key, default Newline =
                                     // iOS shipping default). Shift+Enter always
                                     // inserts a newline regardless of the setting,
-                                    // mirroring iOS hardware-keyboard semantics.
+                                    // and Ctrl+Enter / Cmd+Enter always sends on a
+                                    // hardware keyboard.
                                     // [T-android-enter-to-send-broken] Hardware-
                                     // keyboard path. Soft IME route goes through
                                     // KeyboardActions.onSend below.
+                                    val isEnterKey = event.key == Key.Enter || event.key == Key.NumPadEnter
+                                    val isCtrlOrMetaSend = event.nativeKeyEvent.isCtrlPressed || event.nativeKeyEvent.isMetaPressed
                                     if (event.type == KeyEventType.KeyDown &&
-                                        event.key == Key.Enter &&
+                                        isEnterKey &&
                                         !event.isShiftPressed &&
-                                        sendOnEnter
+                                        (sendOnEnter || isCtrlOrMetaSend)
                                     ) {
                                         performEnterSend()
                                     } else false
                                 },
                             textStyle = mergedTextStyle,
                             cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
-                            maxLines = 6,
+                            maxLines = 8,
                             // [T-android-enter-to-send-broken] When the
                             // user has Return-Key=Send turned on, ask the
                             // IME for the Send action so it (a) shows the

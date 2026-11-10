@@ -30,6 +30,7 @@ object SubAgentSwarm {
         val url: String?,
         val agentName: String?,
         val modelChoice: SubAgentModelChoice,
+        val outputFiles: List<String> = emptyList(),
     )
 
     data class SwarmArgs(
@@ -61,6 +62,7 @@ object SubAgentSwarm {
         val summary: String,
         val result: String,
         val errorDetail: String? = null,
+        val verifiedFiles: List<String> = emptyList(),
     ) {
         fun toJsonObject(): JSONObject = JSONObject().apply {
             put("worker_id", workerId)
@@ -83,6 +85,7 @@ object SubAgentSwarm {
             if (summary.isNotEmpty()) put("summary", summary)
             if (result.isNotEmpty()) put("result", result)
             if (!errorDetail.isNullOrEmpty()) put("error_detail", errorDetail)
+            if (verifiedFiles.isNotEmpty()) put("verified_files", JSONArray(verifiedFiles))
         }
     }
 
@@ -187,6 +190,14 @@ object SubAgentSwarm {
                         } else {
                             SubAgentModelChoice.parse(workerChoiceStr)
                         }
+                        val outFilesArr = item.optJSONArray("output_files") ?: item.optJSONArray("expected_files")
+                        val outFiles = mutableListOf<String>()
+                        if (outFilesArr != null) {
+                            for (fi in 0 until outFilesArr.length()) {
+                                val fPath = outFilesArr.optString(fi, "").trim()
+                                if (fPath.isNotEmpty()) outFiles.add(fPath)
+                            }
+                        }
                         parsedWorkers.add(
                             SwarmWorkerSpec(
                                 id = rawId,
@@ -196,6 +207,7 @@ object SubAgentSwarm {
                                 url = url,
                                 agentName = agentName,
                                 modelChoice = workerChoice,
+                                outputFiles = outFiles,
                             )
                         )
                     }
@@ -231,8 +243,8 @@ object SubAgentSwarm {
 
     /**
      * Build the prompt sent to an individual swarm worker, including its
-     * isolated working directory, dedicated browser tab ID, optional pre-opened
-     * URL, and any shared context from the orchestrator.
+     * isolated working directory, shared swarm handoff directory, dedicated
+     * browser tab ID, optional pre-opened URL, and any shared context.
      */
     fun buildWorkerPrompt(
         spec: SwarmWorkerSpec,
@@ -243,9 +255,15 @@ object SubAgentSwarm {
         workerIndex: Int,
         policy: com.openminis.app.agent.ContextInstructionPolicy = com.openminis.app.agent.ContextInstructionPolicy.STANDARD,
     ): String {
+        val swarmRootDir = workdir.substringBeforeLast('/', workdir)
+        val sharedDir = "$swarmRootDir/shared"
         val sb = StringBuilder()
         sb.append("[Swarm Worker ${workerIndex + 1} of $totalWorkers — ID: ${spec.id} (\"${spec.title}\")]\n")
         sb.append("- Isolated Working Directory: `$workdir` (All `shell_execute` commands start here automatically, and `\$MINIS_WORKER_DIR` is set to `$workdir`. Write all scripts, intermediate files, and outputs inside `$workdir` so you never collide with sibling workers.)\n")
+        sb.append("- Shared Swarm Handoff Directory: `$sharedDir` (Use `$sharedDir` to read or publish cross-worker artifacts/schemas when coordinating across sibling workers.)\n")
+        if (spec.outputFiles.isNotEmpty()) {
+            sb.append("- Required Output Files: ${spec.outputFiles.joinToString(", ") { "`$it`" }} (Ensure these files exist and are non-empty before completing your turn.)\n")
+        }
         if (tabId != null && tabId >= 0) {
             if (!spec.url.isNullOrEmpty()) {
                 sb.append("- Dedicated Browser Tab: `tab_id: $tabId` (Pre-allocated for you and already navigating to `${spec.url}`. Pass `tab_id: $tabId` on your `browser_use` calls to inspect or interact with it immediately.)\n")
@@ -357,7 +375,7 @@ object SubAgentSwarm {
             if (timedOut > 0) append(" ($timedOut timed out)")
             if (failed > 0) append(" ($failed failed)")
             append(" in ").append(elapsedMs / 1000L).append("s\n")
-            append("- **Swarm Workspace**: `").append(swarmRootDir).append("`\n")
+            append("- **Swarm Workspace**: `").append(swarmRootDir).append("` (Shared Dir: `").append(swarmRootDir).append("/shared`)\n")
             if (tabsAllocated.isNotEmpty()) {
                 append("- **Isolated Browser Tabs Used**: ").append(tabsAllocated.joinToString(", ") { "#$it" }).append(" (released)\n")
             }
@@ -382,7 +400,11 @@ object SubAgentSwarm {
                     append(" · **Model**: `").append(w.modelUsed).append("`")
                 }
                 append(" · **Turns**: ").append(w.turns)
-                append(" · **Elapsed**: ").append(w.elapsedMs / 1000L).append("s\n\n")
+                append(" · **Elapsed**: ").append(w.elapsedMs / 1000L).append("s\n")
+                if (w.verifiedFiles.isNotEmpty()) {
+                    append("- **Output Files**: ").append(w.verifiedFiles.joinToString(", ")).append("\n")
+                }
+                append("\n")
                 val body = w.result.trim().ifEmpty {
                     w.errorDetail?.let { "Error: $it" } ?: "(No deliverable text returned)"
                 }

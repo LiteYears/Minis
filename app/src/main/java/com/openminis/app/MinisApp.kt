@@ -236,23 +236,27 @@ class MinisApp : Application(), ImageLoaderFactory {
         // writes filesDir/logs/crash-<stamp>.log — same dir + .log extension
         // that AppLogger.listLogFiles already filters for, so reports surface
         // in LogManagementScreen with no extra UI.
-        ACRA.init(
-            this,
-            CoreConfigurationBuilder()
-                .withBuildConfigClass(BuildConfig::class.java)
-                .withReportFormat(StringFormat.JSON)
-                .withLogcatArguments(listOf("-t", "200", "-v", "time"))
-                .withReportContent(
-                    ReportField.APP_VERSION_NAME,
-                    ReportField.APP_VERSION_CODE,
-                    ReportField.ANDROID_VERSION,
-                    ReportField.BUILD,
-                    ReportField.PHONE_MODEL,
-                    ReportField.BRAND,
-                    ReportField.STACK_TRACE,
-                    ReportField.LOGCAT,
-                ),
-        )
+        runCatching {
+            ACRA.init(
+                this,
+                CoreConfigurationBuilder()
+                    .withBuildConfigClass(BuildConfig::class.java)
+                    .withReportFormat(StringFormat.JSON)
+                    .withLogcatArguments(listOf("-t", "200", "-v", "time"))
+                    .withReportContent(
+                        ReportField.APP_VERSION_NAME,
+                        ReportField.APP_VERSION_CODE,
+                        ReportField.ANDROID_VERSION,
+                        ReportField.BUILD,
+                        ReportField.PHONE_MODEL,
+                        ReportField.BRAND,
+                        ReportField.STACK_TRACE,
+                        ReportField.LOGCAT,
+                    ),
+            )
+        }.onFailure { e ->
+            Log.w("MinisApp", "ACRA.init skipped: ${e.message}")
+        }
     }
 
     @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)

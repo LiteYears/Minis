@@ -1213,12 +1213,12 @@ internal object ForegroundCommandGroup {
 
     /**
      * [T-android-fresh-exit-status-file] See [wrapForFreshProcess]. `$1` is the
-     * command, `$2` the status path. The inner `/bin/sh -c "$1"` means an
+     * command, `$2` the status path. The inner `sh -c "$1"` means an
      * `exit N` in the command ends only the command, and the status is still
      * written; a command killed by a signal reports 128+N, as a shell would.
      */
     const val FRESH_RUNNER =
-        "printf '%s' \"\$\$\" > \"\$2.pid\"; /bin/sh -c \"\$1\"; rc=\$?; printf '%s' \"\$rc\" > \"\$2\"; exit \$rc"
+        "printf '%s' \"\$\$\" > \"\$2.pid\"; sh -c \"\$1\"; rc=\$?; printf '%s' \"\$rc\" > \"\$2\"; exit \$rc"
 
     /** Marker the wrapper prints so the host can learn the group id. */
     fun pgidMarkerPrefix(marker: String): String = "__MINIS_PGID_${marker}_"
@@ -1548,7 +1548,9 @@ internal class FreshProcessShell(
             val hostStatusPath = File(rootfsManager.rootfsDir, statusGuestPath.removePrefix("/")).absolutePath
             val wrapped = ForegroundCommandGroup.wrapForFreshProcess(command, hostStatusPath)
             cmd.add("/system/bin/sh")
-            cmd.addAll(wrapped.drop(1))
+            // Drop both SETSID ("/usr/bin/setsid") and "/bin/sh" from wrapped so
+            // /system/bin/sh receives ["-c", FRESH_RUNNER, "sh", command, hostStatusPath]
+            cmd.addAll(wrapped.drop(2))
         }
 
         val debugOffload = com.openminis.app.BuildConfig.DEV_TOOLS

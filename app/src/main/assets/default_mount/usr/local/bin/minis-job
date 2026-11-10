@@ -1,0 +1,281 @@
+#!/bin/sh
+# minis-job — Background Job & Service Supervisor for Minis Computer (Alpine PRoot)
+# Usage:
+#   minis-job start [--name <label>] [--cwd <dir>] <command...>
+#   minis-job list
+#   minis-job status <job_id>
+#   minis-job logs <job_id> [lines]
+#   minis-job stop <job_id>
+#   minis-job clean
+
+set -e
+
+JOBS_DIR="/tmp/minis-jobs"
+mkdir -p "$JOBS_DIR"
+
+usage() {
+    cat <<'EOF'
+Usage: minis-job <subcommand> [args]
+
+Subcommands:
+  start [--name <label>] [--cwd <dir>] <cmd...>  Start a detached background job
+  list                                           List all tracked background jobs
+  status <job_id>                                Show job status and recent output
+  logs <job_id> [lines]                          Show last N lines of job log (default: 80)
+  stop <job_id>                                  Stop a running background job
+  clean                                          Remove finished jobs and their logs
+EOF
+}
+
+is_pid_alive() {
+    pid="$1"
+    if [ -z "$pid" ]; then
+        return 1
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    if [ -d "/proc/$pid" ]; then
+        return 0
+    fi
+    return 1
+}
+
+read_meta_field() {
+    meta_file="$1"
+    key="$2"
+    if [ -f "$meta_file" ]; then
+        grep "^${key}=" "$meta_file" 2>/dev/null | head -n 1 | cut -d'=' -f2-
+    fi
+}
+
+cmd_start() {
+    job_name=""
+    job_cwd="$(pwd)"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name|-n)
+                job_name="$2"
+                shift 2
+                ;;
+            --cwd|-C)
+                job_cwd="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ $# -eq 0 ]; then
+        echo "Error: 'minis-job start' requires a command to run." >&2
+        usage >&2
+        exit 1
+    fi
+
+    cmd_str="$*"
+    if [ $# -eq 1 ]; then
+        exec_line="$1"
+    else
+        exec_line=""
+        for arg in "$@"; do
+            escaped="$(printf "%s" "$arg" | sed "s/'/'\\\\''/g")"
+            exec_line="$exec_line '$escaped'"
+        done
+    fi
+    ts="$(date +%s 2>/dev/null || echo 0)"
+    rand="$(awk 'BEGIN{srand(); printf "%04d", int(rand()*10000)}' 2>/dev/null || echo $$)"
+    job_id="job_${ts}_${rand}"
+    if [ -z "$job_name" ]; then
+        job_name="$(printf '%s' "$cmd_str" | awk '{print $1}' | tr -cd 'a-zA-Z0-9._-')"
+        [ -z "$job_name" ] && job_name="bg"
+    fi
+
+    log_file="$JOBS_DIR/${job_id}.log"
+    meta_file="$JOBS_DIR/${job_id}.meta"
+    exit_file="$JOBS_DIR/${job_id}.exit"
+    runner_file="$JOBS_DIR/${job_id}.run.sh"
+
+    cat > "$runner_file" <<EOF
+#!/bin/sh
+cd "$job_cwd" || exit 1
+$exec_line
+rc=\$?
+echo "\$rc" > "$exit_file"
+exit \$rc
+EOF
+    chmod +x "$runner_file"
+
+    nohup /bin/sh "$runner_file" > "$log_file" 2>&1 < /dev/null &
+    bg_pid=$!
+
+    cat > "$meta_file" <<EOF
+ID=$job_id
+PID=$bg_pid
+NAME=$job_name
+CWD=$job_cwd
+STARTED_AT=$ts
+CMD=$cmd_str
+EOF
+
+    echo "Started background job: $job_id"
+    echo "  PID:  $bg_pid"
+    echo "  Name: $job_name"
+    echo "  CWD:  $job_cwd"
+    echo "  Log:  $log_file"
+    echo "  Cmd:  $cmd_str"
+}
+
+cmd_list() {
+    found=0
+    printf "%-20s %-10s %-8s %-14s %s\n" "JOB_ID" "STATUS" "PID" "NAME" "COMMAND"
+    printf "%-20s %-10s %-8s %-14s %s\n" "--------------------" "----------" "--------" "--------------" "------------------------------"
+    for meta in "$JOBS_DIR"/*.meta; do
+        [ -f "$meta" ] || continue
+        found=1
+        id="$(read_meta_field "$meta" "ID")"
+        pid="$(read_meta_field "$meta" "PID")"
+        name="$(read_meta_field "$meta" "NAME")"
+        cmd="$(read_meta_field "$meta" "CMD")"
+        exit_file="$JOBS_DIR/${id}.exit"
+        if is_pid_alive "$pid"; then
+            status="running"
+        elif [ -f "$exit_file" ]; then
+            rc="$(cat "$exit_file" 2>/dev/null || echo "?")"
+            status="exit($rc)"
+        else
+            status="stopped"
+        fi
+        short_cmd="$(printf '%s' "$cmd" | cut -c1-50)"
+        printf "%-20s %-10s %-8s %-14s %s\n" "$id" "$status" "$pid" "$name" "$short_cmd"
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "(No background jobs recorded in $JOBS_DIR)"
+    fi
+}
+
+cmd_status() {
+    job_id="$1"
+    if [ -z "$job_id" ]; then
+        echo "Error: job_id required (e.g. minis-job status <job_id>)" >&2
+        exit 1
+    fi
+    meta="$JOBS_DIR/${job_id}.meta"
+    log_file="$JOBS_DIR/${job_id}.log"
+    exit_file="$JOBS_DIR/${job_id}.exit"
+    if [ ! -f "$meta" ]; then
+        echo "Error: Job '$job_id' not found." >&2
+        exit 1
+    fi
+    pid="$(read_meta_field "$meta" "PID")"
+    name="$(read_meta_field "$meta" "NAME")"
+    cwd="$(read_meta_field "$meta" "CWD")"
+    cmd="$(read_meta_field "$meta" "CMD")"
+    if is_pid_alive "$pid"; then
+        status="running"
+    elif [ -f "$exit_file" ]; then
+        status="exited (code $(cat "$exit_file" 2>/dev/null || echo "?"))"
+    else
+        status="stopped"
+    fi
+    echo "Job:    $job_id ($name)"
+    echo "Status: $status"
+    echo "PID:    $pid"
+    echo "CWD:    $cwd"
+    echo "Cmd:    $cmd"
+    echo "Log:    $log_file"
+    if [ -f "$log_file" ]; then
+        echo "--- Last 10 log lines ---"
+        tail -n 10 "$log_file" 2>/dev/null || true
+    fi
+}
+
+cmd_logs() {
+    job_id="$1"
+    lines="${2:-80}"
+    if [ -z "$job_id" ]; then
+        echo "Error: job_id required (e.g. minis-job logs <job_id> [lines])" >&2
+        exit 1
+    fi
+    log_file="$JOBS_DIR/${job_id}.log"
+    if [ ! -f "$log_file" ]; then
+        echo "Error: Log file not found for job '$job_id' ($log_file)" >&2
+        exit 1
+    fi
+    tail -n "$lines" "$log_file"
+}
+
+cmd_stop() {
+    job_id="$1"
+    if [ -z "$job_id" ]; then
+        echo "Error: job_id required (e.g. minis-job stop <job_id>)" >&2
+        exit 1
+    fi
+    meta="$JOBS_DIR/${job_id}.meta"
+    if [ ! -f "$meta" ]; then
+        echo "Error: Job '$job_id' not found." >&2
+        exit 1
+    fi
+    pid="$(read_meta_field "$meta" "PID")"
+    if is_pid_alive "$pid"; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        if is_pid_alive "$pid"; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        echo "Stopped job $job_id (PID $pid)."
+    else
+        echo "Job $job_id (PID $pid) is already stopped."
+    fi
+}
+
+cmd_clean() {
+    removed=0
+    for meta in "$JOBS_DIR"/*.meta; do
+        [ -f "$meta" ] || continue
+        id="$(read_meta_field "$meta" "ID")"
+        pid="$(read_meta_field "$meta" "PID")"
+        if ! is_pid_alive "$pid"; then
+            rm -f "$JOBS_DIR/${id}.meta" "$JOBS_DIR/${id}.log" "$JOBS_DIR/${id}.exit" "$JOBS_DIR/${id}.run.sh"
+            removed=$((removed + 1))
+        fi
+    done
+    echo "Cleaned $removed finished background job(s)."
+}
+
+subcmd="${1:-list}"
+[ $# -gt 0 ] && shift
+
+case "$subcmd" in
+    start|run)
+        cmd_start "$@"
+        ;;
+    list|ls)
+        cmd_list
+        ;;
+    status|info)
+        cmd_status "$@"
+        ;;
+    logs|log|tail)
+        cmd_logs "$@"
+        ;;
+    stop|kill)
+        cmd_stop "$@"
+        ;;
+    clean|prune)
+        cmd_clean
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Unknown subcommand: $subcmd" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

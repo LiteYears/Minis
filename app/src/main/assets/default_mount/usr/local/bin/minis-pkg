@@ -1,0 +1,142 @@
+#!/bin/sh
+# minis-pkg — One-Command Toolchain Profile Installer & Persistent Cache Manager
+# Usage:
+#   minis-pkg list
+#   minis-pkg status
+#   minis-pkg install <pack...>   (packs: core, data, web, net, media)
+
+set -e
+
+CACHE_ROOT="/var/minis/shared/.pkg-cache"
+APK_CACHE_DIR="$CACHE_ROOT/apk"
+PIP_CACHE_DIR="$CACHE_ROOT/pip"
+
+ensure_cache_dirs() {
+    mkdir -p "$APK_CACHE_DIR" "$PIP_CACHE_DIR" 2>/dev/null || true
+    export PIP_CACHE_DIR
+}
+
+usage() {
+    cat <<'EOF'
+Usage: minis-pkg <subcommand> [packs...]
+
+Subcommands:
+  list                  List available toolchain profile packs
+  status                Show installed toolchain binaries and persistent cache size
+  install <pack...>     Install one or more profile packs using persistent cache
+
+Available Profile Packs:
+  core   git, curl, jq, ripgrep (rg), fd, tree, bash, unzip, zip, file
+  data   python3, py3-pip, sqlite, sqlite-dev
+  web    nodejs, npm
+  net    openssh-client, bind-tools (dig/nslookup), socat, netcat-openbsd, openssl
+  media  ffmpeg, imagemagick
+EOF
+}
+
+pack_packages() {
+    case "$1" in
+        core)
+            echo "git curl jq ripgrep fd tree bash unzip zip file"
+            ;;
+        data)
+            echo "python3 py3-pip sqlite"
+            ;;
+        web)
+            echo "nodejs npm"
+            ;;
+        net)
+            echo "openssh-client bind-tools socat netcat-openbsd openssl"
+            ;;
+        media)
+            echo "ffmpeg imagemagick"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+cmd_list() {
+    cat <<'EOF'
+Minis Computer Toolchain Profile Packs:
+  core   -> git, curl, jq, ripgrep, fd, tree, bash, unzip, zip, file
+  data   -> python3, py3-pip, sqlite
+  web    -> nodejs, npm
+  net    -> openssh-client, bind-tools, socat, netcat-openbsd, openssl
+  media  -> ffmpeg, imagemagick
+
+Install example:
+  minis-pkg install core data
+EOF
+}
+
+cmd_status() {
+    ensure_cache_dirs
+    echo "Minis Toolchain Status:"
+    for bin in git curl jq rg fd python3 pip3 sqlite3 node npm ssh dig nc socat openssl ffmpeg convert; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            loc="$(command -v "$bin")"
+            printf "  [installed] %-10s (%s)\n" "$bin" "$loc"
+        else
+            printf "  [missing]   %-10s\n" "$bin"
+        fi
+    done
+    if [ -d "$CACHE_ROOT" ]; then
+        cache_size="$(du -sh "$CACHE_ROOT" 2>/dev/null | awk '{print $1}' || echo "0")"
+        echo "Persistent Package Cache ($CACHE_ROOT): $cache_size"
+    fi
+}
+
+cmd_install() {
+    if [ $# -eq 0 ]; then
+        echo "Error: Specify at least one profile pack (core, data, web, net, media)." >&2
+        usage >&2
+        exit 1
+    fi
+    ensure_cache_dirs
+    pkgs=""
+    for pack in "$@"; do
+        resolved="$(pack_packages "$pack")"
+        if [ -z "$resolved" ]; then
+            # Allow direct apk package names as well
+            pkgs="$pkgs $pack"
+        else
+            echo "[minis-pkg] Queuing pack '$pack': $resolved"
+            pkgs="$pkgs $resolved"
+        fi
+    done
+
+    if ! command -v apk >/dev/null 2>&1; then
+        echo "Error: 'apk' package manager is not available in this shell mode." >&2
+        exit 1
+    fi
+
+    echo "[minis-pkg] Installing packages (cache: $APK_CACHE_DIR)..."
+    # shellcheck disable=SC2086
+    apk add --cache-dir "$APK_CACHE_DIR" $pkgs
+    echo "[minis-pkg] Done."
+}
+
+subcmd="${1:-list}"
+[ $# -gt 0 ] && shift
+
+case "$subcmd" in
+    list|ls)
+        cmd_list
+        ;;
+    status|info)
+        cmd_status
+        ;;
+    install|add)
+        cmd_install "$@"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Unknown subcommand: $subcmd" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

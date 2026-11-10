@@ -32,7 +32,7 @@ class AnsiParser {
     private var csiIntermediate: Char? = null
 
     private var oscCommand = 0
-    private var oscPayload = StringBuilder()
+    private val oscPayload = java.io.ByteArrayOutputStream()
 
     private val utf8Buffer = ByteArray(4)
     private var utf8Len = 0
@@ -49,7 +49,7 @@ class AnsiParser {
         hasParam = false
         csiIntermediate = null
         oscCommand = 0
-        oscPayload.setLength(0)
+        oscPayload.reset()
         utf8Len = 0
         utf8Remaining = 0
     }
@@ -116,7 +116,7 @@ class AnsiParser {
             0x5D -> { // ]
                 state = State.OSC_PARAM
                 oscCommand = 0
-                oscPayload.setLength(0)
+                oscPayload.reset()
             }
             in 0x20..0x2F -> {
                 state = State.ESCAPE_INTERMEDIATE
@@ -231,11 +231,11 @@ class AnsiParser {
             }
             0x3B -> state = State.OSC_STRING
             0x07 -> {
-                action(ParsedAction.OscDispatch(oscCommand, oscPayload.toString()))
+                action(ParsedAction.OscDispatch(oscCommand, oscPayload.toByteArray().toString(Charsets.UTF_8)))
                 state = State.GROUND
             }
             0x1B -> {
-                action(ParsedAction.OscDispatch(oscCommand, oscPayload.toString()))
+                action(ParsedAction.OscDispatch(oscCommand, oscPayload.toByteArray().toString(Charsets.UTF_8)))
                 state = State.ESCAPE
             }
             else -> state = State.GROUND
@@ -245,15 +245,17 @@ class AnsiParser {
     private fun processOscString(byte: Int, action: (ParsedAction) -> Unit) {
         when (byte) {
             0x07 -> {
-                action(ParsedAction.OscDispatch(oscCommand, oscPayload.toString()))
+                action(ParsedAction.OscDispatch(oscCommand, oscPayload.toByteArray().toString(Charsets.UTF_8)))
                 state = State.GROUND
             }
             0x1B -> {
-                action(ParsedAction.OscDispatch(oscCommand, oscPayload.toString()))
+                action(ParsedAction.OscDispatch(oscCommand, oscPayload.toByteArray().toString(Charsets.UTF_8)))
                 state = State.ESCAPE
             }
             in 0x20..0x7E, in 0x80..0xFF -> {
-                oscPayload.append(byte.toChar())
+                if (oscPayload.size() < 8192) {
+                    oscPayload.write(byte)
+                }
             }
             else -> { /* ignore */ }
         }

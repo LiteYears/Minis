@@ -1,2 +1,11 @@
-862d0f7170f51b5db0599737df36606a0301e874c70a1b5570369cdb4cc9613c  apk/app-debug.apk
-Built at: 2026-10-31T12:19:18Z
+App Name: Minis
+Package ID: com.openminis.app
+Version: 1.15 (versionCode 37)
+APK File: .build-outputs/app-debug.apk (mirrored at apk/app-debug.apk)
+File Size: 66,381,382 bytes (63.31 MiB / 66.38 MB)
+SHA-256: d6072ae1f9771156af2f5f36895c15489392d1aabd34990e0fee52d27d8411f4
+MD5: 21e34066d6de618907942acdb6abeea1
+Signing: APK Signature Scheme v2 + v3 (debug.keystore / androiddebugkey)
+Zip Alignment: 4-byte (resources.arsc) & 4096-byte (uncompressed .so), 0 zipflinger virtual holes
+Direct Download URL: https://kappa.lol/etbRRE.apk (Landing: https://kappa.lol/etbRRE)
+Note on temp.sh: https://temp.sh/upload is currently returning HTTP 500 Internal Server Error (nginx/1.30.3 upstream outage) for all uploads; hosted on kappa.lol direct mirror.

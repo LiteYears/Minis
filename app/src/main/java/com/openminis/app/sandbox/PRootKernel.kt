@@ -140,20 +140,28 @@ object PRootKernel {
         // LD_LIBRARY_PATH for the extracted native libs. talloc used to be
         // staged here under a versioned name; deps/build_proot.sh now links it
         // statically, so only the native lib dir is needed.
-        nativeLibDir = rootfsManager.nativeLibDir.absolutePath
+        val activeNativeDir = rootfsManager.effectiveNativeLibDir
+        nativeLibDir = activeNativeDir.absolutePath
 
         // PROOT_LOADER / PROOT_LOADER_32 overrides. The loader is bundled into
         // the proot binary (extracted via /proc/self/fd at runtime), so these
         // files normally do not exist — kept only to honour a side-loaded
         // loader if one is present.
-        val loaderPath = File(rootfsManager.nativeLibDir, "libproot-loader.so")
-        val loader32Path = File(rootfsManager.nativeLibDir, "libproot-loader32.so")
+        val loaderPath = File(activeNativeDir, "libproot-loader.so")
+        val loader32Path = File(activeNativeDir, "libproot-loader32.so")
         if (loaderPath.exists()) prootLoaderPath = loaderPath.absolutePath
         if (loader32Path.exists()) prootLoader32Path = loader32Path.absolutePath
 
-        // Set default PATH for Alpine Linux
-        customEnvironment.putIfAbsent("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin")
-        customEnvironment.putIfAbsent("HOME", "/root")
+        // Set default PATH for Alpine Linux (with /system/bin:/system/xbin tail
+        // so host /system/bin/sh fallback mode can always locate Android system tools).
+        customEnvironment.putIfAbsent(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/system/bin:/system/xbin",
+        )
+        customEnvironment.putIfAbsent(
+            "HOME",
+            if (rootfsManager.isProotAvailable) "/root" else File(rootfsManager.rootfsDir, "root").apply { mkdirs() }.absolutePath,
+        )
 
         // URL interception: seed $BROWSER directly into every process envp
         // so non-login shells (which never source /etc/profile.d/minis.sh)
@@ -286,6 +294,10 @@ object PRootKernel {
             val hostDir = File(globalBase, subdir).also { it.mkdirs() }
             bindMounts["/var/minis/$subdir"] = hostDir.absolutePath
         }
+        // Pre-create persistent apk & pip package cache directories under /var/minis/shared/.pkg-cache
+        val sharedHost = File(globalBase, "shared")
+        File(sharedHost, ".pkg-cache/apk").mkdirs()
+        File(sharedHost, ".pkg-cache/pip").mkdirs()
     }
 
     fun removeBindMount(linuxPath: String) {

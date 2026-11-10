@@ -110,6 +110,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
     // the identity emoji shown to the user is locked to ✨ everywhere
     // (see [SoulMetadata.displayEmoji]).
     var preservedEmoji by remember { mutableStateOf(SoulMetadata.DEFAULT.emoji) }
+    var preservedExtraFields by remember { mutableStateOf(SoulMetadata.DEFAULT.extraFields) }
     // [T-android-soul-custom-icon] The user-settable identity icon: an emoji
     // literal, a data:image/png;base64 URI, or empty for the default sparkle.
     var icon by remember { mutableStateOf(SoulMetadata.DEFAULT.icon) }
@@ -169,18 +170,11 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
         }
         name = parsed.metadata.name
         preservedEmoji = parsed.metadata.emoji
+        preservedExtraFields = parsed.metadata.extraFields
         icon = parsed.metadata.icon
         style = parsed.metadata.style
         lang = parsed.metadata.lang
         body = parsed.body
-        // [T-android-soul-save-in-appbar] Snapshot what disk holds, so the
-        // dirty check starts from the loaded state rather than from the
-        // pre-load defaults (which would read as "changed" immediately).
-        //
-        // Rebuilt through the same normalisation Save applies (ifBlank
-        // fallbacks) rather than stored raw: a file whose `lang` is empty on
-        // disk would otherwise compare unequal to the field state the instant
-        // it loaded, and the screen would open already dirty.
         baseline = SoulFile(
             metadata = SoulMetadata(
                 name = parsed.metadata.name.ifBlank { SoulMetadata.DEFAULT.name },
@@ -188,6 +182,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
                 icon = parsed.metadata.icon,
                 style = parsed.metadata.style,
                 lang = parsed.metadata.lang.ifBlank { SoulMetadata.DEFAULT.lang },
+                extraFields = parsed.metadata.extraFields,
             ),
             body = parsed.body,
         )
@@ -205,6 +200,7 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
             icon = icon,
             style = style,
             lang = lang.ifBlank { SoulMetadata.DEFAULT.lang },
+            extraFields = preservedExtraFields,
         ),
         body = body,
     )

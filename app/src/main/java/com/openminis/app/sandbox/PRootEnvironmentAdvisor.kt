@@ -27,6 +27,9 @@ object PRootEnvironmentAdvisor {
         PACKET_CAPTURE_UNSUPPORTED,
         NESTED_PTRACE_CONFLICT,
         KERNEL_NET_OR_SYS_ADMIN_UNSUPPORTED,
+        PROCESS_KILLED_SIGKILL_OR_OOM,
+        COMMAND_NOT_FOUND,
+        STORAGE_QUOTA_EXCEEDED,
     }
 
     data class Diagnostic(
@@ -156,6 +159,33 @@ object PRootEnvironmentAdvisor {
                 kind = ConstraintKind.KERNEL_NET_OR_SYS_ADMIN_UNSUPPORTED,
                 summary = "Kernel network stack mutations (`iptables`, `nft`, `ip route/link`), filesystem `mount`, and kernel namespaces (`unshare`/`chroot`) require host `CAP_NET_ADMIN` / `CAP_SYS_ADMIN` and are blocked by Android's kernel in unprivileged PRoot.",
                 alternative = "Read network state via `/proc/net/tcp`, `/proc/net/udp`, `/proc/net/route`, or `minis-config get network`; mount user directories via Settings → Mount External Folders (`/var/minis/mounts/<name>`); or execute kernel-level network/container operations on a remote Linux lab host via `ssh`.",
+            )
+        }
+
+        // 6. SIGKILL / OOM / Android Phantom Process Killer (exit code 137)
+        if (exitCode == 137 && !timedOut) {
+            return Diagnostic(
+                kind = ConstraintKind.PROCESS_KILLED_SIGKILL_OR_OOM,
+                summary = "Process terminated with exit code 137 (`SIGKILL`), typically triggered by Android's per-app memory ceiling (OOM killer) or Android 12+ Phantom Process Killer when spawning too many concurrent child processes.",
+                alternative = "Reduce worker/thread concurrency (e.g. `-j2`, `--workers 1`, `NODE_OPTIONS=--max-old-space-size=512`), process large datasets in streaming chunks instead of loading everything into RAM, or use `minis-job start <cmd>` for managed background execution.",
+            )
+        }
+
+        // 7. Storage quota / disk full (ENOSPC)
+        if (outLower.contains("no space left on device") || outLower.contains("enospc")) {
+            return Diagnostic(
+                kind = ConstraintKind.STORAGE_QUOTA_EXCEEDED,
+                summary = "The command failed with `ENOSPC` (No space left on device).",
+                alternative = "Check disk usage with `df -h` and `du -sh /tmp/* /var/minis/workspace/*`, remove temporary artifacts in `/tmp` or run `minis-job clean`.",
+            )
+        }
+
+        // 8. Command not found (exit code 127)
+        if (exitCode == 127 && (outLower.contains("not found") || outLower.contains("command not found"))) {
+            return Diagnostic(
+                kind = ConstraintKind.COMMAND_NOT_FOUND,
+                summary = "The requested binary is not installed in the current Alpine PRoot rootfs (exit code 127).",
+                alternative = "Install it with `apk add --no-cache <package>`, or install a cached Minis toolchain pack (`minis-pkg install core`, `data`, `web`, `net`, or `media`).",
             )
         }
 

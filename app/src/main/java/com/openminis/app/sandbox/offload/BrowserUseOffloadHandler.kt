@@ -496,6 +496,7 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
             "get_text"             -> "browser: read text"
             "get_readable"         -> "browser: extract readable"
             "get_backbone"         -> "browser: extract structure"
+            "get_console_logs"     -> "browser: console & network logs"
             "fetch"                -> "browser: fetch ${url ?: ""}".trim()
             "execute_js"           -> "browser: run JS"
             "set_viewport"         -> "browser: set viewport"
@@ -561,6 +562,7 @@ ACTIONS:
   set_user_agent  --user-agent mobile_chrome|desktop_chrome   (this tab only; aliases mobile, desktop)
   set_viewport    --width <n> --height <n> | --reset
   get_backbone    [--max-depth <n>]
+  get_console_logs
   fetch           --url <url>
   new_tab         [--url <url>]
   close_tab       [--tab-id <n>]

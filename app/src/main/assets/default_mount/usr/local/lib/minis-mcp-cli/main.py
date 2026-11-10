@@ -542,6 +542,81 @@ def cmd_set_enabled(args, pretty, enabled):
     _emit({"server": name, "enabled": enabled}, pretty)
 
 
+def cmd_doctor(args, pretty):
+    import shutil
+    target_name = args[0] if args else None
+    all_servers = config.load_all()
+    if target_name:
+        if target_name not in all_servers:
+            _fail("server not found: %s" % target_name, "NOT_FOUND", target_name, pretty)
+        items = [(target_name, all_servers[target_name])]
+    else:
+        items = sorted(all_servers.items())
+
+    has_enabled = any(srv.get("enabled", True) is not False for _, srv in items)
+    if has_enabled:
+        maybe_start_daemon()
+    d_alive = daemon_alive()
+    d_port = _read_daemon_port()
+
+    reports = []
+    all_ok = d_alive if has_enabled else True
+    for name, srv in items:
+        enabled = srv.get("enabled", True) is not False
+        transport = "http" if srv.get("url") else "stdio"
+        entry = {
+            "name": name,
+            "enabled": enabled,
+            "transport": transport,
+        }
+        if transport == "stdio":
+            cmd_bin = srv.get("command", "")
+            resolved_bin = shutil.which(cmd_bin) if cmd_bin else None
+            entry["command"] = cmd_bin
+            entry["command_found"] = bool(resolved_bin)
+            if not resolved_bin:
+                entry["status"] = "missing_binary"
+                entry["hint"] = "Command '%s' not found in PATH. Install it via minis-pkg or apk." % cmd_bin
+                if enabled:
+                    all_ok = False
+                reports.append(entry)
+                continue
+        else:
+            entry["url"] = srv.get("url", "")
+
+        if not enabled:
+            entry["status"] = "disabled"
+            reports.append(entry)
+            continue
+
+        t0 = time.time()
+        ping_resp = send_to_daemon({"cmd": "ping", "server": name}, timeout=20.0)
+        latency_ms = int((time.time() - t0) * 1000)
+        entry["latency_ms"] = latency_ms
+        if ping_resp.get("ok"):
+            tools_resp = send_to_daemon({"cmd": "tools", "server": name, "refresh": False}, timeout=20.0)
+            tools_list = (tools_resp.get("result") or {}).get("tools") if tools_resp.get("ok") else None
+            entry["status"] = "healthy"
+            entry["reachable"] = True
+            if isinstance(tools_list, list):
+                entry["tool_count"] = len(tools_list)
+        else:
+            entry["status"] = "unreachable"
+            entry["reachable"] = False
+            entry["error"] = ping_resp.get("error", "ping failed")
+            entry["code"] = ping_resp.get("code", "MCP_ERROR")
+            all_ok = False
+        reports.append(entry)
+
+    _emit({
+        "ok": all_ok,
+        "config_path": getattr(config, "CONFIG_PATH", "/var/minis/mcp-servers/servers.json"),
+        "daemon": {"alive": d_alive, "port": d_port},
+        "server_count": len(reports),
+        "servers": reports,
+    }, pretty)
+
+
 USAGE = """minis-mcp-cli — MCP (Model Context Protocol) client for the Minis agent.
 
 Usage: minis-mcp-cli <command> [args] [--pretty]
@@ -554,6 +629,8 @@ Commands:
   refresh <server>                      Alias for `tools <server> --refresh`.
   info <server>                         Show a server's stored config.
   ping <server>                         Reachability check (initialize handshake).
+  doctor [<server>]                     Run diagnostics on daemon, server binaries,
+                                        handshake latency, and available tool counts.
   call <server> <tool> ['{"k":"v"}'] [--input '{}'] [key=value ...]
                                         Invoke a tool. Pass the arguments as a JSON
                                         object (directly or via --input, not both)
@@ -593,6 +670,7 @@ Files:
 
 Examples:
   minis-mcp-cli list --pretty
+  minis-mcp-cli doctor --pretty
   minis-mcp-cli tools notion
   minis-mcp-cli call notion search '{"query":"meeting"}'
   minis-mcp-cli call notion search --input '{"query":"meeting"}'
@@ -651,6 +729,8 @@ def main():
             cmd_info(rest, pretty)
         elif cmd == "ping":
             cmd_ping(rest, pretty)
+        elif cmd == "doctor":
+            cmd_doctor(rest, pretty)
         elif cmd == "call":
             cmd_call(rest, pretty)
         elif cmd == "add":

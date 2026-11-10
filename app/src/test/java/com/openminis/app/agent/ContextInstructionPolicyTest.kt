@@ -41,7 +41,7 @@ import org.robolectric.annotation.Config
 import java.io.File
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35])
+@Config(sdk = [35], application = android.app.Application::class)
 class ContextInstructionPolicyTest {
 
     private lateinit var context: Context
@@ -372,5 +372,392 @@ class ContextInstructionPolicyTest {
             assertFalse("Reading write-only apiKey must fail in $mode", secretRead.optBoolean("ok", true))
             assertEquals("permission_denied", secretRead.optString("error"))
         }
+    }
+
+    @Test
+    fun `SoulMDParser and SoulStore preserve custom frontmatter CRLF case-insensitive Soul_md and full body`() {
+        val rawWithCrlfAndExtra = "---\r\n" +
+            "name: \"Aegis \\\"Prime\\\"\"\r\n" +
+            "icon: shield\r\n" +
+            "lang: zh\r\n" +
+            "style: concise, analytical, dry wit\r\n" +
+            "role: Principal Exploit Developer\r\n" +
+            "tone: direct and rigorous\r\n" +
+            "---\r\n" +
+            "Always speak as Aegis Prime and begin technical breakdowns with a hypothesis.\r\n"
+
+        val parsed = SoulMDParser.parse(rawWithCrlfAndExtra)
+        assertEquals("Aegis \"Prime\"", parsed.metadata.name)
+        assertEquals("shield", parsed.metadata.icon)
+        assertEquals("zh", parsed.metadata.lang)
+        assertEquals("concise, analytical, dry wit", parsed.metadata.style)
+        assertEquals("Principal Exploit Developer", parsed.metadata.extraFields["role"])
+        assertEquals("direct and rigorous", parsed.metadata.extraFields["tone"])
+        assertEquals("Always speak as Aegis Prime and begin technical breakdowns with a hypothesis.", parsed.body)
+
+        // Round-trip serialize -> parse preserves extraFields and escaped quotes
+        val roundTripped = SoulMDParser.parse(SoulMDParser.serialize(parsed))
+        assertEquals(parsed.metadata.name, roundTripped.metadata.name)
+        assertEquals(parsed.metadata.icon, roundTripped.metadata.icon)
+        assertEquals(parsed.metadata.lang, roundTripped.metadata.lang)
+        assertEquals(parsed.metadata.style, roundTripped.metadata.style)
+        assertEquals(parsed.metadata.extraFields, roundTripped.metadata.extraFields)
+        assertEquals(parsed.body, roundTripped.body)
+
+        // Case-insensitive Soul.md file resolution + live cachedMetadata update on load()
+        SoulStore.fileLocation(context).delete()
+        val lowercaseVariant = File(SoulStore.fileLocation(context).parentFile, "Soul.md")
+        lowercaseVariant.parentFile?.mkdirs()
+        lowercaseVariant.writeText(rawWithCrlfAndExtra)
+
+        val sigBefore = SoulStore.fileSignature(context)
+        val loadedFromVariant = SoulStore.load(context)
+        assertNotNull(loadedFromVariant)
+        assertEquals("Aegis \"Prime\"", loadedFromVariant!!.metadata.name)
+        assertEquals("Aegis \"Prime\"", SoulStore.cachedMetadata.value.name)
+
+        // Verify SystemPromptBuilder injects name, style, lang preference, extraFields, and full body
+        val identity = SystemPromptBuilder.identitySection(context, ContextInstructionPolicy.STANDARD)
+        assertTrue(identity.contains("Your name is Aegis \"Prime\"."))
+        assertTrue(identity.contains("## Communication Style"))
+        assertTrue(identity.contains("concise, analytical, dry wit"))
+        assertTrue(identity.contains("## Language Preference"))
+        assertTrue(identity.contains("Simplified Chinese"))
+        assertTrue(identity.contains("## Additional Soul Configuration"))
+        assertTrue(identity.contains("- role: Principal Exploit Developer"))
+        assertTrue(identity.contains("- tone: direct and rigorous"))
+        assertTrue(identity.contains("Always speak as Aegis Prime and begin technical breakdowns with a hypothesis."))
+
+        // Verify large SOUL.md body is never dropped even when exceeding soft editor limit
+        val largeBody = (1..5200).joinToString(" ") { "instruction_$it" }
+        SoulStore.save(context, parsed.copy(body = largeBody))
+        val sigAfter = SoulStore.fileSignature(context)
+        assertFalse(sigBefore == sigAfter)
+        val largeIdentity = SystemPromptBuilder.identitySection(context, ContextInstructionPolicy.STANDARD)
+        assertTrue(largeIdentity.contains("instruction_1"))
+        assertTrue(largeIdentity.contains("instruction_5200"))
+        lowercaseVariant.delete()
+    }
+
+    @Test
+    fun `TerminalBuffer resize preserves cursor line via scrollback and AnsiParser decodes UTF8 OSC`() {
+        val emulator = com.openminis.app.ui.terminal.emulator.TerminalEmulator(cols = 40, rows = 10)
+        fun rowText(r: Int): String = emulator.activeBuffer.grid[r]
+            .filter { !it.isWideTrailer }
+            .map { String(Character.toChars(it.char)) }
+            .joinToString("")
+            .trimEnd()
+
+        for (i in 1..10) {
+            val line = "line-$i" + if (i < 10) "\r\n" else ""
+            emulator.feed(line.toByteArray(Charsets.UTF_8))
+        }
+        assertEquals(9, emulator.activeBuffer.cursorRow)
+        assertEquals("line-10", rowText(9))
+
+        // Shrink rows from 10 to 5 (simulating keyboard opening): line-10 must remain on the bottom row
+        emulator.resize(40, 5)
+        assertEquals(4, emulator.activeBuffer.cursorRow)
+        assertEquals("line-10", rowText(4))
+        assertTrue(emulator.activeBuffer.scrollback.size >= 5)
+
+        // Expand rows back from 5 to 10 (simulating keyboard closing): scrollback lines pull back in
+        emulator.resize(40, 10)
+        assertEquals(9, emulator.activeBuffer.cursorRow)
+        assertEquals("line-10", rowText(9))
+        assertEquals("line-1", rowText(0))
+
+        // UTF-8 window title in OSC 2 sequence
+        val oscTitleSeq = "\u001B]2;终端 — Minis Shell 🚀\u0007".toByteArray(Charsets.UTF_8)
+        emulator.feed(oscTitleSeq)
+        assertEquals("终端 — Minis Shell 🚀", emulator.title)
+    }
+
+    @Test
+    fun `BrowserUseJS generates shadow-DOM and React-compatible interaction scripts`() {
+        val clickJs = com.openminis.app.browser.BrowserUseJS.clickCoordinate(120, 240)
+        assertTrue(clickJs.contains("shadowRoot.elementFromPoint"))
+        assertTrue(clickJs.contains("PointerEvent"))
+
+        val typeJs = com.openminis.app.browser.BrowserUseJS.type("#prompt-textarea", "hello world")
+        assertTrue(typeJs.contains("_valueTracker"))
+        assertTrue(typeJs.contains("execCommand('insertText'"))
+
+        val scrollJs = com.openminis.app.browser.BrowserUseJS.scroll(com.openminis.app.browser.ScrollDirection.DOWN, 600, null)
+        assertTrue(scrollJs.contains("canScrollInDir"))
+        assertTrue(scrollJs.contains("el.shadowRoot"))
+    }
+
+    @Test
+    fun `BashismDetector loads rules from assets and matches bashism_test_vectors`() {
+        com.openminis.app.agent.shell.BashismDetector.ensureLoaded(context)
+        val vectorsJson = context.assets.open("bashism/bashism_test_vectors.json")
+            .bufferedReader()
+            .use { it.readText() }
+        val vectors = JSONObject(vectorsJson).getJSONArray("vectors")
+        assertTrue(vectors.length() >= 5)
+
+        for (i in 0 until vectors.length()) {
+            val v = vectors.getJSONObject(i)
+            val name = v.getString("name")
+            val script = v.getString("script")
+            val expectedNeedsBash = v.getBoolean("needsBash")
+            val result = com.openminis.app.agent.shell.BashismDetector.detect(script)
+            assertEquals("Vector '$name' needsBash mismatch", expectedNeedsBash, result.needsBash)
+        }
+    }
+
+    @Test
+    fun `BackgroundWordFrequency loads zh_background_wordfreq and distinguishes common vs rare words`() {
+        val freq = com.openminis.app.speech.correction.BackgroundWordFrequency.getInstance(context)
+        assertTrue("Expected at least 150 background words loaded", freq.size >= 150)
+        assertNotNull("'我们' is a common word and should have a rank", freq.rank("我们"))
+        assertNotNull("'终端' is a common word and should have a rank", freq.rank("终端"))
+        assertNull("Unlisted technical term '反编译' should return null rank (rare)", freq.rank("反编译"))
+    }
+
+    @Test
+    fun `BrowserUserscriptManager parses headers matches URLs and builds GM runtime wrapper`() {
+        val sampleScript = """
+            // ==UserScript==
+            // @name         Test Header Parser
+            // @description  Verifies Tampermonkey metadata parsing
+            // @version      1.2
+            // @match        *://*.example.com/*
+            // @exclude      *://admin.example.com/*
+            // @run-at       document-start
+            // ==/UserScript==
+            GM_addStyle('body { background: #111; }');
+        """.trimIndent()
+
+        val header = com.openminis.app.browser.BrowserUserscriptManager.parseHeader(sampleScript)
+        assertEquals("Test Header Parser", header.name)
+        assertEquals("1.2", header.version)
+        assertEquals(com.openminis.app.browser.BrowserUserscriptManager.RunAt.DOCUMENT_START, header.runAt)
+        assertEquals(listOf("*://*.example.com/*"), header.matches)
+        assertEquals(listOf("*://admin.example.com/*"), header.excludes)
+
+        val scriptObj = com.openminis.app.browser.BrowserUserscriptManager.Userscript(
+            id = "test-header-parser",
+            name = header.name!!,
+            description = header.description!!,
+            version = header.version!!,
+            matches = header.matches,
+            excludes = header.excludes,
+            runAt = header.runAt!!,
+            code = sampleScript,
+        )
+        assertTrue(com.openminis.app.browser.BrowserUserscriptManager.matchesUrl(scriptObj, "https://app.example.com/dashboard"))
+        assertFalse(com.openminis.app.browser.BrowserUserscriptManager.matchesUrl(scriptObj, "https://admin.example.com/settings"))
+
+        val wrappedJs = com.openminis.app.browser.BrowserUserscriptManager.buildInjectionJavaScript(scriptObj, captureReturn = true)
+        assertTrue(wrappedJs.contains("function GM_addStyle"))
+        assertTrue(wrappedJs.contains("function GM_xmlhttpRequest"))
+    }
+
+    @Test
+    fun `SandboxServerManager extracts OSC 1337 server markers and normalizes localhost URLs`() {
+        val normalized = com.openminis.app.sandbox.SandboxServerManager.normalizeLocalUrl("http://0.0.0.0:8080/index.html?x=1")
+        assertEquals("http://127.0.0.1:8080/index.html?x=1", normalized)
+        assertTrue(com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(normalized))
+
+        val osc = "\u001B]1337;MinisSandboxServer={\"action\":\"start\",\"port\":18089,\"url\":\"http://0.0.0.0:18089/\",\"title\":\"Test Canvas\",\"cmd\":\"python3 -m http.server 18089\"}\u0007Hello Canvas"
+        val cleaned = com.openminis.app.sandbox.SandboxServerManager.extractAndProcessMarkers(osc, "sess-1")
+        assertEquals("Hello Canvas", cleaned)
+        val registered = com.openminis.app.sandbox.SandboxServerManager.getServerByPort(18089)
+        assertNotNull(registered)
+        assertEquals("http://127.0.0.1:18089/", registered!!.url)
+        assertEquals("Test Canvas", registered.title)
+        com.openminis.app.sandbox.SandboxServerManager.removeServer(18089)
+    }
+
+    @Test
+    fun `file tools search list multi-hunk edit undo browser console logs swarm output_files and minis-job minis-pkg assets work end-to-end`() {
+        val sessionId = "test-session-improvements"
+        val workspaceDir = File(context.filesDir, "minis-sessions/$sessionId/workspace").apply { mkdirs() }
+        val sampleFile = File(workspaceDir, "app.py")
+        sampleFile.writeText(
+            """
+            def greet():
+                print("hello alpha")
+
+            def compute():
+                return 41
+            """.trimIndent()
+        )
+
+        // 1. FileReadTool list_dir=true on directory
+        val listArgs = JSONObject()
+            .put("path", "/var/minis/workspace")
+            .put("list_dir", true)
+            .toString()
+        val listRes = FileReadTool.execute(listArgs, sessionId, context)
+        assertTrue(listRes.success)
+        assertTrue(listRes.output.contains("app.py"))
+
+        // 2. FileReadTool search_pattern across directory
+        val searchArgs = JSONObject()
+            .put("path", "/var/minis/workspace")
+            .put("search_pattern", "hello alpha")
+            .toString()
+        val searchRes = FileReadTool.execute(searchArgs, sessionId, context)
+        assertTrue(searchRes.success)
+        assertTrue(searchRes.output.contains("/var/minis/workspace/app.py:2:"))
+
+        // 3. FileEditTool multi-hunk edits + undo=true via FileUndoStore
+        val multiEditArgs = JSONObject()
+            .put("path", "/var/minis/workspace/app.py")
+            .put(
+                "edits",
+                org.json.JSONArray()
+                    .put(JSONObject().put("old_string", "hello alpha").put("new_string", "hello beta"))
+                    .put(JSONObject().put("old_string", "return 41").put("new_string", "return 42"))
+            )
+            .toString()
+        val editRes = com.openminis.app.tools.FileEditTool.execute(multiEditArgs, sessionId, context)
+        assertTrue(editRes.output, editRes.success)
+        assertTrue(sampleFile.readText().contains("hello beta"))
+        assertTrue(sampleFile.readText().contains("return 42"))
+
+        val undoArgs = JSONObject()
+            .put("path", "/var/minis/workspace/app.py")
+            .put("undo", true)
+            .toString()
+        val undoRes = com.openminis.app.tools.FileEditTool.execute(undoArgs, sessionId, context)
+        assertTrue(undoRes.output, undoRes.success)
+        assertTrue(sampleFile.readText().contains("hello alpha"))
+        assertTrue(sampleFile.readText().contains("return 41"))
+
+        // 4. BrowserAction GET_CONSOLE_LOGS and aliases + BrowserUseJS telemetry
+        assertEquals(
+            com.openminis.app.browser.BrowserAction.GET_CONSOLE_LOGS,
+            com.openminis.app.browser.BrowserAction.fromString("get_console_logs")
+        )
+        assertEquals(
+            com.openminis.app.browser.BrowserAction.GET_CONSOLE_LOGS,
+            com.openminis.app.browser.BrowserAction.fromString("get_console_and_network")
+        )
+        assertEquals(
+            com.openminis.app.browser.BrowserAction.SOM_SNAPSHOT,
+            com.openminis.app.browser.BrowserAction.fromString("get_interactive_tree")
+        )
+        val shimJs = com.openminis.app.browser.BrowserUseJS.stealthAndCompatibilityShim()
+        assertTrue(shimJs.contains("__minis_console_logs__"))
+        assertTrue(shimJs.contains("__minis_network_logs__"))
+
+        // 5. PRootEnvironmentAdvisor exit 137 (SIGKILL/OOM) and exit 127 (command not found)
+        val oomDiag = PRootEnvironmentAdvisor.diagnose("python3 train.py", exitCode = 137, output = "Killed")
+        assertNotNull(oomDiag)
+        assertEquals(PRootEnvironmentAdvisor.ConstraintKind.PROCESS_KILLED_SIGKILL_OR_OOM, oomDiag!!.kind)
+        assertTrue(oomDiag.alternative.contains("minis-job"))
+
+        val missingDiag = PRootEnvironmentAdvisor.diagnose("rg pattern", exitCode = 127, output = "/bin/sh: rg: not found")
+        assertNotNull(missingDiag)
+        assertEquals(PRootEnvironmentAdvisor.ConstraintKind.COMMAND_NOT_FOUND, missingDiag!!.kind)
+        assertTrue(missingDiag.alternative.contains("minis-pkg"))
+
+        // 6. SubAgentSwarm output_files parsing and shared dir prompt
+        val swarmParsed = SubAgentSwarm.parseArgs(
+            JSONObject()
+                .put("tool_title", "Parallel Audit")
+                .put(
+                    "workers",
+                    org.json.JSONArray().put(
+                        JSONObject()
+                            .put("id", "w1")
+                            .put("title", "Worker 1")
+                            .put("task", "Generate report.json")
+                            .put("output_files", org.json.JSONArray().put("report.json"))
+                    )
+                ).toString()
+        )
+        assertEquals(listOf("report.json"), swarmParsed.workers.first().outputFiles)
+        val prompt = SubAgentSwarm.buildWorkerPrompt(
+            spec = swarmParsed.workers.first(),
+            sharedContext = "",
+            workdir = "/var/minis/workspace/swarm_123/w1",
+            tabId = null,
+            totalWorkers = 1,
+            workerIndex = 0,
+        )
+        assertTrue(prompt.contains("/var/minis/workspace/swarm_123/shared"))
+        assertTrue(prompt.contains("report.json"))
+
+        // 7. Verify minis-job, minis-pkg, and minis-mcp-cli doctor exist in assets
+        val jobScript = context.assets.open("default_mount/usr/local/bin/minis-job").bufferedReader().use { it.readText() }
+        assertTrue(jobScript.contains("JOBS_DIR=\"/tmp/minis-jobs\""))
+        assertTrue(jobScript.contains("exec_line="))
+        val pkgScript = context.assets.open("default_mount/usr/local/bin/minis-pkg").bufferedReader().use { it.readText() }
+        assertTrue(pkgScript.contains("CACHE_ROOT=\"/var/minis/shared/.pkg-cache\""))
+        val mcpCliMain = context.assets.open("default_mount/usr/local/lib/minis-mcp-cli/main.py").bufferedReader().use { it.readText() }
+        assertTrue(mcpCliMain.contains("def cmd_doctor("))
+
+        // 8. Verify FileEditTool schema + ChatViewModel.preflightValidateToolCallImpl + session isolation
+        val editDef = com.openminis.app.tools.FileEditTool.definition()
+        assertEquals(listOf("tool_title", "path"), editDef.required)
+        assertTrue(editDef.parameters.containsKey("edits"))
+        assertTrue(editDef.parameters.containsKey("undo"))
+
+        val toolsList = listOf(editDef)
+        // Missing old_string & new_string without undo/edits -> rejected
+        val missingReason = com.openminis.app.ui.chat.ChatViewModel.preflightValidateToolCallImpl(
+            "file_edit",
+            JSONObject().put("path", "/var/minis/workspace/app.py"),
+            toolsList,
+        )
+        assertNotNull(missingReason)
+        assertTrue(missingReason!!.contains("old_string"))
+        assertTrue(missingReason.contains("new_string"))
+
+        // undo=true without old_string/new_string -> allowed
+        val undoPreflight = com.openminis.app.ui.chat.ChatViewModel.preflightValidateToolCallImpl(
+            "file_edit",
+            JSONObject().put("path", "/var/minis/workspace/app.py").put("undo", true),
+            toolsList,
+        )
+        assertEquals(null, undoPreflight)
+
+        // edits array without top-level old_string/new_string -> allowed
+        val editsPreflight = com.openminis.app.ui.chat.ChatViewModel.preflightValidateToolCallImpl(
+            "file_edit",
+            JSONObject().put("path", "/var/minis/workspace/app.py")
+                .put("edits", org.json.JSONArray().put(JSONObject().put("old_string", "a").put("new_string", "b"))),
+            toolsList,
+        )
+        assertEquals(null, editsPreflight)
+
+        // Empty new_string (deletion) -> allowed
+        val deletePreflight = com.openminis.app.ui.chat.ChatViewModel.preflightValidateToolCallImpl(
+            "file_edit",
+            JSONObject().put("path", "/var/minis/workspace/app.py").put("old_string", "a").put("new_string", ""),
+            toolsList,
+        )
+        assertEquals(null, deletePreflight)
+
+        // Stringified edits array + FileUndoStore strict per-session isolation
+        val stringifiedEditArgs = JSONObject()
+            .put("path", "/var/minis/workspace//app.py")
+            .put("edits", "[{\"old_string\":\"return 41\",\"new_string\":\"return 99\"}]")
+            .toString()
+        val strEditRes = com.openminis.app.tools.FileEditTool.execute(stringifiedEditArgs, sessionId, context)
+        assertTrue(strEditRes.output, strEditRes.success)
+        assertTrue(sampleFile.readText().contains("return 99"))
+
+        // Different session cannot undo sessionId's snapshot
+        val wrongSessionUndo = com.openminis.app.tools.FileEditTool.execute(
+            JSONObject().put("path", "/var/minis/workspace/app.py").put("undo", true).toString(),
+            "other_session_xyz",
+            context,
+        )
+        assertTrue(!wrongSessionUndo.success)
+
+        // Original session CAN undo even with normalized slash path
+        val rightSessionUndo = com.openminis.app.tools.FileEditTool.execute(
+            JSONObject().put("path", "/var/minis/workspace/app.py").put("undo", true).toString(),
+            sessionId,
+            context,
+        )
+        assertTrue(rightSessionUndo.output, rightSessionUndo.success)
+        assertTrue(sampleFile.readText().contains("return 41"))
     }
 }

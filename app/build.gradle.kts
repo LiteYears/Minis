@@ -130,6 +130,7 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+        unitTests.isIncludeAndroidResources = true
     }
 
     // [T-android-downgrade-compat] MigrationTestHelper loads the exported

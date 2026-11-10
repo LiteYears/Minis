@@ -1,3 +1,81 @@
 {
-  "rules": []
+  "rules": [
+    {
+      "name": "process_substitution",
+      "tier": "S",
+      "pattern": "(?:^|[^<])<\\([^)]+\\)|>\\([^)]+\\)",
+      "behaviorNote": "Process substitution `<(...)` / `>(...)` is a syntax error in BusyBox ash.",
+      "fixHint": "Use a temporary file or pipe into a subshell (`cmd1 | while IFS= read -r ...`)."
+    },
+    {
+      "name": "here_string",
+      "tier": "S",
+      "pattern": "<<<",
+      "behaviorNote": "Here-string `<<<` is a syntax error in BusyBox ash.",
+      "fixHint": "Use `printf '%s\\n' \"...\" | cmd` or a standard heredoc `<<'EOF'`."
+    },
+    {
+      "name": "double_bracket_test",
+      "tier": "S",
+      "pattern": "(?:^|[;&|()\\s])\\[\\[\\s+.+?\\s+\\]\\]",
+      "behaviorNote": "Extended conditional `[[ ... ]]` is not supported in BusyBox ash.",
+      "fixHint": "Use POSIX `[ ... ]` (`test`) or `case` for pattern matching."
+    },
+    {
+      "name": "declare_or_typeset",
+      "tier": "S",
+      "pattern": "(?:^|[;&|()\\s])(?:declare|typeset)\\s+-[aAilrtux]+",
+      "behaviorNote": "`declare` / `typeset` arrays and attributes do not exist in BusyBox ash.",
+      "fixHint": "Use standard POSIX variables or `awk`/`python3` for associative/indexed arrays."
+    },
+    {
+      "name": "shopt_builtin",
+      "tier": "S",
+      "pattern": "(?:^|[;&|()\\s])shopt\\s+",
+      "behaviorNote": "`shopt` is a bash-only builtin.",
+      "fixHint": "Use POSIX `set` options or `find` instead of `shopt -s nullglob/globstar`."
+    },
+    {
+      "name": "read_array",
+      "tier": "S",
+      "pattern": "(?:^|[;&|()\\s])read\\s+[^;\\n]*-a\\s+",
+      "behaviorNote": "`read -a` array assignment is not supported in BusyBox ash.",
+      "fixHint": "Use `set -- $line` positional parameters or `read -r a b c`."
+    },
+    {
+      "name": "array_literal",
+      "tier": "S",
+      "pattern": "(?:^|[;&|()\\s])[A-Za-z_][A-Za-z0-9_]*\\+?=(?:\\s*)\\([^)]*\\)",
+      "behaviorNote": "Indexed array literals `arr=(...)` are a syntax error in BusyBox ash.",
+      "fixHint": "Use positional parameters `set -- item1 item2` or newline-delimited strings."
+    },
+    {
+      "name": "combined_redirect",
+      "tier": "E",
+      "pattern": "(?:\\|&|&>>?)",
+      "behaviorNote": "Combined stdout/stderr redirect `&>` or `|&` is misparsed in POSIX sh.",
+      "fixHint": "Use POSIX `>file 2>&1` or `2>&1 |`."
+    },
+    {
+      "name": "array_or_indirect_expansion",
+      "tier": "E",
+      "pattern": "\\$\\{[A-Za-z_][A-Za-z0-9_]*\\[@\\]|\\$\\{[A-Za-z_][A-Za-z0-9_]*\\[\\*\\]|\\$\\{![A-Za-z_][A-Za-z0-9_]*",
+      "behaviorNote": "Array expansion `${arr[@]}` and indirect expansion `${!var}` fail in BusyBox ash.",
+      "fixHint": "Use `\"$@\"` or `eval` / `awk` / `python3`."
+    },
+    {
+      "name": "brace_sequence_expansion",
+      "tier": "E",
+      "pattern": "\\{[0-9]+\\.\\.[0-9]+(?:\\.\\.[0-9]+)?\\}",
+      "behaviorNote": "Brace sequence `{start..end}` is not expanded by BusyBox ash by default.",
+      "fixHint": "Use `seq start end`."
+    },
+    {
+      "name": "bash_special_vars",
+      "tier": "T1",
+      "pattern": "\\b(?:PIPESTATUS|FUNCNAME|BASH_SOURCE|BASH_REMATCH|BASH_VERSION|OSTYPE)\\b",
+      "behaviorNote": "Bash-only special variables expand to empty in BusyBox ash.",
+      "fixHint": "Capture exit codes explicitly or run under `/bin/bash`."
+    }
+  ]
 }

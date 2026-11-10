@@ -867,8 +867,10 @@ class PersistentShell(
             cmd.addAll(com.openminis.app.network.ShellTransparentNet.prootArgs(rootfsManager.prootBinary))
 
             cmd.add("/bin/sh")
+            setsidAvailable = File(rootfsManager.rootfsDir, "usr/bin/setsid").canExecute()
         } else {
             cmd.add("/system/bin/sh")
+            setsidAvailable = false
         }
 
         val debugOffload = com.openminis.app.BuildConfig.DEV_TOOLS
@@ -1251,6 +1253,13 @@ class PersistentShell(
                 // session (setsid/nohup) and is untouched — verified on
                 // device, see ForegroundCommandGroup.
                 cb?.pgid?.let { pgid ->
+                    if (pgid > 1) {
+                        runCatching {
+                            android.system.Os.kill(-pgid, android.system.OsConstants.SIGKILL)
+                        }.onFailure {
+                            Log.w(TAG, "host kill -$pgid failed: ${it.message}")
+                        }
+                    }
                     runCatching {
                         stdinWriter?.let { w ->
                             w.write(ForegroundCommandGroup.killGroupCommand(pgid))
@@ -1455,8 +1464,24 @@ class TerminalSession(private val context: Context) {
         private const val READ_BUFFER_SIZE = 8192
         /** Max bytes per PTY write; larger pastes are chunked so nothing is dropped. */
         private const val CHUNK_SIZE = 2048
+        private const val MAX_HISTORY_BYTES = 131_072
+        private const val GLOBAL_SESSION_KEY = "__global__"
         const val DEFAULT_COLS = 80
         const val DEFAULT_ROWS = 24
+
+        /**
+         * Persistent registry of interactive terminal sessions keyed by chat
+         * `sessionId` (or `"__global__"` for the global terminal) so navigating
+         * back and forth between Chat and Terminal preserves the live shell,
+         * working directory, running background jobs, and screen scrollback.
+         */
+        private val sessionRegistry = ConcurrentHashMap<String, TerminalSession>()
+
+        fun getOrCreate(context: Context, sessionId: String?): TerminalSession {
+            val appCtx = context.applicationContext ?: context
+            val key = sessionId?.takeIf { it.isNotBlank() } ?: GLOBAL_SESSION_KEY
+            return sessionRegistry.computeIfAbsent(key) { TerminalSession(appCtx) }
+        }
 
         /**
          * Weak-reference registry of live sessions so the Application can push
@@ -1499,10 +1524,38 @@ class TerminalSession(private val context: Context) {
 
     /** Raw PTY output bytes (not sanitized — feed directly into TerminalEmulator). */
     private val _outputBytes = MutableSharedFlow<ByteArray>(
-        extraBufferCapacity = 64,
+        extraBufferCapacity = 128,
         onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
     )
     val outputBytes: SharedFlow<ByteArray> = _outputBytes.asSharedFlow()
+
+    /** Rolling output history so re-entering TerminalScreen replays the current session buffer. */
+    private val outputHistory = ArrayDeque<ByteArray>()
+    private var outputHistoryBytes = 0
+
+    private fun recordAndEmitOutput(bytes: ByteArray) {
+        if (bytes.isEmpty()) return
+        synchronized(outputHistory) {
+            outputHistory.addLast(bytes)
+            outputHistoryBytes += bytes.size
+            while (outputHistoryBytes > MAX_HISTORY_BYTES && outputHistory.size > 1) {
+                val removed = outputHistory.removeFirst()
+                outputHistoryBytes -= removed.size
+            }
+        }
+        _outputBytes.tryEmit(bytes)
+    }
+
+    fun snapshotOutputHistory(): List<ByteArray> = synchronized(outputHistory) {
+        outputHistory.toList()
+    }
+
+    private fun clearOutputHistory() {
+        synchronized(outputHistory) {
+            outputHistory.clear()
+            outputHistoryBytes = 0
+        }
+    }
 
     /** Counter bumped on every reset() / clearOutput() — lets UI wipe emulator state. */
     private val _clearVersion = MutableStateFlow(0)
@@ -1511,6 +1564,8 @@ class TerminalSession(private val context: Context) {
     private var masterFd: Int = -1
     private var childPid: Int = 0
     private var readerJob: Job? = null
+    @Volatile
+    private var boundSessionId: String? = null
 
     /**
      * [T-android-seccomp-selfheal / GH#186] Set once the interactive shell has
@@ -1535,11 +1590,23 @@ class TerminalSession(private val context: Context) {
     val isRunning: Boolean get() = _state.value == State.RUNNING
 
     /**
+     * Explicitly restart the PTY shell session (stopping any active process and
+     * clearing screen history before booting a fresh shell).
+     */
+    fun restart(sessionId: String? = boundSessionId, initialCols: Int = cols, initialRows: Int = rows) {
+        stop()
+        clearOutputHistory()
+        _clearVersion.value = _clearVersion.value + 1
+        start(sessionId = sessionId, initialCols = initialCols, initialRows = initialRows)
+    }
+
+    /**
      * Start the PTY-backed shell. Call [setWindowSize] first if you know the
      * target geometry — otherwise boots at 80×24 and expects a resize callback.
      */
     fun start(sessionId: String? = null, initialCols: Int = DEFAULT_COLS, initialRows: Int = DEFAULT_ROWS) {
-        if (_state.value == State.RUNNING) return
+        if (_state.value == State.RUNNING || _state.value == State.BOOTING) return
+        boundSessionId = sessionId
         _state.value = State.BOOTING
         cols = initialCols
         rows = initialRows
@@ -1607,7 +1674,7 @@ class TerminalSession(private val context: Context) {
                 val fd = PtyBridge.forkExec(cmd, argv, envp, cwd, cols, rows, outPid)
                 if (fd < 0) {
                     Log.e(TAG, "forkExec failed: errno=${-fd}")
-                    _outputBytes.emit("Failed to start PTY: errno=${-fd}\r\n".toByteArray())
+                    recordAndEmitOutput("Failed to start PTY: errno=${-fd}\r\n".toByteArray())
                     _state.value = State.STOPPED
                     return@launch
                 }
@@ -1617,18 +1684,11 @@ class TerminalSession(private val context: Context) {
                 liveSessions.add(WeakReference(this@TerminalSession))
                 Log.i(TAG, "PTY started: fd=$fd pid=$childPid cols=$cols rows=$rows")
 
-                if (sessionId != null) {
-                    kotlinx.coroutines.delay(300)
-                    writeInput("cd /var/minis && clear\n".toByteArray())
-                }
-                // [T-android-session-private-mounts] Say which files this
-                // terminal sees. Written to the screen, not typed into the
-                // shell, so it never lands in history. Delayed past the
-                // `clear` above so it is not wiped.
-                scope.launch {
-                    kotlinx.coroutines.delay(if (sessionId != null) 600 else 300)
-                    _outputBytes.emit(banner(sessionId).toByteArray())
-                }
+                // Emit the workspace/mount banner directly to the terminal buffer
+                // before starting the PTY read loop so it appears cleanly at the
+                // top without typing `cd /var/minis && clear` into shell stdin
+                // (the working directory is already set via proot `-w /var/minis`).
+                recordAndEmitOutput(banner(sessionId).toByteArray())
 
                 readerJob = scope.launch { readLoop() }
 
@@ -1638,12 +1698,6 @@ class TerminalSession(private val context: Context) {
                     val status = PtyBridge.waitFor(childPid)
                     Log.i(TAG, "Child exited: status=$status")
 
-                    // [T-android-seccomp-selfheal / GH#186] PtyBridge reports a
-                    // signal death as -(128+signal) (pty_bridge.c:234), so
-                    // negate before consulting the policy. If the interactive
-                    // shell died on an early fatal signal, restart it once with
-                    // PROOT_NO_SECCOMP=1 rather than leaving the user staring
-                    // at a dead terminal they cannot fix from the UI.
                     val aliveMs = System.currentTimeMillis() - spawnedAt
                     if (SeccompFallbackPolicy.shouldRetryWithoutSeccomp(
                             exitCode = if (status < 0) -status else null,
@@ -1661,16 +1715,17 @@ class TerminalSession(private val context: Context) {
                         childPid = 0
                         readerJob?.cancel()
                         readerJob = null
+                        _state.value = State.IDLE
                         start(sessionId, cols, rows)
                         return@launch
                     }
 
-                    _outputBytes.emit("\r\n[Process exited: $status]\r\n".toByteArray())
+                    recordAndEmitOutput("\r\n[Process exited: $status]\r\n".toByteArray())
                     _state.value = State.STOPPED
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to start PTY session", t)
-                _outputBytes.emit("Error: ${t.message}\r\n".toByteArray())
+                recordAndEmitOutput("Error: ${t.message}\r\n".toByteArray())
                 _state.value = State.STOPPED
             }
         }
@@ -1687,7 +1742,7 @@ class TerminalSession(private val context: Context) {
                 break
             }
             sawOutput = true
-            _outputBytes.emit(buf.copyOf(n))
+            recordAndEmitOutput(buf.copyOf(n))
         }
     }
 
@@ -1776,7 +1831,10 @@ class TerminalSession(private val context: Context) {
         masterFd = -1
         childPid = 0
         if (fd >= 0) PtyBridge.closeFd(fd)
-        if (pid > 0) PtyBridge.sendSignal(pid, 15) // SIGTERM
+        if (pid > 0) {
+            PtyBridge.sendSignal(pid, 1)  // SIGHUP — interactive login shells ignore SIGTERM
+            PtyBridge.sendSignal(pid, 15) // SIGTERM
+        }
         if (_state.value != State.STOPPED) _state.value = State.STOPPED
         liveSessions.removeAll { it.get() === this || it.get() == null }
     }
@@ -1809,6 +1867,7 @@ class TerminalSession(private val context: Context) {
 
     /** Signal UI to wipe the emulator. No PTY bytes are written. */
     fun clearOutput() {
+        clearOutputHistory()
         _clearVersion.value = _clearVersion.value + 1
     }
 
@@ -1869,14 +1928,9 @@ class TerminalSession(private val context: Context) {
         cmd.add("-b"); cmd.add("/dev")
         cmd.add("-b"); cmd.add("/proc")
         cmd.add("-b"); cmd.add("/sys")
-        cmd.add("-w"); cmd.add("/root")
+        val initialWorkDir = if (sessionId != null) "/var/minis" else "/root"
+        cmd.add("-w"); cmd.add(initialWorkDir)
 
-        // [T-android-session-private-mounts] The same mount set the agent's
-        // shell for [sessionId] gets (SessionMounts is the single builder), so
-        // a file saved here is the file the agent sees. This used to replay
-        // the global PRootKernel.bindMounts, whose per-session entries were
-        // whichever chat last built a shell — a random chat's workspace.
-        // No session (global entry): global dirs and external mounts only.
         cmd.addAll(SessionMounts.toProotArgs(SessionMounts.forContext(context, sessionId).mounts))
 
         val handlers = NativeOffloadServer.registeredHandlers

@@ -1,3 +1,29 @@
 {
-  "vectors": []
+  "vectors": [
+    {
+      "name": "process_substitution",
+      "script": "diff -u <(sort a.txt) <(sort b.txt)",
+      "needsBash": true
+    },
+    {
+      "name": "here_string",
+      "script": "grep foo <<< \"$bar\"",
+      "needsBash": true
+    },
+    {
+      "name": "double_bracket_test",
+      "script": "if [[ $x == foo* ]]; then echo ok; fi",
+      "needsBash": true
+    },
+    {
+      "name": "declare_associative_array",
+      "script": "declare -A map\nmap[foo]=bar",
+      "needsBash": true
+    },
+    {
+      "name": "posix_script_clean",
+      "script": "if [ -f /etc/alpine-release ]; then cat /etc/alpine-release; fi",
+      "needsBash": false
+    }
+  ]
 }
