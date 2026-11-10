@@ -5,6 +5,8 @@
 #   minis-job list
 #   minis-job status <job_id>
 #   minis-job logs <job_id> [lines]
+#   minis-job restart <job_id>
+#   minis-job wait <job_id> [timeout_secs]
 #   minis-job stop <job_id>
 #   minis-job clean
 
@@ -22,6 +24,8 @@ Subcommands:
   list                                           List all tracked background jobs
   status <job_id>                                Show job status and recent output
   logs <job_id> [lines]                          Show last N lines of job log (default: 80)
+  restart <job_id>                               Restart a stopped or running job in-place
+  wait <job_id> [timeout_secs]                   Wait for job completion (default: 30s)
   stop <job_id>                                  Stop a running background job
   clean                                          Remove finished jobs and their logs
 EOF
@@ -234,6 +238,64 @@ cmd_stop() {
     fi
 }
 
+cmd_restart() {
+    job_id="$1"
+    if [ -z "$job_id" ]; then
+        echo "Error: job_id required (e.g. minis-job restart <job_id>)" >&2
+        exit 1
+    fi
+    meta="$JOBS_DIR/${job_id}.meta"
+    runner_file="$JOBS_DIR/${job_id}.run.sh"
+    log_file="$JOBS_DIR/${job_id}.log"
+    exit_file="$JOBS_DIR/${job_id}.exit"
+    if [ ! -f "$meta" ] || [ ! -f "$runner_file" ]; then
+        echo "Error: Job '$job_id' not found or missing runner." >&2
+        exit 1
+    fi
+    cmd_stop "$job_id" >/dev/null 2>&1 || true
+    rm -f "$exit_file"
+    ts="$(date +%s 2>/dev/null || echo 0)"
+    nohup /bin/sh "$runner_file" >> "$log_file" 2>&1 < /dev/null &
+    bg_pid=$!
+    name="$(read_meta_field "$meta" "NAME")"
+    cwd="$(read_meta_field "$meta" "CWD")"
+    cmd="$(read_meta_field "$meta" "CMD")"
+    cat > "$meta" <<EOF
+ID=$job_id
+PID=$bg_pid
+NAME=$name
+CWD=$cwd
+STARTED_AT=$ts
+CMD=$cmd
+EOF
+    echo "Restarted job $job_id (new PID: $bg_pid)"
+}
+
+cmd_wait() {
+    job_id="$1"
+    timeout_secs="${2:-30}"
+    if [ -z "$job_id" ]; then
+        echo "Error: job_id required (e.g. minis-job wait <job_id> [timeout_secs])" >&2
+        exit 1
+    fi
+    meta="$JOBS_DIR/${job_id}.meta"
+    if [ ! -f "$meta" ]; then
+        echo "Error: Job '$job_id' not found." >&2
+        exit 1
+    fi
+    pid="$(read_meta_field "$meta" "PID")"
+    elapsed=0
+    while is_pid_alive "$pid"; do
+        if [ "$elapsed" -ge "$timeout_secs" ]; then
+            echo "Timeout (${timeout_secs}s) waiting for job $job_id (PID $pid still running)."
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    cmd_status "$job_id"
+}
+
 cmd_clean() {
     removed=0
     for meta in "$JOBS_DIR"/*.meta; do
@@ -263,6 +325,12 @@ case "$subcmd" in
         ;;
     logs|log|tail)
         cmd_logs "$@"
+        ;;
+    restart)
+        cmd_restart "$@"
+        ;;
+    wait)
+        cmd_wait "$@"
         ;;
     stop|kill)
         cmd_stop "$@"

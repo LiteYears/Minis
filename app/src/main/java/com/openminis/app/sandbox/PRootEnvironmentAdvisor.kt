@@ -30,6 +30,7 @@ object PRootEnvironmentAdvisor {
         PROCESS_KILLED_SIGKILL_OR_OOM,
         COMMAND_NOT_FOUND,
         STORAGE_QUOTA_EXCEEDED,
+        PORT_ALREADY_IN_USE,
     }
 
     data class Diagnostic(
@@ -180,12 +181,21 @@ object PRootEnvironmentAdvisor {
             )
         }
 
-        // 8. Command not found (exit code 127)
+        // 8. Port already in use (EADDRINUSE) when starting a local web server
+        if (outLower.contains("address already in use") || outLower.contains("eaddrinuse")) {
+            return Diagnostic(
+                kind = ConstraintKind.PORT_ALREADY_IN_USE,
+                summary = "The target TCP port is already bound by an existing sandbox server (`EADDRINUSE` / Address already in use).",
+                alternative = "Use `minis-serve <port> <command...>` (which automatically stops the old process on `<port>` before starting the new one), run `minis-serve restart <port>`, or choose another port (e.g. `8001`–`8099`).",
+            )
+        }
+
+        // 9. Command not found (exit code 127)
         if (exitCode == 127 && (outLower.contains("not found") || outLower.contains("command not found"))) {
             return Diagnostic(
                 kind = ConstraintKind.COMMAND_NOT_FOUND,
                 summary = "The requested binary is not installed in the current Alpine PRoot rootfs (exit code 127).",
-                alternative = "Install it with `apk add --no-cache <package>`, or install a cached Minis toolchain pack (`minis-pkg install core`, `data`, `web`, `net`, or `media`).",
+                alternative = "Install it with `apk add --no-cache <package>`, or install a cached Minis toolchain pack (`minis-pkg install core`, `data`, `science`, `web`, `dev`, `net`, or `media`).",
             )
         }
 

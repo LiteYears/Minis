@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -558,7 +559,8 @@ private fun buildFeedbackMailto(): String {
 }
 
 /**
- * A grouped settings section with header and optional footer, matching iOS grouped List sections.
+ * A grouped settings section with header and optional footer, matching iOS grouped List sections
+ * and unified with [SettingsComponents.kt].
  */
 @Composable
 private fun SettingsSection(
@@ -569,16 +571,16 @@ private fun SettingsSection(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 20.dp),
+            .padding(top = 24.dp),
     ) {
-        // Section header
+        // Section header aligned with inset card content (32.dp)
         Text(
             text = title.uppercaseForDisplay(),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontWeight = FontWeight.Medium,
             letterSpacing = 0.5.sp,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+            modifier = Modifier.padding(start = 32.dp, end = 32.dp, bottom = 8.dp),
         )
 
         // Section card
@@ -586,7 +588,7 @@ private fun SettingsSection(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp)
-                .clip(RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(14.dp))
                 .background(color = MaterialTheme.colorScheme.surfaceContainerLow),
         ) {
             content()
@@ -598,7 +600,7 @@ private fun SettingsSection(
                 text = footer,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
+                modifier = Modifier.padding(start = 32.dp, end = 32.dp, top = 8.dp, bottom = 4.dp),
                 lineHeight = 16.sp,
             )
         }
@@ -606,8 +608,8 @@ private fun SettingsSection(
 }
 
 /**
- * A single settings row item with colored icon, title, optional subtitle, and chevron.
- * Styled to match iOS settings rows with SF Symbol-like colored circle icons.
+ * A single settings row item with colored squircle icon badge, title, optional subtitle, and chevron.
+ * Unified with [SettingsRow] in [SettingsComponents.kt] (56.dp minimum row height, 8.dp icon radius).
  */
 @Composable
 private fun SettingsItem(
@@ -624,17 +626,18 @@ private fun SettingsItem(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .heightIn(min = 56.dp)
                 .clickable(onClick = onClick)
                 .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Colored circle icon (matching iOS settings style)
+            // Colored rounded-squircle icon badge (matching iOS settings & SettingsRow)
             Box(
                 modifier = Modifier
                     .size(30.dp)
                     .background(
                         color = iconColor,
-                        shape = CircleShape,
+                        shape = RoundedCornerShape(8.dp),
                     ),
                 contentAlignment = Alignment.Center,
             ) {
@@ -642,7 +645,7 @@ private fun SettingsItem(
                     imageVector = icon,
                     contentDescription = null,
                     tint = Color.White,
-                    modifier = Modifier.size(16.dp),
+                    modifier = Modifier.size(18.dp),
                 )
             }
 

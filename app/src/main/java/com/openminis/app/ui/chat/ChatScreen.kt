@@ -2782,6 +2782,38 @@ fun ChatScreen(
             openLiveWebPreview("file://${file.absolutePath}", title, false)
         }
     }
+    // Bidirectional Canvas <-> Agent Bridge consumer:
+    // Handles prompts dispatched by `window.minis.sendPrompt(...)`, `window.minis.insertPrompt(...)`,
+    // or the 1-tap "Fix with AI" button in SandboxCanvasSubbar.
+    val pendingCanvasBridgeAction by com.openminis.app.ui.preview.CanvasAgentBridge.pendingAction.collectAsState()
+    LaunchedEffect(pendingCanvasBridgeAction) {
+        val action = pendingCanvasBridgeAction ?: return@LaunchedEffect
+        com.openminis.app.ui.preview.CanvasAgentBridge.consumeAction()
+        when (action) {
+            is com.openminis.app.ui.preview.CanvasAgentBridge.Action.SendPrompt -> {
+                if (action.minimizeCanvas && htmlPreviewVisible) {
+                    htmlPreviewHolder?.detach()
+                    htmlPreviewVisible = false
+                    htmlPreviewFullscreen = false
+                }
+                if (action.prompt.isNotBlank()) {
+                    viewModel.sendMessage(action.prompt)
+                }
+            }
+            is com.openminis.app.ui.preview.CanvasAgentBridge.Action.InsertPrompt -> {
+                if (action.minimizeCanvas && htmlPreviewVisible) {
+                    htmlPreviewHolder?.detach()
+                    htmlPreviewVisible = false
+                    htmlPreviewFullscreen = false
+                }
+                if (action.text.isNotBlank()) {
+                    val currentDraft = viewModel.inputText.value
+                    val updated = if (currentDraft.isBlank()) action.text else "$currentDraft\n${action.text}"
+                    viewModel.setInputText(updated)
+                }
+            }
+        }
+    }
     // Pinned-shortcut deep link: minis://session/<id>/<resource-path>
     // consumes here on first composition iff this screen is showing the
     // matching session; opens fullscreen HTML preview backed by a fresh
@@ -3920,6 +3952,17 @@ fun ChatScreen(
                     // predicate, compaction cut included.
                     hasFloatingToolBarBlocks(merged)
                 }
+                val allSandboxServers by com.openminis.app.sandbox.SandboxServerManager.servers.collectAsState()
+                val isCanvasCardMinimized by com.openminis.app.sandbox.SandboxServerManager.isCardMinimized.collectAsState()
+                val sessionSandboxServers = remember(allSandboxServers, sessionId) {
+                    allSandboxServers.filter { it.sessionId.isEmpty() || it.sessionId == sessionId }
+                }
+                val sandboxBarExtraReserve = when {
+                    sessionSandboxServers.isEmpty() -> 0.dp
+                    isCanvasCardMinimized -> 44.dp
+                    sessionSandboxServers.size > 1 -> 84.dp
+                    else -> 58.dp
+                }
                 // Halve the breathing room above the input bar in both
                 // states — felt too sparse before. The thumbnail's 65dp
                 // physical height is preserved (it has to clear the
@@ -3952,9 +3995,9 @@ fun ChatScreen(
                 // frame; a toggle
                 // re-pins through LaunchedEffect(bottomReserve) below.
                 val bottomReserve =
-                    if (hasFloatingTools) {
+                    (if (hasFloatingTools) {
                         FloatingToolBarMetrics.visibleTop(toolPreviewEnabled) + FloatingToolBarMetrics.ROW_GAP
-                    } else 20.dp
+                    } else 20.dp) + sandboxBarExtraReserve
                 // [T-android-reserve-anchor] The reserve is the reversed list's
                 // bottom contentPadding, which sits BEFORE every item: when it
                 // grows (the floating tool bar appears with a turn's first
@@ -5483,10 +5526,6 @@ fun ChatScreen(
                     }.collect { lastToolBlocks = it }
                 }
                 val allToolBlocks = lastToolBlocks
-                val allSandboxServers by com.openminis.app.sandbox.SandboxServerManager.servers.collectAsState()
-                val sessionSandboxServers = remember(allSandboxServers, sessionId) {
-                    allSandboxServers.filter { it.sessionId.isEmpty() || it.sessionId == sessionId }
-                }
                 if (lastToolBlocks.isNotEmpty() || sessionSandboxServers.isNotEmpty()) {
                     Box(
                         modifier = Modifier
@@ -5501,6 +5540,10 @@ fun ChatScreen(
                             if (sessionSandboxServers.isNotEmpty()) {
                                 com.openminis.app.ui.preview.LiveSandboxServerBar(
                                     servers = sessionSandboxServers,
+                                    isMinimized = isCanvasCardMinimized,
+                                    onToggleMinimized = {
+                                        com.openminis.app.sandbox.SandboxServerManager.toggleCardMinimized()
+                                    },
                                     onOpenCanvas = { srv, fullscreen ->
                                         openLiveWebPreview(srv.url, srv.title, fullscreen)
                                     },
@@ -5551,7 +5594,7 @@ fun ChatScreen(
                 val upFabVisible = messages.isNotEmpty() && !isNearBottom.value
                 val downFabVisible =
                     userScrolledAway && contentOverflows.value && messages.isNotEmpty()
-                val fabBaseDp = if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp
+                val fabBaseDp = (if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp) + sandboxBarExtraReserve
                 val fabStackTopDp = when {
                     upFabVisible -> fabBaseDp + 46.dp + 36.dp
                     downFabVisible -> fabBaseDp + 36.dp
@@ -5654,7 +5697,7 @@ fun ChatScreen(
                 // spacing). Tapping walks BACK one user turn at a time rather
                 // than jumping to the oldest message.
                 if (messages.isNotEmpty() && !isNearBottom.value) {
-                    val upBaseBottom = if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp
+                    val upBaseBottom = (if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp) + sandboxBarExtraReserve
                     androidx.compose.material3.FilledIconButton(
                         onClick = {
                             // [T-android-updown-fab-asymmetry] Arm the same flag a
@@ -5696,7 +5739,7 @@ fun ChatScreen(
                 }
 
                 if (userScrolledAway && contentOverflows.value && messages.isNotEmpty()) {
-                    val fabBottomPadding = if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp
+                    val fabBottomPadding = (if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp) + sandboxBarExtraReserve
                     androidx.compose.material3.FilledIconButton(
                         onClick = {
                             // [T-android-scroll-fab-down-stuck] Clear the

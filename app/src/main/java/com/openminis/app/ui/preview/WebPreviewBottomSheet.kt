@@ -223,6 +223,7 @@ fun WebPreviewBottomSheet(
                 subtitle = displayHost,
                 isLoading = holder.isLoading,
                 desktopMode = holder.desktopMode,
+                isLocalSandbox = isLocalSandbox,
                 onClose = onDismiss,
                 onReload = { holder.reload() },
                 onStop = { holder.stopLoading() },
@@ -286,8 +287,8 @@ fun WebPreviewBottomSheet(
 }
 
 /**
- * Top-of-sheet toolbar: X on far left, two-line title + URL host in the
- * middle, collapse (▾) and overflow (⋯) on the right. The overflow menu
+ * Top-of-sheet toolbar: minimize (▾) or close (X) on far left, two-line title + URL host in the
+ * middle, reload, fullscreen, and overflow (⋯) on the right. The overflow menu
  * holds Open-in / Refresh / Desktop-site / Fullscreen.
  */
 @Composable
@@ -305,6 +306,8 @@ internal fun WebPreviewToolbar(
     onExpand: (() -> Unit)?,
     /** Pad the row's top edge by the status-bar inset. */
     topInsetPadding: Boolean = false,
+    /** When true, left action renders as a Minimize/Collapse (▾) button since the sandbox server stays live. */
+    isLocalSandbox: Boolean = false,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
 
@@ -317,8 +320,12 @@ internal fun WebPreviewToolbar(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         ToolbarIcon(
-            icon = Icons.Default.Close,
-            description = stringResource(R.string.webpreview_close),
+            icon = if (isLocalSandbox) Icons.Default.ExpandMore else Icons.Default.Close,
+            description = if (isLocalSandbox) {
+                stringResource(R.string.sandbox_canvas_minimize_sheet)
+            } else {
+                stringResource(R.string.webpreview_close)
+            },
             onClick = onClose,
         )
         Column(
@@ -374,6 +381,18 @@ internal fun WebPreviewToolbar(
                 expanded = menuOpen,
                 onDismissRequest = { menuOpen = false },
             ) {
+                if (isLocalSandbox) {
+                    androidx.compose.material3.DropdownMenuItem(
+                        text = { Text(stringResource(R.string.sandbox_canvas_minimize_sheet)) },
+                        leadingIcon = {
+                            Icon(Icons.Default.ExpandMore, contentDescription = null)
+                        },
+                        onClick = {
+                            menuOpen = false
+                            onClose()
+                        },
+                    )
+                }
                 androidx.compose.material3.DropdownMenuItem(
                     text = { Text(stringResource(R.string.webpreview_open_external)) },
                     leadingIcon = {

@@ -1,6 +1,6 @@
 #!/bin/sh
-# /usr/local/bin/minis-serve — Start, manage, and auto-preview live local web
-# servers ("Interactive Micro-App Canvas") inside the Minis Alpine sandbox.
+# /usr/local/bin/minis-serve — Start, manage, hot-reload, and auto-preview live
+# local web servers ("Interactive Micro-App Canvas") inside the Minis Alpine sandbox.
 #
 # Runs servers detached via setsid with stdin/stdout/stderr redirected to
 # /tmp/minis-server-<port>.log so shell_execute returns immediately once the
@@ -11,8 +11,11 @@
 usage() {
     cat <<'EOF'
 Usage:
-  minis-serve [start] --port <port> [--title "<title>"] [--workdir <dir>] [--path </subpath>] [--] <command...>
-  minis-serve <port> <command...>
+  minis-serve [start] [--watch] --port <port> [--title "<title>"] [--workdir <dir>] [--path </subpath>] [--] <command...>
+  minis-serve [--watch] <port> <command...>
+  minis-serve static <port> [dir] [--title "<title>"]
+  minis-serve db <file.sqlite|file.csv|file.tsv|file.json|file.jsonl> [--port <port>] [--title "<title>"]
+  minis-serve restart <port>
   minis-serve open <port> [--path </subpath>] [--title "<title>"]
   minis-serve list
   minis-serve logs <port> [lines]
@@ -20,8 +23,13 @@ Usage:
 
 Examples:
   minis-serve 8000 python3 app.py
+  minis-serve --watch 8000 python3 app.py
+  minis-serve static 8080 /var/minis/workspace/dist
+  minis-serve db /var/minis/workspace/analytics.sqlite
+  minis-serve db /var/minis/workspace/sales.csv --port 8125 --title "Sales Explorer"
   minis-serve --port 8080 --title "SQLite Dashboard" --workdir /var/minis/workspace -- python3 server.py
   minis-serve 5000 flask --app dashboard.py run --host 127.0.0.1 --port 5000
+  minis-serve restart 8000
   minis-serve logs 8000
   minis-serve stop 8000
 EOF
@@ -42,12 +50,28 @@ is_port_listening() {
     return 1
 }
 
+find_free_port() {
+    _cand="${1:-8123}"
+    while is_port_listening "$_cand"; do
+        _cand=$((_cand + 1))
+    done
+    echo "$_cand"
+}
+
 json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/ /g'
 }
 
+json_extract() {
+    # Extract a string field from simple single-line JSON: json_extract "$file" "key"
+    _file="$1"
+    _key="$2"
+    sed -n 's/.*"'"$_key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_file" 2>/dev/null | head -n 1
+}
+
 stop_port() {
     _p="$1"
+    _keep_meta="${2:-1}"
     _pidfile="/tmp/minis-server-${_p}.pid"
     if [ -f "$_pidfile" ]; then
         _oldpid=$(cat "$_pidfile" 2>/dev/null)
@@ -56,7 +80,10 @@ stop_port() {
             sleep 0.2
             kill -KILL "-$_oldpid" 2>/dev/null || kill -KILL "$_oldpid" 2>/dev/null
         fi
-        rm -f "$_pidfile" "/tmp/minis-server-${_p}.json"
+        rm -f "$_pidfile"
+    fi
+    if [ "$_keep_meta" = "0" ]; then
+        rm -f "/tmp/minis-server-${_p}.json"
     fi
     if command -v fuser >/dev/null 2>&1; then
         fuser -k "${_p}/tcp" >/dev/null 2>&1
@@ -117,19 +144,113 @@ case "$SUBCMD" in
         shift
         target="$1"
         if [ "$target" = "--all" ] || [ -z "$target" ]; then
-            for pf in /tmp/minis-server-*.pid; do
-                [ -f "$pf" ] || continue
-                p=$(printf '%s' "$pf" | sed -e 's|^/tmp/minis-server-||' -e 's|\.pid$||')
-                stop_port "$p"
+            for jf in /tmp/minis-server-*.json /tmp/minis-server-*.pid; do
+                [ -f "$jf" ] || continue
+                p=$(printf '%s' "$jf" | sed -e 's|^/tmp/minis-server-||' -e 's|\.\(pid\|json\)$||')
+                stop_port "$p" 1
                 printf '\033]1337;MinisSandboxServer={"action":"stop","port":%s}\007' "$p"
                 echo "[minis-serve] Stopped server on port $p"
             done
         else
-            stop_port "$target"
+            stop_port "$target" 1
             printf '\033]1337;MinisSandboxServer={"action":"stop","port":%s}\007' "$target"
             echo "[minis-serve] Stopped server on port $target"
         fi
         exit 0
+        ;;
+    restart)
+        shift
+        port="$1"
+        if [ -z "$port" ]; then
+            echo "Usage: minis-serve restart <port>" >&2
+            exit 1
+        fi
+        metafile="/tmp/minis-server-${port}.json"
+        if [ ! -f "$metafile" ]; then
+            echo "[minis-serve] No saved metadata for port $port; starting static server in /var/minis/workspace..."
+            exec "$0" static "$port" /var/minis/workspace
+        fi
+        saved_title=$(json_extract "$metafile" "title")
+        saved_workdir=$(json_extract "$metafile" "workdir")
+        saved_cmd=$(json_extract "$metafile" "cmd")
+        [ -z "$saved_workdir" ] && saved_workdir="/var/minis/workspace"
+        [ -z "$saved_cmd" ] && saved_cmd="python3 -m http.server $port --bind 127.0.0.1"
+        exec "$0" start --port "$port" --title "${saved_title:-Sandbox App (:$port)}" --workdir "$saved_workdir" -- /bin/sh -c "$saved_cmd"
+        ;;
+    static)
+        shift
+        port="$1"
+        if [ -z "$port" ]; then
+            echo "Usage: minis-serve static <port> [dir] [--title \"<title>\"]" >&2
+            exit 1
+        fi
+        shift
+        dir=""
+        title=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -t|--title|--name) title="$2"; shift 2 ;;
+                -w|--workdir|--dir) dir="$2"; shift 2 ;;
+                *)
+                    if [ -z "$dir" ]; then
+                        dir="$1"
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+        if [ -z "$dir" ]; then
+            if [ -d "/var/minis/workspace" ] && [ "$PWD" = "/root" ]; then
+                dir="/var/minis/workspace"
+            else
+                dir="$PWD"
+            fi
+        fi
+        [ -z "$title" ] && title="Static Web Server (:${port})"
+        exec "$0" start --port "$port" --title "$title" --workdir "$dir" -- python3 -m http.server "$port" --bind 127.0.0.1
+        ;;
+    db|data|sqlite|csv)
+        shift
+        db_port=""
+        db_file=""
+        db_title=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -p|--port) db_port="$2"; shift 2 ;;
+                -t|--title|--name) db_title="$2"; shift 2 ;;
+                ''|*[!0-9]*)
+                    if [ -z "$db_file" ]; then
+                        db_file="$1"
+                    fi
+                    shift
+                    ;;
+                *)
+                    if [ -z "$db_port" ]; then
+                        db_port="$1"
+                    elif [ -z "$db_file" ]; then
+                        db_file="$1"
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+        if [ -z "$db_file" ]; then
+            echo "Usage: minis-serve db <file.sqlite|file.csv|file.tsv|file.json|file.jsonl> [--port <port>] [--title \"<title>\"]" >&2
+            exit 1
+        fi
+        case "$db_file" in
+            /*) ;;
+            *) db_file="$PWD/$db_file" ;;
+        esac
+        if [ ! -e "$db_file" ]; then
+            echo "Error: Data file not found: $db_file" >&2
+            exit 1
+        fi
+        [ -z "$db_port" ] && db_port=$(find_free_port 8123)
+        [ -z "$db_title" ] && db_title="Data Studio · $(basename "$db_file")"
+        db_workdir=$(dirname "$db_file")
+        exec "$0" start --port "$db_port" --title "$db_title" --workdir "$db_workdir" -- \
+            python3 /usr/local/lib/minis-data-studio/server.py --file "$db_file" --port "$db_port" --title "$db_title"
         ;;
     open)
         shift
@@ -165,18 +286,14 @@ TITLE=""
 WORKDIR=""
 SUBPATH="/"
 WAIT_SECS=15
-
-# Support shorthand: minis-serve <port> <command...>
-case "$1" in
-    ''|*[!0-9]*) ;;
-    *)
-        PORT="$1"
-        shift
-        ;;
-esac
+WATCH_MODE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --watch)
+            WATCH_MODE=1
+            shift
+            ;;
         -p|--port)
             PORT="$2"
             shift 2
@@ -201,15 +318,43 @@ while [ $# -gt 0 ]; do
             shift
             break
             ;;
-        *)
+        ''|*[!0-9]*)
             break
+            ;;
+        *)
+            if [ -z "$PORT" ]; then
+                PORT="$1"
+                shift
+            else
+                break
+            fi
             ;;
     esac
 done
 
-if [ -z "$PORT" ] || [ $# -eq 0 ]; then
+if [ -z "$PORT" ]; then
     usage >&2
     exit 1
+fi
+
+# If no command was supplied (or a directory or data file was supplied), serve automatically!
+if [ $# -eq 0 ]; then
+    set -- python3 -m http.server "$PORT" --bind 127.0.0.1
+elif [ $# -eq 1 ] && [ -f "$1" ]; then
+    case "$1" in
+        *.db|*.sqlite|*.sqlite3|*.csv|*.tsv|*.jsonl)
+            _abs_df="$1"
+            case "$_abs_df" in
+                /*) ;;
+                *) _abs_df="$PWD/$_abs_df" ;;
+            esac
+            [ -z "$TITLE" ] && TITLE="Data Studio · $(basename "$_abs_df")"
+            set -- python3 /usr/local/lib/minis-data-studio/server.py --file "$_abs_df" --port "$PORT" --title "$TITLE"
+            ;;
+    esac
+elif [ $# -eq 1 ] && [ -d "$1" ]; then
+    WORKDIR="$1"
+    set -- python3 -m http.server "$PORT" --bind 127.0.0.1
 fi
 
 if [ -z "$WORKDIR" ]; then
@@ -230,7 +375,7 @@ if [ -z "$TITLE" ]; then
 fi
 
 # Stop any prior server on this port
-stop_port "$PORT"
+stop_port "$PORT" 1
 
 LOGFILE="/tmp/minis-server-${PORT}.log"
 PIDFILE="/tmp/minis-server-${PORT}.pid"
@@ -243,17 +388,52 @@ if [ ! -d "$WORKDIR" ]; then
     mkdir -p "$WORKDIR" 2>/dev/null || WORKDIR="/tmp"
 fi
 
-# Launch in its own session (setsid) with fds 0/1/2 detached from the command pipe
-setsid /bin/sh -c '
-    cd "$1" || exit 1
-    shift
-    echo "$$" > "'"$PIDFILE"'"
-    if [ $# -eq 1 ]; then
-        exec /bin/sh -c "$1"
-    else
-        exec "$@"
-    fi
-' sh "$WORKDIR" "$@" </dev/null >>"$LOGFILE" 2>&1 &
+if [ "$WATCH_MODE" -eq 1 ]; then
+    # Launch with lightweight auto-reload file watcher inside its own session
+    setsid /bin/sh -c '
+        cd "$1" || exit 1
+        shift
+        echo "$$" > "'"$PIDFILE"'"
+        calc_sig() {
+            find . -maxdepth 3 \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.html" -o -name "*.css" -o -name "*.json" -o -name "*.go" \) -exec stat -c "%Y:%n" {} + 2>/dev/null | sort | md5sum 2>/dev/null
+        }
+        LAST_SIG=$(calc_sig)
+        while true; do
+            if [ $# -eq 1 ]; then
+                /bin/sh -c "$1" &
+            else
+                "$@" &
+            fi
+            CHILD_PID=$!
+            trap "kill -TERM $CHILD_PID 2>/dev/null; exit 0" TERM INT
+            while kill -0 "$CHILD_PID" 2>/dev/null; do
+                sleep 1.5
+                NEW_SIG=$(calc_sig)
+                if [ -n "$NEW_SIG" ] && [ "$NEW_SIG" != "$LAST_SIG" ]; then
+                    echo "[minis-serve --watch] File change detected; restarting server..."
+                    LAST_SIG="$NEW_SIG"
+                    kill -TERM "$CHILD_PID" 2>/dev/null
+                    sleep 0.3
+                    kill -KILL "$CHILD_PID" 2>/dev/null
+                    break
+                fi
+            done
+            sleep 0.2
+        done
+    ' sh "$WORKDIR" "$@" </dev/null >>"$LOGFILE" 2>&1 &
+else
+    # Launch in its own session (setsid) with fds 0/1/2 detached from the command pipe
+    setsid /bin/sh -c '
+        cd "$1" || exit 1
+        shift
+        echo "$$" > "'"$PIDFILE"'"
+        if [ $# -eq 1 ]; then
+            exec /bin/sh -c "$1"
+        else
+            exec "$@"
+        fi
+    ' sh "$WORKDIR" "$@" </dev/null >>"$LOGFILE" 2>&1 &
+fi
 
 sleep 0.15
 SERVER_PID=""

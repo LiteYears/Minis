@@ -236,6 +236,18 @@ object PRootKernel {
         // can resolve /var/minis/{memory,skills,shared}/... (idempotent).
         registerGlobalBindMounts(context)
 
+        // Pre-initialize persistent package caches & shared Python site-packages
+        // inside /var/minis/shared so apk and pip downloads survive rootfs resets.
+        runCatching {
+            val sharedHostPath = bindMounts["/var/minis/shared"]
+            if (sharedHostPath != null) {
+                File(sharedHostPath, ".pkg-cache/apk").mkdirs()
+                File(sharedHostPath, ".pkg-cache/pip").mkdirs()
+                File(sharedHostPath, "site-packages").mkdirs()
+            }
+            customEnvironment.putIfAbsent("PIP_CACHE_DIR", "/var/minis/shared/.pkg-cache/pip")
+        }
+
         // Start the native_offload server so the proot extension can reach it
         // over the abstract unix socket. Handlers must have been registered
         // via NativeOffloadServer.register() before this point.

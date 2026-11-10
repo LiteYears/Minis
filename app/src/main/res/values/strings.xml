@@ -492,6 +492,14 @@
     <string name="sandbox_canvas_refresh_logs">Refresh logs</string>
     <string name="sandbox_canvas_warming_up_title">Starting live sandbox server…</string>
     <string name="sandbox_canvas_warming_up_subtitle">Connecting to %1$s inside Alpine Linux</string>
+    <string name="sandbox_canvas_hide_card">Hide card</string>
+    <string name="sandbox_canvas_show_card">Show card</string>
+    <string name="sandbox_canvas_start">Start</string>
+    <string name="sandbox_canvas_copy_logs">Copy logs</string>
+    <string name="sandbox_canvas_copied_logs">Logs copied</string>
+    <string name="sandbox_canvas_hide_subbar">Hide server bar</string>
+    <string name="sandbox_canvas_show_subbar">Show server bar</string>
+    <string name="sandbox_canvas_minimize_sheet">Minimize canvas</string>
 
     <!-- T-browser-use-per-tab-serial-android: returned to the model when a
          browser_use call can't acquire the per-tab serial lock within the wait
@@ -3347,4 +3355,6 @@
         <item quantity="one">%1$d model</item>
         <item quantity="other">%1$d models</item>
     </plurals>
+    <string name="sandbox_canvas_fix_with_ai">Fix with AI</string>
+    <string name="sandbox_canvas_ask_ai">Ask AI</string>
 </resources>

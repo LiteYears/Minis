@@ -207,6 +207,11 @@ fun WebPreviewFullscreenScreen(
                 modifier = Modifier.fillMaxSize(),
             )
 
+            val localSandboxPort = com.openminis.app.sandbox.SandboxServerManager.extractPort(holder.currentUrl)
+            if (holder.isWarmingUpLocalServer && localSandboxPort != null) {
+                SandboxWarmingUpOverlay(hostPort = "127.0.0.1:$localSandboxPort")
+            }
+
             val navInset = WindowInsets.navigationBars.asPaddingValues()
                 .calculateBottomPadding()
 
@@ -265,24 +270,47 @@ private fun FloatingMenuButton(
     onCollapse: (() -> Unit)?,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
-    Box {
-        androidx.compose.foundation.layout.Box(
-            modifier = Modifier
-                .size(48.dp)
-                .background(
-                    color = Color.Black.copy(alpha = 0.55f),
-                    shape = androidx.compose.foundation.shape.CircleShape,
+    androidx.compose.foundation.layout.Row(
+        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (onCollapse != null) {
+            androidx.compose.foundation.layout.Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .background(
+                        color = Color.Black.copy(alpha = 0.55f),
+                        shape = androidx.compose.foundation.shape.CircleShape,
+                    )
+                    .clickable(onClick = onCollapse),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.FullscreenExit,
+                    contentDescription = stringResource(R.string.webapp_action_exit_fullscreen),
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp),
                 )
-                .clickable(onClick = { menuOpen = true }),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                imageVector = androidx.compose.material.icons.Icons.Outlined.MoreHoriz,
-                contentDescription = stringResource(R.string.webpreview_more),
-                tint = Color.White,
-                modifier = Modifier.size(24.dp),
-            )
+            }
         }
+        Box {
+            androidx.compose.foundation.layout.Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .background(
+                        color = Color.Black.copy(alpha = 0.55f),
+                        shape = androidx.compose.foundation.shape.CircleShape,
+                    )
+                    .clickable(onClick = { menuOpen = true }),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = androidx.compose.material.icons.Icons.Outlined.MoreHoriz,
+                    contentDescription = stringResource(R.string.webpreview_more),
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp),
+                )
+            }
         com.openminis.app.ui.components.MinisMenu(
             expanded = menuOpen,
             onDismissRequest = { menuOpen = false },
@@ -353,6 +381,7 @@ private fun FloatingMenuButton(
                     onClose()
                 },
             )
+        }
         }
     }
 }

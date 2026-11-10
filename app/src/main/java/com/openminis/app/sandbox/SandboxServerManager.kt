@@ -65,6 +65,21 @@ object SandboxServerManager {
     val servers: StateFlow<List<SandboxServerInstance>> = _servers.asStateFlow()
 
     /**
+     * Tracks whether the floating Open Canvas card in ChatScreen is hidden/minimized into a
+     * compact pill without stopping the underlying server or closing the WebView session.
+     */
+    private val _isCardMinimized = MutableStateFlow(false)
+    val isCardMinimized: StateFlow<Boolean> = _isCardMinimized.asStateFlow()
+
+    fun setCardMinimized(minimized: Boolean) {
+        _isCardMinimized.value = minimized
+    }
+
+    fun toggleCardMinimized() {
+        _isCardMinimized.value = !_isCardMinimized.value
+    }
+
+    /**
      * Emits the latest server URL that should be auto-opened in the Interactive
      * Micro-App Canvas sheet.
      */
@@ -79,17 +94,17 @@ object SandboxServerManager {
 
     /**
      * Matches localhost / loopback URLs printed by common web servers:
-     * Flask, FastAPI/Uvicorn, Streamlit, Node/Vite/Express, Go, python -m http.server, etc.
+     * Flask, FastAPI/Uvicorn, Streamlit, Gradio, Node/Vite/Express, Go, python -m http.server, etc.
      */
     private val LOCAL_URL_REGEX =
         Regex("""https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1?]):(\d{2,5})(/[^\s"'<>)\]]*)?""", RegexOption.IGNORE_CASE)
 
     /**
      * Matches port numbers in server start commands, e.g. `--port 8000`, `-p 5000`,
-     * `http.server 8080`, `:8000`, `minis-serve 8000`.
+     * `http.server 8080`, `:8000`, `minis-serve 8000`, `minis-serve static 8000`.
      */
     private val COMMAND_PORT_REGEX =
-        Regex("""(?:--port[=\s]+|-p\s+|http\.server\s+|minis-serve\s+(?:start\s+)?|127\.0\.0\.1:|localhost:|0\.0\.0\.0:)(\d{4,5})\b""", RegexOption.IGNORE_CASE)
+        Regex("""(?:--port[=\s]+|--server\.port[=\s]+|-p\s+|http\.server\s+|minis-serve\s+(?:(?:start|open|static|restart)\s+)?(?:--watch\s+)?|PORT=|GRADIO_SERVER_PORT=|127\.0\.0\.1:|localhost:|0\.0\.0\.0:)(\d{4,5})\b""", RegexOption.IGNORE_CASE)
 
     /** Ports reserved or used internally by Android/ADB that shouldn't be treated as user micro-apps. */
     private val IGNORED_PORTS = setOf(5037, 5555, 8600)
@@ -419,6 +434,7 @@ object SandboxServerManager {
         val normalizedUrl = normalizeLocalUrl(url)
         val now = System.currentTimeMillis()
         lateinit var resolvedInstance: SandboxServerInstance
+        var isNewServer = false
         _servers.update { list ->
             val current = list.toMutableList()
             val idx = current.indexOfFirst { it.port == port }
@@ -435,6 +451,7 @@ object SandboxServerManager {
                     lastCheckedAtMs = now,
                 ).also { current[idx] = it }
             } else {
+                isNewServer = true
                 SandboxServerInstance(
                     port = port,
                     url = normalizedUrl,
@@ -449,6 +466,10 @@ object SandboxServerManager {
                 ).also { current.add(0, it) }
             }
             current
+        }
+        if (isNewServer && status != SandboxServerStatus.STOPPED) {
+            // Un-minimize the Open Canvas card when a brand-new server spins up
+            _isCardMinimized.value = false
         }
         if (autoOpen && status != SandboxServerStatus.STOPPED) {
             _pendingAutoOpenServer.value = resolvedInstance
@@ -571,6 +592,24 @@ object SandboxServerManager {
         }
 
     /**
+     * Truncates/clears the stdout/stderr log file for the sandbox server on [port].
+     */
+    suspend fun clearServerLogs(context: Context, port: Int) = withContext(Dispatchers.IO) {
+        runCatching {
+            val rootfsDir = RootfsManager.getInstance(context).rootfsDir
+            val candidates = listOf(
+                File(rootfsDir, "tmp/minis-server-$port.log"),
+                File(rootfsDir, "tmp/server-$port.log"),
+            )
+            for (f in candidates) {
+                if (f.isFile) {
+                    f.writeText("")
+                }
+            }
+        }
+    }
+
+    /**
      * Stop a running sandbox server on [port] and clean up its PID/meta files.
      */
     fun stopServer(context: Context, port: Int, removeFromList: Boolean = false) {
@@ -588,7 +627,9 @@ object SandboxServerManager {
             runCatching {
                 val rootfsDir = RootfsManager.getInstance(context).rootfsDir
                 File(rootfsDir, "tmp/minis-server-$port.pid").delete()
-                File(rootfsDir, "tmp/minis-server-$port.json").delete()
+                if (removeFromList) {
+                    File(rootfsDir, "tmp/minis-server-$port.json").delete()
+                }
             }
             // Also invoke minis-serve stop inside the guest in case the server was started without a pidfile
             val sessionId = srv?.sessionId?.ifBlank { "default" } ?: "default"
@@ -609,7 +650,7 @@ object SandboxServerManager {
     }
 
     /**
-     * Restart a sandbox server using its recorded command and working directory.
+     * Restart (or start if stopped) a sandbox server using its recorded command and working directory.
      */
     fun restartServer(
         context: Context,
@@ -620,28 +661,38 @@ object SandboxServerManager {
             onComplete?.invoke(false)
             return
         }
-        val cmd = srv.command.trim()
-        if (cmd.isEmpty()) {
-            onComplete?.invoke(false)
-            return
-        }
         scope.launch {
+            val rootfsDir = RootfsManager.getInstance(context).rootfsDir
+            val metaFile = File(rootfsDir, "tmp/minis-server-$port.json")
+            val metaObj = runCatching {
+                if (metaFile.isFile) JSONObject(metaFile.readText()) else null
+            }.getOrNull()
+
+            val effectiveCmd = srv.command.trim()
+                .ifBlank { metaObj?.optString("cmd", "")?.trim().orEmpty() }
+                .ifBlank { "python3 -m http.server $port --bind 127.0.0.1" }
+            val effectiveWorkdir = srv.workdir.trim()
+                .ifBlank { metaObj?.optString("workdir", "")?.trim().orEmpty() }
+                .ifBlank { "/var/minis/workspace" }
+
             registerOrUpdateServer(
                 port = srv.port,
                 url = srv.url,
                 title = srv.title,
-                command = srv.command,
-                workdir = srv.workdir,
+                command = effectiveCmd,
+                workdir = effectiveWorkdir,
                 sessionId = srv.sessionId,
                 status = SandboxServerStatus.STARTING,
             )
             val sessionId = srv.sessionId.ifBlank { "default" }
             val safeTitle = srv.title.replace("'", "'\\''")
-            val safeWorkdir = srv.workdir.ifBlank { "/var/minis/workspace" }.replace("'", "'\\''")
-            val innerCmd = if (cmd.contains("minis-serve") && cmd.contains(" -- ")) {
-                cmd.substringAfter(" -- ").trim()
-            } else {
-                cmd
+            val safeWorkdir = effectiveWorkdir.replace("'", "'\\''")
+            val innerCmd = when {
+                effectiveCmd.contains("minis-serve") && effectiveCmd.contains(" -- ") ->
+                    effectiveCmd.substringAfter(" -- ").trim()
+                effectiveCmd.matches(Regex("""^minis-serve\s+static\s+\d+.*""")) ->
+                    "python3 -m http.server $port --bind 127.0.0.1"
+                else -> effectiveCmd
             }.replace('\n', ' ').replace('\r', ' ').replace("\u0000", "")
             val safeInnerCmd = innerCmd.replace("'", "'\\''")
             val launchCmd = "/usr/local/bin/minis-serve start --port $port --title '$safeTitle' --workdir '$safeWorkdir' -- /bin/sh -c '$safeInnerCmd'"
@@ -657,8 +708,8 @@ object SandboxServerManager {
                 port = srv.port,
                 url = srv.url,
                 title = srv.title,
-                command = srv.command,
-                workdir = srv.workdir,
+                command = effectiveCmd,
+                workdir = effectiveWorkdir,
                 sessionId = srv.sessionId,
                 pid = readRootfsPid(context, port) ?: srv.pid,
                 status = if (live) SandboxServerStatus.LIVE else SandboxServerStatus.STOPPED,
@@ -675,7 +726,7 @@ object SandboxServerManager {
             return trimmedTitle
         }
         val lower = command.lowercase()
-        val scriptMatch = Regex("""([a-zA-Z0-9_-]+)\.(?:py|js|ts|go|sh)\b""").find(command)
+        val scriptMatch = Regex("""([a-zA-Z0-9_-]+)\.(?:py|js|ts|go|sh|rb|php|rs)\b""").find(command)
         val scriptName = scriptMatch?.groupValues?.getOrNull(1)
             ?.replace('_', ' ')
             ?.replace('-', ' ')
@@ -686,15 +737,22 @@ object SandboxServerManager {
         return when {
             lower.contains("streamlit") ->
                 if (!scriptName.isNullOrBlank()) "Streamlit · $scriptName (:$port)" else "Streamlit App (:$port)"
+            lower.contains("gradio") ->
+                if (!scriptName.isNullOrBlank()) "Gradio · $scriptName (:$port)" else "Gradio App (:$port)"
             lower.contains("uvicorn") || lower.contains("fastapi") ->
                 if (!scriptName.isNullOrBlank()) "FastAPI · $scriptName (:$port)" else "FastAPI Server (:$port)"
-            lower.contains("flask") ->
+            lower.contains("flask") || lower.contains("gunicorn") ->
                 if (!scriptName.isNullOrBlank()) "Flask · $scriptName (:$port)" else "Flask App (:$port)"
             lower.contains("sqlite") -> "SQLite Dashboard (:$port)"
-            lower.contains("http.server") -> "Static Web Server (:$port)"
-            lower.contains("node") || lower.contains("npm") || lower.contains("vite") ->
+            lower.contains("http.server") || lower.contains("minis-serve static") -> "Static Web Server (:$port)"
+            lower.contains("next") -> "Next.js App (:$port)"
+            lower.contains("astro") -> "Astro App (:$port)"
+            lower.contains("vite") -> "Vite Dev Server (:$port)"
+            lower.contains("node") || lower.contains("npm") || lower.contains("bun") || lower.contains("deno") ->
                 if (!scriptName.isNullOrBlank()) "Node · $scriptName (:$port)" else "Node.js App (:$port)"
+            lower.contains("php -s") -> "PHP Web Server (:$port)"
             lower.contains("go run") -> "Go Web App (:$port)"
+            lower.contains("cargo run") -> "Rust Web App (:$port)"
             !scriptName.isNullOrBlank() -> "$scriptName (:$port)"
             else -> "Micro-App Canvas (:$port)"
         }

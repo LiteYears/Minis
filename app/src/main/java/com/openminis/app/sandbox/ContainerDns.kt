@@ -292,6 +292,7 @@ object ExecutionCoordinator {
         val startTime = System.currentTimeMillis()
         val bindMounts = buildSessionBindMounts(fsSessionId ?: sessionId)
         val envVars = envVarRepository?.allAsDict() ?: emptyMap()
+        PRootZygoteManager.ensureSessionWarmAsync(appContext, sessionId, bindMounts)
 
         suspend fun attempt(noSeccomp: Boolean): Pair<String, Int> {
             val shell = FreshProcessShell(
@@ -897,6 +898,7 @@ object ExecutionCoordinator {
         // commands are untouched.
         val stoppedFresh = stopFreshShells(sessionId)
         if (stoppedFresh > 0) Log.i(TAG, "[$sessionId] $stoppedFresh fresh-process command(s) killed on terminate")
+        PRootZygoteManager.stopSessionZygote(appContext, sessionId, clearCwd = true)
     }
 
     /**
@@ -1218,7 +1220,12 @@ internal object ForegroundCommandGroup {
      * written; a command killed by a signal reports 128+N, as a shell would.
      */
     const val FRESH_RUNNER =
-        "printf '%s' \"\$\$\" > \"\$2.pid\"; sh -c \"\$1\"; rc=\$?; printf '%s' \"\$rc\" > \"\$2\"; exit \$rc"
+        "printf '%s' \"\$\$\" > \"\$2.pid\"; " +
+            "_cwdf=\"\${2%/*}/cwd_\${MINIS_CHAT_SESSION_ID:-default}\"; " +
+            "[ -f \"\$_cwdf\" ] && _d=\$(cat \"\$_cwdf\" 2>/dev/null) && [ -n \"\$_d\" ] && [ -d \"\$_d\" ] && cd \"\$_d\" 2>/dev/null; " +
+            "[ -d /var/minis/shared/site-packages ] && export PYTHONPATH=\"/var/minis/shared/site-packages\${PYTHONPATH:+:\$PYTHONPATH}\"; " +
+            "sh -c 'trap \"_rc=\\\$?; pwd > \\\"\\\$0\\\" 2>/dev/null; exit \\\$_rc\" EXIT; eval \"\$1\"' \"\$_cwdf\" \"\$1\"; " +
+            "rc=\$?; printf '%s' \"\$rc\" > \"\$2\"; exit \$rc"
 
     /** Marker the wrapper prints so the host can learn the group id. */
     fun pgidMarkerPrefix(marker: String): String = "__MINIS_PGID_${marker}_"
@@ -1716,8 +1723,13 @@ internal class FreshProcessShell(
 
     /** Drop status files a killed app left behind; they are tiny but unbounded. */
     private fun pruneStaleExitFiles(dir: File) {
-        val cutoff = System.currentTimeMillis() - STALE_EXIT_FILE_MS
-        dir.listFiles()?.forEach { if (it.lastModified() < cutoff) it.delete() }
+        val now = System.currentTimeMillis()
+        val cutoff = now - STALE_EXIT_FILE_MS
+        val cwdCutoff = now - 24 * 60 * 60_000L
+        dir.listFiles()?.forEach { file ->
+            val maxAge = if (file.name.startsWith("cwd_")) cwdCutoff else cutoff
+            if (file.lastModified() < maxAge) file.delete()
+        }
     }
 
     /**

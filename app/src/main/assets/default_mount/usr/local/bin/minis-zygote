@@ -1,0 +1,94 @@
+#!/bin/sh
+# minis-zygote — Warm PRoot Zygote Daemon for OpenMinis
+# Keeps the session's PRoot guest translation table, bind mounts, and shared
+# package caches warm in memory, and services fast-fork command requests from
+# /.minis-zygote/<session_id>/queue.
+
+set -u
+
+SESSION_ID="${1:-${MINIS_CHAT_SESSION_ID:-default}}"
+ZYGOTE_ROOT="/.minis-zygote/${SESSION_ID}"
+QUEUE_DIR="${ZYGOTE_ROOT}/queue"
+CWD_FILE="/.minis-exit/cwd_${SESSION_ID}"
+
+mkdir -p "$QUEUE_DIR" "/.minis-exit" /tmp 2>/dev/null || true
+printf '%s' "$$" > "${ZYGOTE_ROOT}/zygote.pid" 2>/dev/null || true
+date +%s > "${ZYGOTE_ROOT}/heartbeat" 2>/dev/null || true
+
+cleanup() {
+    rm -f "${ZYGOTE_ROOT}/zygote.pid" 2>/dev/null || true
+    exit 0
+}
+trap cleanup INT TERM EXIT
+
+# Ensure shared Python site-packages directory is on PYTHONPATH
+if [ -d "/var/minis/shared/site-packages" ]; then
+    export PYTHONPATH="/var/minis/shared/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
+# Warm common binaries into the VFS page cache once on startup
+for bin in /bin/sh /usr/bin/env /usr/bin/python3 /usr/bin/node; do
+    [ -x "$bin" ] && head -c 4096 "$bin" >/dev/null 2>&1 || true
+done
+
+IDLE_TICKS=0
+# Max idle lifetime: 20 minutes (24000 ticks * 50ms)
+MAX_IDLE_TICKS=24000
+
+while true; do
+    FOUND=0
+    for req in "$QUEUE_DIR"/*.req; do
+        [ -f "$req" ] || continue
+        FOUND=1
+        IDLE_TICKS=0
+        JOB_ID=$(basename "$req" .req)
+        CMD_FILE="${QUEUE_DIR}/${JOB_ID}.cmd"
+        ENV_FILE="${QUEUE_DIR}/${JOB_ID}.env"
+        STATUS_PATH=$(cat "$req" 2>/dev/null || true)
+        rm -f "$req" 2>/dev/null || true
+
+        if [ -z "$STATUS_PATH" ] || [ ! -f "$CMD_FILE" ]; then
+            rm -f "$CMD_FILE" "$ENV_FILE" 2>/dev/null || true
+            continue
+        fi
+
+        # Fork isolated process group for the command
+        (
+            if [ -f "$ENV_FILE" ]; then
+                # shellcheck disable=SC1090
+                . "$ENV_FILE" 2>/dev/null || true
+                rm -f "$ENV_FILE" 2>/dev/null || true
+            fi
+            if [ -f "$CWD_FILE" ]; then
+                _SAVED_DIR=$(cat "$CWD_FILE" 2>/dev/null || true)
+                if [ -n "$_SAVED_DIR" ] && [ -d "$_SAVED_DIR" ]; then
+                    cd "$_SAVED_DIR" 2>/dev/null || true
+                fi
+            elif [ -d "/var/minis/workspace" ]; then
+                cd "/var/minis/workspace" 2>/dev/null || true
+            fi
+
+            CMD_TEXT=$(cat "$CMD_FILE" 2>/dev/null || true)
+            rm -f "$CMD_FILE" 2>/dev/null || true
+
+            /usr/bin/setsid /bin/sh -c '
+                printf "%s" "$$" > "$2.pid"
+                /bin/sh -c '\''trap "_rc=\$?; pwd > \"$0\" 2>/dev/null; exit \$_rc" EXIT; eval "$1"'\'' "$3" "$1"
+                rc=$?
+                printf "%s" "$rc" > "$2"
+                exit $rc
+            ' sh "$CMD_TEXT" "$STATUS_PATH" "$CWD_FILE" > "${STATUS_PATH}.out" 2>&1 &
+        )
+    done
+
+    if [ "$FOUND" -eq 0 ]; then
+        IDLE_TICKS=$((IDLE_TICKS + 1))
+        if [ $((IDLE_TICKS % 200)) -eq 0 ]; then
+            date +%s > "${ZYGOTE_ROOT}/heartbeat" 2>/dev/null || true
+        fi
+        if [ "$IDLE_TICKS" -ge "$MAX_IDLE_TICKS" ]; then
+            exit 0
+        fi
+        sleep 0.05 2>/dev/null || sleep 1
+    fi
+done

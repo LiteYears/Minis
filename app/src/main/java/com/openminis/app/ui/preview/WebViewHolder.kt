@@ -12,6 +12,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import com.openminis.app.logging.AppLogger
+import kotlinx.coroutines.launch
 
 /**
  * Holds a single WebView instance + the page-state observed from it.
@@ -90,6 +91,16 @@ class WebViewHolder(
         return true
     }
 
+    /**
+     * Returns true iff [url] is a local sandbox server (`http://127.0.0.1:<port>`)
+     * or a verified sandbox `file://` URL. Used to strictly gate `window.minis`
+     * JS-to-Agent bridge invocations so external websites cannot trigger prompts.
+     */
+    fun isTrustedBridgeOrigin(url: String = currentUrl): Boolean {
+        return com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(url) ||
+            isSafeLocalFileUrl(url)
+    }
+
     private fun applyFileAccessPolicyForUrl(wv: WebView, url: String) {
         val allowLocalFile = isSafeLocalFileUrl(url)
         wv.settings.allowFileAccess = allowLocalFile
@@ -112,7 +123,7 @@ class WebViewHolder(
         webView.loadUrl(normalized)
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     val webView: WebView = WebView(appContext).apply {
         val initialAllowFile = isSafeLocalFileUrl(currentUrl)
         settings.javaScriptEnabled = true       // sandbox HTML demos rely on JS
@@ -133,6 +144,35 @@ class WebViewHolder(
         settings.loadWithOverviewMode = true
         mobileUserAgent = settings.userAgentString
         val wv = this
+        // Bidirectional Canvas <-> Agent bridge (`window.minis`):
+        // Scoped to local sandbox servers and verified sandbox file:// previews.
+        addJavascriptInterface(
+            MinisCanvasJsInterface(
+                isTrustedOrigin = { isTrustedBridgeOrigin(currentUrl) },
+                currentUrlProvider = { currentUrl },
+                onAutoFixRequested = { errorHint ->
+                    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                        val port = com.openminis.app.sandbox.SandboxServerManager.extractPort(currentUrl) ?: 0
+                        val srv = com.openminis.app.sandbox.SandboxServerManager.getServerForUrl(currentUrl)
+                        val srvLogs = if (port > 0) {
+                            com.openminis.app.sandbox.SandboxServerManager.readServerLogs(appContext, port)
+                        } else {
+                            ""
+                        }
+                        val prompt = CanvasAgentBridge.buildAutoFixPrompt(
+                            url = currentUrl,
+                            port = port,
+                            server = srv,
+                            consoleLogs = consoleLogs,
+                            serverLogs = srvLogs,
+                            customErrorHint = errorHint,
+                        )
+                        CanvasAgentBridge.dispatchSendPrompt(prompt = prompt, minimizeCanvas = true)
+                    }
+                },
+            ),
+            "minis",
+        )
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setAcceptThirdPartyCookies(wv, true)
@@ -218,6 +258,27 @@ class WebViewHolder(
                 }
             }
 
+            override fun onReceivedHttpError(
+                view: WebView,
+                request: android.webkit.WebResourceRequest,
+                errorResponse: android.webkit.WebResourceResponse,
+            ) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                val reqUrl = request.url?.toString().orEmpty()
+                if (com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(reqUrl) &&
+                    errorResponse.statusCode >= 400 &&
+                    !reqUrl.endsWith("/favicon.ico")
+                ) {
+                    val entry = WebConsoleEntry(
+                        level = if (errorResponse.statusCode >= 500) "ERROR" else "WARNING",
+                        message = "HTTP ${errorResponse.statusCode} ${errorResponse.reasonPhrase.orEmpty()} (${request.method} ${request.url?.path ?: reqUrl})".trim(),
+                        sourceId = request.url?.path?.substringAfterLast('/')?.ifBlank { "http" } ?: "http",
+                        lineNumber = errorResponse.statusCode,
+                    )
+                    consoleLogs = (consoleLogs + entry).takeLast(100)
+                }
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
                 if (url == "about:blank") return
                 isLoading = false
@@ -226,6 +287,9 @@ class WebViewHolder(
                 pageTitle = view.title.orEmpty()
                 if (com.openminis.app.sandbox.SandboxServerManager.isLocalSandboxUrl(url) && pageTitle.isNotBlank()) {
                     com.openminis.app.sandbox.SandboxServerManager.updatePageTitle(url, pageTitle)
+                }
+                if (isTrustedBridgeOrigin(url)) {
+                    view.evaluateJavascript(CanvasAgentBridge.INJECTED_CANVAS_RUNTIME_JS, null)
                 }
                 AppLogger.debug(TAG, "onPageFinished title=${pageTitle.take(60)}")
                 view.postDelayed({

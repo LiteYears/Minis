@@ -3,17 +3,33 @@
 # Usage:
 #   minis-pkg list
 #   minis-pkg status
-#   minis-pkg install <pack...>   (packs: core, data, web, net, media)
+#   minis-pkg install <pack...>   (packs: core, data, science, web, dev, net, media)
+#   minis-pkg search <query>
+#   minis-pkg clean
 
 set -e
 
 CACHE_ROOT="/var/minis/shared/.pkg-cache"
 APK_CACHE_DIR="$CACHE_ROOT/apk"
 PIP_CACHE_DIR="$CACHE_ROOT/pip"
+SHARED_SITE_PACKAGES="/var/minis/shared/site-packages"
 
 ensure_cache_dirs() {
-    mkdir -p "$APK_CACHE_DIR" "$PIP_CACHE_DIR" 2>/dev/null || true
+    mkdir -p "$APK_CACHE_DIR" "$PIP_CACHE_DIR" "$SHARED_SITE_PACKAGES" 2>/dev/null || true
     export PIP_CACHE_DIR
+    export PYTHONPATH="$SHARED_SITE_PACKAGES${PYTHONPATH:+:$PYTHONPATH}"
+    if [ -d "/etc/apk" ] && [ ! -L "/etc/apk/cache" ]; then
+        rm -rf /etc/apk/cache 2>/dev/null || true
+        ln -s "$APK_CACHE_DIR" /etc/apk/cache 2>/dev/null || true
+    fi
+    if [ -d "/etc/profile.d" ] && [ ! -f "/etc/profile.d/minis-shared-pkg.sh" ]; then
+        cat > /etc/profile.d/minis-shared-pkg.sh 2>/dev/null <<'EOF' || true
+export PIP_CACHE_DIR="/var/minis/shared/.pkg-cache/pip"
+if [ -d "/var/minis/shared/site-packages" ]; then
+    export PYTHONPATH="/var/minis/shared/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+fi
+EOF
+    fi
 }
 
 usage() {
@@ -23,14 +39,20 @@ Usage: minis-pkg <subcommand> [packs...]
 Subcommands:
   list                  List available toolchain profile packs
   status                Show installed toolchain binaries and persistent cache size
-  install <pack...>     Install one or more profile packs using persistent cache
+  install <pack...>     Install one or more profile packs (or apk packages) using persistent cache
+  pip <pkg...>          Install Python packages into persistent /var/minis/shared/site-packages
+  warmup [--quiet]      Initialize persistent APK/pip caches and shared Python site-packages
+  search <query>        Search Alpine package repositories for matching packages
+  clean                 Clear cached package archives in /var/minis/shared/.pkg-cache
 
 Available Profile Packs:
-  core   git, curl, jq, ripgrep (rg), fd, tree, bash, unzip, zip, file
-  data   python3, py3-pip, sqlite, sqlite-dev
-  web    nodejs, npm
-  net    openssh-client, bind-tools (dig/nslookup), socat, netcat-openbsd, openssl
-  media  ffmpeg, imagemagick
+  core     git, curl, jq, ripgrep (rg), fd, tree, bash, unzip, zip, file
+  data     python3, py3-pip, sqlite, sqlite-dev
+  science  python3, py3-numpy, py3-scipy, py3-pandas, py3-matplotlib, py3-pillow
+  web      nodejs, npm, python3, py3-flask, py3-fastapi, uvicorn
+  dev      build-base, pkgconf, cmake, git, make
+  net      openssh-client, bind-tools (dig/nslookup), socat, netcat-openbsd, openssl
+  media    ffmpeg, imagemagick
 EOF
 }
 
@@ -42,8 +64,14 @@ pack_packages() {
         data)
             echo "python3 py3-pip sqlite"
             ;;
+        science)
+            echo "python3 py3-pip py3-numpy py3-scipy py3-pandas py3-matplotlib py3-pillow"
+            ;;
         web)
-            echo "nodejs npm"
+            echo "nodejs npm python3 py3-pip py3-flask"
+            ;;
+        dev)
+            echo "build-base pkgconf cmake git make"
             ;;
         net)
             echo "openssh-client bind-tools socat netcat-openbsd openssl"
@@ -60,21 +88,25 @@ pack_packages() {
 cmd_list() {
     cat <<'EOF'
 Minis Computer Toolchain Profile Packs:
-  core   -> git, curl, jq, ripgrep, fd, tree, bash, unzip, zip, file
-  data   -> python3, py3-pip, sqlite
-  web    -> nodejs, npm
-  net    -> openssh-client, bind-tools, socat, netcat-openbsd, openssl
-  media  -> ffmpeg, imagemagick
+  core     -> git, curl, jq, ripgrep, fd, tree, bash, unzip, zip, file
+  data     -> python3, py3-numpy/sqlite, py3-pip, sqlite
+  science  -> python3, py3-numpy, py3-scipy, py3-pandas, py3-matplotlib, py3-pillow
+  web      -> nodejs, npm, python3, py3-flask
+  dev      -> build-base, pkgconf, cmake, git, make
+  net      -> openssh-client, bind-tools, socat, netcat-openbsd, openssl
+  media    -> ffmpeg, imagemagick
 
 Install example:
   minis-pkg install core data
+  minis-pkg install science
+  minis-pkg pip requests beautifulsoup4
 EOF
 }
 
 cmd_status() {
     ensure_cache_dirs
     echo "Minis Toolchain Status:"
-    for bin in git curl jq rg fd python3 pip3 sqlite3 node npm ssh dig nc socat openssl ffmpeg convert; do
+    for bin in git curl jq rg fd python3 pip3 sqlite3 node npm gcc make cmake ssh dig nc socat openssl ffmpeg convert; do
         if command -v "$bin" >/dev/null 2>&1; then
             loc="$(command -v "$bin")"
             printf "  [installed] %-10s (%s)\n" "$bin" "$loc"
@@ -86,11 +118,15 @@ cmd_status() {
         cache_size="$(du -sh "$CACHE_ROOT" 2>/dev/null | awk '{print $1}' || echo "0")"
         echo "Persistent Package Cache ($CACHE_ROOT): $cache_size"
     fi
+    if [ -d "$SHARED_SITE_PACKAGES" ]; then
+        py_size="$(du -sh "$SHARED_SITE_PACKAGES" 2>/dev/null | awk '{print $1}' || echo "0")"
+        echo "Persistent Python site-packages ($SHARED_SITE_PACKAGES): $py_size"
+    fi
 }
 
 cmd_install() {
     if [ $# -eq 0 ]; then
-        echo "Error: Specify at least one profile pack (core, data, web, net, media)." >&2
+        echo "Error: Specify at least one profile pack (core, data, science, web, dev, net, media) or package name." >&2
         usage >&2
         exit 1
     fi
@@ -118,6 +154,48 @@ cmd_install() {
     echo "[minis-pkg] Done."
 }
 
+cmd_pip() {
+    if [ $# -eq 0 ]; then
+        echo "Usage: minis-pkg pip <package...>" >&2
+        exit 1
+    fi
+    ensure_cache_dirs
+    if ! command -v pip3 >/dev/null 2>&1 && ! python3 -m pip --version >/dev/null 2>&1; then
+        echo "[minis-pkg] Installing python3 & py3-pip first..."
+        apk add --cache-dir "$APK_CACHE_DIR" python3 py3-pip
+    fi
+    echo "[minis-pkg] Installing Python packages into $SHARED_SITE_PACKAGES..."
+    python3 -m pip install --cache-dir "$PIP_CACHE_DIR" --target "$SHARED_SITE_PACKAGES" --upgrade "$@"
+    echo "[minis-pkg] Installed into shared site-packages ($SHARED_SITE_PACKAGES)."
+}
+
+cmd_warmup() {
+    ensure_cache_dirs
+    if [ "${1:-}" != "--quiet" ]; then
+        echo "[minis-pkg] Persistent APK cache linked: /etc/apk/cache -> $APK_CACHE_DIR"
+        echo "[minis-pkg] Persistent pip cache ready:  $PIP_CACHE_DIR"
+        echo "[minis-pkg] Shared Python site-packages: $SHARED_SITE_PACKAGES"
+    fi
+}
+
+cmd_search() {
+    if [ $# -eq 0 ]; then
+        echo "Usage: minis-pkg search <query>" >&2
+        exit 1
+    fi
+    ensure_cache_dirs
+    apk search --cache-dir "$APK_CACHE_DIR" "$@"
+}
+
+cmd_clean() {
+    if [ -d "$CACHE_ROOT" ]; then
+        rm -rf "${APK_CACHE_DIR:?}"/* "${PIP_CACHE_DIR:?}"/* 2>/dev/null || true
+        echo "[minis-pkg] Cleared persistent package cache at $CACHE_ROOT"
+    else
+        echo "[minis-pkg] Cache directory is already clean."
+    fi
+}
+
 subcmd="${1:-list}"
 [ $# -gt 0 ] && shift
 
@@ -130,6 +208,18 @@ case "$subcmd" in
         ;;
     install|add)
         cmd_install "$@"
+        ;;
+    pip|py)
+        cmd_pip "$@"
+        ;;
+    warmup|init)
+        cmd_warmup "$@"
+        ;;
+    search|find)
+        cmd_search "$@"
+        ;;
+    clean|prune)
+        cmd_clean
         ;;
     -h|--help|help)
         usage
