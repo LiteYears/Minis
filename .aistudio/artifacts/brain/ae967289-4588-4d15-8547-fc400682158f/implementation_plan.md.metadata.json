@@ -1,6 +1,0 @@
-{
-  "summary":  "Surgical zero-feature-loss plan to reduce the OpenMinis APK size from ~79.9 MB (72.9 MB repacked) to ~58-60 MB while keeping all CPU architectures, bundled Alpine rootfs archives, native libraries, and application features intact.",
-  "updatedAt":  "2026-11-01T17:55:26.418435249Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}
